@@ -1,0 +1,30 @@
+# Template for a mixed initial run with three Pi seats.
+# `werewolf play init --pi-seats 1,2,3 --output <directory>` creates a
+# verified copy with an isolated preview ruleset and the final relative paths.
+schema_version: 1
+play_setup:
+  status: EXPERIMENTAL_CANDIDATE
+  board_ref: classic_12_seer_witch_hunter_idiot@1.0.0
+game:
+  game_id: classic-mixed-001
+  board:
+    id: classic_12_seer_witch_hunter_idiot
+    version: 1.0.0
+  seed: 20260930
+  moderator_mode: human_assisted
+paths:
+  compiled_root: preview/compiled
+  games_root: games
+players:
+  - {seat: 1, runtime: pi, provider: github-copilot, model: gpt-6-luna, reasoning: medium}
+  - {seat: 2, runtime: pi, provider: github-copilot, model: gpt-6-luna, reasoning: medium}
+  - {seat: 3, runtime: pi, provider: github-copilot, model: gpt-6-luna, reasoning: medium}
+  - {seat: 4, runtime: scripted}
+  - {seat: 5, runtime: scripted}
+  - {seat: 6, runtime: scripted}
+  - {seat: 7, runtime: scripted}
+  - {seat: 8, runtime: scripted}
+  - {seat: 9, runtime: scripted}
+  - {seat: 10, runtime: scripted}
+  - {seat: 11, runtime: scripted}
+  - {seat: 12, runtime: scripted}

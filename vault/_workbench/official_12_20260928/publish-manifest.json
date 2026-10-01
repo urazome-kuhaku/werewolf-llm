@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "package_id": "classic_12_seer_witch_hunter_idiot@1.0.0",
+  "board_ref": "classic_12_seer_witch_hunter_idiot@1.0.0",
+  "candidate_id": "classic_12_seer_witch_hunter_idiot",
+  "status": "CANDIDATE_PENDING_HUMAN_REVIEW",
+  "files": [
+    {"path": "boards/classic_12_seer_witch_hunter_idiot/1.0.0/board.md", "sha256": "15f753f0de1fcc5550e3dbd216cb1e90d82c707c331434754b1f4287b4e2e340"},
+    {"path": "interactions/hunter-death-trigger/1.0.0/interaction.md", "sha256": "4b7516c77f25c8a3523859684e6621e8b1a906a98e27b1a20c9189a08e62eac6"},
+    {"path": "interactions/idiot-exile/1.0.0/interaction.md", "sha256": "ed80a7480623d68b27ccd27995eddc8f9a7429a3f748baea54c9e80cd878df9e"},
+    {"path": "interactions/witch-poison-hunter/1.0.0/interaction.md", "sha256": "462ac25d57040b1994844757e752041df45b4f5e05bacf1444a9e0b9ff80ea11"},
+    {"path": "mechanics/day-vote/1.0.0/mechanic.md", "sha256": "d05d426bb41335e5fbc4c5703601c66747d95f186ad505d5d2d0dc6927ef6aef"},
+    {"path": "mechanics/night-resolution/1.0.0/mechanic.md", "sha256": "b374ca862939ea8d7381ba877b0d3c460a01c7d973fc88a7ad005bf47e7be3be"},
+    {"path": "mechanics/sheriff-election/1.0.0/mechanic.md", "sha256": "f347bdd269a7511ddee51eeab33769be03e4ad35a8dda5a859fba6a35f659f7e"},
+    {"path": "roles/hunter/1.0.0/role.md", "sha256": "b46ff8ae4fec0048a61a45902756eb0d73083cee9ffd0715f2d0da91ee571100"},
+    {"path": "roles/idiot/1.0.0/role.md", "sha256": "4a7378cf10a7b828705fd37ef5d38902ccff41eec93b2953b05208d5bbc2b1c4"},
+    {"path": "roles/seer/1.0.0/role.md", "sha256": "2105ead3bac28f31f21baf74f108d94b6c3bfa8f38ac3b87d1ec35d38abe8fe7"},
+    {"path": "roles/villager/1.0.0/role.md", "sha256": "a7b6d3637455632c34f82b3965d9ffb8c113374ceb3aa04a40257a5549407dbf"},
+    {"path": "roles/witch/1.0.0/role.md", "sha256": "665ac77f6fe51ed5da29f25e445537e59c34ca6ee059a071c6d98abdb46176a0"},
+    {"path": "roles/wolf/1.0.0/role.md", "sha256": "952f5e27f10b0576b5a16fd9a0fbac5f68e968af632daf7ee5239185282bba88"}
+  ]
+}

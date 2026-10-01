@@ -1,0 +1,58 @@
+schema_version: 1
+sources:
+  - schema_version: 1
+    source_id: source-netease-12-standard
+    url: https://langrensha.163.com/wanfa/guize/2017/10/18/26899_719311.html
+    title: 《狼人杀·官方正版》12人标准场规则
+    publisher: 网易狼人杀·官方正版
+    source_class: PLATFORM_RULES
+    fetched_at: 2026-09-28T01:19:39Z
+    content_sha256: 1c82028f483a04b6ec45b4a7ba0038e2a12d8991098b57f26faf88a694fa8a1b
+    excerpt: >-
+      研究摘要（非逐字引文）：已抓取的页面“12人标准场”段落列出暗牌、警长、4名狼人、4名平民，以及预言家、女巫、猎人、白痴各1名；同页说明好人消灭全部狼人获胜、狼人杀死全部神职或全部平民即屠边，女巫有解药和毒药、每晚最多使用一瓶且不能自救，猎人在被狼人杀害或投票放逐时可开枪、被女巫毒杀时不能开枪，白痴被投票放逐时翻牌存活但失去投票权。`content_sha256` 对应 `sources/raw/source-netease-12-standard.html` 的原始 HTTPS 响应字节；本字段摘要仍不是逐字引文。
+    retrieval_method: curl_https_raw_body
+  - schema_version: 1
+    source_id: source-lanke-rulebook-secondary
+    url: https://lanke.fun/wp-content/uploads/2024/06/%E7%AC%AC%E4%BA%8C%E7%89%88%E7%8B%BC%E4%BA%BA%E6%9D%80%E6%B3%95%E5%85%B8.pdf
+    title: 第二版狼人杀法典
+    publisher: 烂柯法典（补充资料）
+    source_class: MATURE_RULE_GUIDE
+    fetched_at: 2026-09-28T01:19:39Z
+    content_sha256: 39d68b7b3f4cbebb91c22179474f7bd695e4c68f8f242e2404e9500c5bbf6420
+    excerpt: >-
+      研究摘要（非逐字引文）：该 PDF 仅作为警长和平票等候选细节的补充资料；它不是网易官方12人标准场规则，版本差异可能影响警长票型和 PK 细节，因此不覆盖主来源结论。`content_sha256` 对应 `sources/raw/source-lanke-rulebook-secondary.pdf` 的原始 HTTPS 响应字节；本字段摘要仍不是逐字引文。
+    retrieval_method: curl_https_raw_body
+  - schema_version: 1
+    source_id: source-langrensha-community
+    url: https://www.langrensha.net/strategy/2021050801.html
+    title: 狼人杀规则补充：警长、投票与女巫刀口
+    publisher: 领域圈（转载/社区规则说明）
+    source_class: COMMUNITY
+    fetched_at: 2026-09-28T01:19:39Z
+    content_sha256: 72ff9ef493b9801cae3269446a2634f18ccfc7c2115bd93fb7dd8bea9ba8608d
+    excerpt: >-
+      研究摘要（非逐字引文）：页面说明日票按主持指令同时举票、允许弃票、平票进入 PK 且再次平票为平安日；并说明狼队需要统一选择刀口、解药未使用时由法官告知女巫刀口、警长退选或死亡时传徽或撕徽。该页面属于社区转载，且其警长票型与主来源冲突，不能覆盖网易口径。`content_sha256` 对应 `sources/raw/source-langrensha-community.html` 的原始 HTTPS 响应字节；本字段摘要仍不是逐字引文。
+    retrieval_method: curl_https_raw_body
+  - schema_version: 1
+    source_id: source-duotegame-12-sheriff
+    url: https://www.duotegame.com/mgl/31582.html
+    title: 狼人杀12人局基本玩法
+    publisher: 多特游戏（攻略整理）
+    source_class: COMMUNITY
+    published_at: 2021-10-15T13:11:07Z
+    fetched_at: 2026-09-28T01:16:26Z
+    content_sha256: cf7c7804cbff74edd895e54aac8e1148d7aeed30f2928e498c2522badf5a40fa
+    excerpt: >-
+      研究摘要（非逐字引文）：页面规则整理将警长竞选首次平票处理为 PK 发言和 PK 投票，PK 后得票最高者当选；再次平票时警徽流失、本局没有警长。页面还提到1.5票和死亡后警徽处理，但这些字段分别受主来源层级与人工审核约束。`content_sha256` 是本工作台保存的摘要 Markdown 文件 hash，不声称是未保存的完整网页 hash；当前直接 HTTPS 重取返回 404，需审核时重新确认。
+    retrieval_method: saved_excerpt_sha256
+  - schema_version: 1
+    source_id: source-lingyuq-12-sheriff
+    url: https://www.lingyuq.com/guides/81407.html
+    title: 狼人杀标准游戏规则（领域圈转载）
+    publisher: 领域圈（转载页面）
+    source_class: COMMUNITY
+    fetched_at: 2026-09-28T01:16:26Z
+    content_sha256: 27ba195f7d0f36e9a6c50fb89ae345876fcc2c388fe8b36ebcb555e2a9b01034
+    excerpt: >-
+      研究摘要（非逐字引文）：转载规则段落将警长竞选平票处理为 PK，PK 再次平票时本局没有警徽、没有警长，并提到警长死亡可移交或撕掉警徽。页面标题的官方表述不改变本记录的社区转载来源层级。`content_sha256` 是本工作台保存的摘要 Markdown 文件 hash，不声称是未保存的完整网页 hash；当前直接 HTTPS 重取未成功，需审核时重新确认。
+    retrieval_method: saved_excerpt_sha256

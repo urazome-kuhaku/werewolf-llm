@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "package_id": "classic_12_white_wolf_guard@1.0.0",
+  "board_ref": "classic_12_white_wolf_guard@1.0.0",
+  "candidate_id": "classic_12_white_wolf_guard",
+  "status": "CANDIDATE_PENDING_HUMAN_REVIEW",
+  "files": [
+    {"path": "boards/classic_12_white_wolf_guard/1.0.0/board.md", "sha256": "d9c3852519244b47f1d29bef47edcaad6d7526ea1a24975ed720c309262b4a72"},
+    {"path": "mechanics/day-vote/1.0.0/mechanic.md", "sha256": "a1ca722faffee0a3f41467be7a6bce8a820bc53aa89677c8981acd77e37b2a1f"},
+    {"path": "mechanics/night-resolution/1.0.0/mechanic.md", "sha256": "ac42cd352b3cb4654eeff9c82e0627f6e2ab8dfe9bab2fb81587ddf8e4150523"},
+    {"path": "mechanics/sheriff-election/1.0.0/mechanic.md", "sha256": "65c91ee92e6074005b22199636190f658c5a31615e8d8928fcb6cc712efec518"},
+    {"path": "roles/guard/1.0.0/role.md", "sha256": "bbd6fe5cf694b9cda76e56162ad53d2bc3ecde39be9cb3872e2524e64dfa789b"},
+    {"path": "roles/hunter/1.0.0/role.md", "sha256": "c8a8895171636c785cbc043960461edcaf47118c4064c1e5e437a86b79400e59"},
+    {"path": "roles/seer/1.0.0/role.md", "sha256": "767df5f6a0e3c24f6885a4a3f9d2887390474667ab57bf331bccd7ff446a8d0f"},
+    {"path": "roles/villager/1.0.0/role.md", "sha256": "465cbef08c567c50fd0f0102aa76582e4b426b248ed5da5cdc8c7572a27dbfdb"},
+    {"path": "roles/white_wolf_king/1.0.0/role.md", "sha256": "09ce3160a330e2b47baab2fd4c9b5ae894166cac3f896b18ce84d87eb75f3c31"},
+    {"path": "roles/witch/1.0.0/role.md", "sha256": "e853c70f914c667fbd50089530acd218e82bd24c610351348755495c2a789382"},
+    {"path": "roles/wolf/1.0.0/role.md", "sha256": "9870fac9cbc1e7bea1ab02294e1f103f12e748477ed4f34d636f36b82ed66c2e"}
+  ]
+}

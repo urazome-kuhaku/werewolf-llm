@@ -1,0 +1,58 @@
+[project]
+name = "werewolf-arena"
+version = "0.1.0"
+description = "Werewolf Arena V1 multi-model game framework"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "aiohttp>=3.10,<4",
+    "pydantic>=2.9,<3",
+    "pyyaml>=6,<7",
+    "rich>=13,<15",
+    "typer>=0.12,<1",
+]
+
+[project.scripts]
+werewolf = "werewolf.cli:app"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.11,<2",
+    "pytest>=8,<9",
+    "pytest-asyncio>=0.24,<2",
+    "pytest-cov>=5,<8",
+    "ruff>=0.8,<1",
+]
+
+[build-system]
+requires = ["hatchling>=1.26,<2"]
+build-backend = "hatchling.build"
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/werewolf"]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+exclude = ["doc"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers"
+testpaths = ["tests"]
+asyncio_mode = "auto"

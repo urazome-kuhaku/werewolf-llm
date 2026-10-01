@@ -1,0 +1,250 @@
+schema_version: 1
+candidate_id: classic_12_seer_witch_hunter_idiot
+claims:
+  - schema_version: 1
+    claim_id: claim-netease-board-composition
+    ruleset_candidate_id: classic_12_seer_witch_hunter_idiot
+    key: board.role_composition
+    value:
+      seat_count: 12
+      wolf_count: 4
+      villager_count: 4
+      seer_count: 1
+      witch_count: 1
+      hunter_count: 1
+      idiot_count: 1
+    scope: BOARD
+    conditions: {}
+    evidence_ids: [source-netease-12-standard]
+    confidence: 0.98
+    extraction_note: 主来源页面的12人标准场配置；value 是结构化归纳，不是页面原文格式。
+    status: SUPPORTED
+  - schema_version: 1
+    claim_id: claim-netease-dark-board
+    ruleset_candidate_id: classic_12_seer_witch_hunter_idiot
+    key: board.identity_reveal
+    value: false
+    scope: BOARD
+    conditions: {}
+    evidence_ids: [source-netease-12-standard]
+    confidence: 0.95
+    extraction_note: 主来源将该配置标为暗牌。
+    status: SUPPORTED
+  - schema_version: 1
+    claim_id: claim-netease-sheriff
+    ruleset_candidate_id: classic_12_seer_witch_hunter_idiot
+    key: board.sheriff_enabled
+    value: true
+    scope: BOARD
+    conditions: {}
+    evidence_ids: [source-netease-12-standard]
+    confidence: 0.95
+    extraction_note: 主来源的12人标准场配置包含警长。
+    status: SUPPORTED
+  - schema_version: 1
+    claim_id: claim-netease-sheriff-vote-weight
+    ruleset_candidate_id: classic_12_seer_witch_hunter_idiot
+    key: board.sheriff_vote_weight
+    value: 1.5
+    scope: BOARD
+    conditions: {}
+    evidence_ids: [source-netease-12-standard]
+    confidence: 0.92
+    extraction_note: 主来源页面列出警长投票权重；机器字段将其表示为数值。
+    status: SUPPORTED
+  - schema_version: 1
+    claim_id: claim-netease-sheriff-final-speech
+    ruleset_candidate_id: classic_12_seer_witch_hunter_idiot
+    key: board.sheriff_final_speech
+    value: true
+    scope: BOARD
+    conditions: {}
+    evidence_ids: [source-netease-12-standard]
+    confidence: 0.96
+    extraction_note: 可复算的官方 HTML 在12人标准场段落明确警长白天最后发言。
+    status: SUPPORTED
+  - schema_version: 1
+    claim_id: claim-netease-last-words
+    ruleset_candidate_id: classic_12_seer_witch_hunter_idiot
+    key: board.last_words_policy
+    value:
+      night_death_policy: first_night_only
+      day_death_policy: every_day
+    scope: BOARD
+    conditions: {}
+    evidence_ids: [source-netease-12-standard]
+    confidence: 0.95
+    extraction_note: 可复算的官方 HTML 在12人标准场段落明确首夜死亡者有遗言、所有白天死亡者有遗言；value 是结构化归纳。
+    status: SUPPORTED
+  - schema_version: 1
+    claim_id: claim-netease-victory
+    ruleset_candidate_id: classic_12_seer_witch_hunter_idiot
+    key: board.victory_conditions
+    value:
+      good: all_wolves_dead
+      wolf:
+        any_of:
+          - all_gods_dead
+          - all_villagers_dead
+        requires_surviving_wolf: true
+    scope: BOARD
+    conditions: {}
+    evidence_ids: [source-netease-12-standard]
+    confidence: 0.95
+    extraction_note: 主来源的12人标准场段落明确好人需消灭全部狼人，狼人按屠边获胜：全部神职或全部平民死亡；至少一名狼人存活以及双方条件同时成立时的优先顺序是运行时安全约束和主持决议，不是该页面的逐字规则。
+    status: SUPPORTED
+  - schema_version: 1
+    claim_id: claim-community-duotegame-sheriff-election-tie
+    ruleset_candidate_id: classic_12_seer_witch_hunter_idiot
+    key: board.sheriff_tie_policy
+    value: pk_then_no_sheriff_on_retie
+    scope: BOARD
+    conditions: {}
+    evidence_ids: [source-duotegame-12-sheriff]
+    confidence: 0.72
+    extraction_note: 仅保存了社区攻略的研究摘要，未保存可复算的原始页面；候选值不能作为精确原文证据，需人工重新获取并确认后才可冻结。
+    status: CONFLICTING
+  - schema_version: 1
+    claim_id: claim-community-sheriff-election-tie
+    ruleset_candidate_id: classic_12_seer_witch_hunter_idiot
+    key: board.sheriff_tie_policy
+    value: pk_then_no_sheriff_on_retie
+    scope: BOARD
+    conditions: {}
+    evidence_ids: [source-langrensha-community]
+    confidence: 0.84
+    extraction_note: 可复算的社区原始 HTML 明确警长竞选首次平票重发言、再次平票无警长；来源同时给出2票面杀口径，与网易主来源1.5票冲突，因此只用于平票分支，不覆盖票型。
+    status: SUPPORTED
+  - schema_version: 1
+    claim_id: claim-community-lingyuq-sheriff-election-tie
+    ruleset_candidate_id: classic_12_seer_witch_hunter_idiot
+    key: board.sheriff_tie_policy_crosscheck
+    value: pk_then_no_sheriff_on_retie
+    scope: BOARD
+    conditions: {}
+    evidence_ids: [source-lingyuq-12-sheriff]
+    confidence: 0.68
+    extraction_note: 仅保存了社区转载页面的研究摘要，未保存可复算的原始页面；候选值不能作为精确原文证据，需人工重新获取并确认。
+    status: CONFLICTING
+  - schema_version: 1
+    claim_id: claim-netease-witch-no-self-heal
+    ruleset_candidate_id: classic_12_seer_witch_hunter_idiot
+    key: witch.can_self_heal
+    value: false
+    scope: ROLE
+    conditions: {}
+    evidence_ids: [source-netease-12-standard]
+    confidence: 0.97
+    extraction_note: 主来源明确女巫不能自救。
+    status: SUPPORTED
+  - schema_version: 1
+    claim_id: claim-netease-witch-one-potion-per-night
+    ruleset_candidate_id: classic_12_seer_witch_hunter_idiot
+    key: witch.potions_per_night
+    value: 1
+    scope: ROLE
+    conditions: {}
+    evidence_ids: [source-netease-12-standard]
+    confidence: 0.97
+    extraction_note: 主来源明确女巫每晚最多使用一瓶药。
+    status: SUPPORTED
+  - schema_version: 1
+    claim_id: claim-netease-hunter-trigger
+    ruleset_candidate_id: classic_12_seer_witch_hunter_idiot
+    key: hunter.shoot_causes
+    value: [wolf_kill, exiled]
+    scope: ROLE
+    conditions: {}
+    evidence_ids: [source-netease-12-standard]
+    confidence: 0.96
+    extraction_note: 主来源列出狼人杀害和投票放逐两种开枪触发原因。
+    status: SUPPORTED
+  - schema_version: 1
+    claim_id: claim-netease-hunter-poison-block
+    ruleset_candidate_id: classic_12_seer_witch_hunter_idiot
+    key: hunter.can_shoot_if_poisoned
+    value: false
+    scope: ROLE
+    conditions: {}
+    evidence_ids: [source-netease-12-standard]
+    confidence: 0.96
+    extraction_note: 主来源明确猎人被女巫毒杀时不能开枪。
+    status: SUPPORTED
+  - schema_version: 1
+    claim_id: claim-netease-idiot-exile
+    ruleset_candidate_id: classic_12_seer_witch_hunter_idiot
+    key: idiot.exile_result
+    value: revealed_alive_without_vote
+    scope: ROLE
+    conditions: {}
+    evidence_ids: [source-netease-12-standard]
+    confidence: 0.96
+    extraction_note: 主来源明确白痴被投票放逐时翻牌存活并失去投票权。
+    status: SUPPORTED
+  - schema_version: 1
+    claim_id: claim-netease-night-order
+    ruleset_candidate_id: classic_12_seer_witch_hunter_idiot
+    key: mechanic.night_resolution
+    value: single_resolution_phase
+    scope: MECHANIC
+    conditions: {}
+    evidence_ids: [source-netease-12-standard]
+    confidence: 0.62
+    extraction_note: 官方页面覆盖角色夜间行动，但没有冻结 Python 内部的单一 NIGHT_RESOLVE 阶段；`single_resolution_phase` 是系统调度决议，不是页面逐字规则，需主持/系统版本审核。
+    status: CONFLICTING
+  - schema_version: 1
+    claim_id: claim-netease-day-vote
+    ruleset_candidate_id: classic_12_seer_witch_hunter_idiot
+    key: mechanic.day_vote
+    value: day_vote_rules_described
+    scope: MECHANIC
+    conditions: {}
+    evidence_ids: [source-netease-12-standard]
+    confidence: 0.64
+    extraction_note: 主来源描述白天投票流程但未冻结所有主持细节；该 value 只表示页面覆盖了投票主题。
+    status: SUPPORTED
+  - schema_version: 1
+    claim_id: claim-community-witch-target-information
+    ruleset_candidate_id: classic_12_seer_witch_hunter_idiot
+    key: witch.knows_wolf_target
+    value: true
+    scope: ROLE
+    conditions:
+      when: antidote_unused
+    evidence_ids: [source-langrensha-community]
+    confidence: 0.63
+    extraction_note: 社区转载规则的条件化补充；网易主来源未明确刀口信息的时序，需人工审核。
+    status: SUPPORTED
+  - schema_version: 1
+    claim_id: claim-community-wolf-consensus
+    ruleset_candidate_id: classic_12_seer_witch_hunter_idiot
+    key: board.knife_selection_mode
+    value: consensus
+    scope: BOARD
+    conditions: {}
+    evidence_ids: [source-langrensha-community]
+    confidence: 0.61
+    extraction_note: 社区转载规则补充的狼队选刀口径；不冒充网易官方条款。
+    status: SUPPORTED
+  - schema_version: 1
+    claim_id: claim-community-day-vote-pk
+    ruleset_candidate_id: classic_12_seer_witch_hunter_idiot
+    key: mechanic.day_vote_tie
+    value: pk_then_no_exile_on_retie
+    scope: MECHANIC
+    conditions: {}
+    evidence_ids: [source-langrensha-community]
+    confidence: 0.61
+    extraction_note: 社区转载规则补充的普通投票平票处理；主来源未完整说明，需人工确认版本适配性。
+    status: SUPPORTED
+  - schema_version: 1
+    claim_id: claim-community-sheriff-transfer
+    ruleset_candidate_id: classic_12_seer_witch_hunter_idiot
+    key: board.sheriff_transfer
+    value: transfer_or_teardown_on_death_or_resignation
+    scope: BOARD
+    conditions: {}
+    evidence_ids: [source-langrensha-community]
+    confidence: 0.6
+    extraction_note: 社区转载规则补充的警徽处理；主来源未完整说明，需人工确认。
+    status: SUPPORTED

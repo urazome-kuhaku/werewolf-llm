@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "candidate_id": "classic_12_white_wolf_guard",
+  "required_count": 5,
+  "satisfied_count": 5,
+  "coverage_percentage": 100.0,
+  "blocking_requirement_ids": [],
+  "passed": true,
+  "human_review_required": true,
+  "items": [
+    {"requirement_id": "claim-wwg-board-composition", "required": true, "status": "SATISFIED", "blocking": false, "machine_evidence": ["source-wpl-2019-board"], "human_review": "PENDING"},
+    {"requirement_id": "claim-wwg-self-explode", "required": true, "status": "SATISFIED", "blocking": false, "machine_evidence": ["source-white-wolf-king-guide"], "human_review": "PENDING"},
+    {"requirement_id": "claim-guard-night-protect", "required": true, "status": "SATISFIED", "blocking": false, "machine_evidence": ["source-guard-strategy"], "human_review": "PENDING"},
+    {"requirement_id": "claim-guard-no-repeat", "required": true, "status": "SATISFIED", "blocking": false, "machine_evidence": ["source-guard-strategy"], "human_review": "PENDING"},
+    {"requirement_id": "claim-wwg-wolf-victory", "required": true, "status": "SATISFIED", "blocking": false, "machine_evidence": ["source-guard-strategy"], "human_review": "PENDING"},
+    {"requirement_id": "claim-guard-self-protect", "required": false, "status": "DEFERRED", "blocking": false, "machine_evidence": ["source-guard-strategy", "source-guard-interaction"], "human_review": "REQUIRED_BEFORE_RELEASE"},
+    {"requirement_id": "claim-guard-witch-resolution", "required": false, "status": "DEFERRED", "blocking": false, "machine_evidence": ["source-guard-interaction"], "human_review": "REQUIRED_BEFORE_RELEASE"},
+    {"requirement_id": "claim-wwg-explosion-target-window", "required": false, "status": "DEFERRED", "blocking": false, "machine_evidence": ["source-white-wolf-king-guide", "source-guard-interaction"], "human_review": "REQUIRED_BEFORE_RELEASE"}
+  ]
+}

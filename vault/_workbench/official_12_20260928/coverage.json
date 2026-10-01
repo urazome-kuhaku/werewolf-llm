@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "candidate_id": "classic_12_seer_witch_hunter_idiot",
+  "required_count": 18,
+  "satisfied_count": 18,
+  "coverage_percentage": 100.0,
+  "blocking_requirement_ids": [],
+  "passed": true,
+  "human_review_required": true,
+  "items": [
+    {"requirement_id": "claim-netease-board-composition", "required": true, "status": "SATISFIED", "blocking": false, "machine_evidence": ["source-netease-12-standard"], "human_review": "PENDING"},
+    {"requirement_id": "claim-netease-dark-board", "required": true, "status": "SATISFIED", "blocking": false, "machine_evidence": ["source-netease-12-standard"], "human_review": "PENDING"},
+    {"requirement_id": "claim-netease-sheriff", "required": true, "status": "SATISFIED", "blocking": false, "machine_evidence": ["source-netease-12-standard"], "human_review": "PENDING"},
+    {"requirement_id": "claim-netease-sheriff-final-speech", "required": true, "status": "SATISFIED", "blocking": false, "machine_evidence": ["source-netease-12-standard"], "human_review": "PENDING"},
+    {"requirement_id": "claim-netease-last-words", "required": true, "status": "SATISFIED", "blocking": false, "machine_evidence": ["source-netease-12-standard"], "human_review": "PENDING"},
+    {"requirement_id": "claim-netease-sheriff-vote-weight", "required": true, "status": "SATISFIED", "blocking": false, "machine_evidence": ["source-netease-12-standard"], "human_review": "PENDING"},
+    {"requirement_id": "claim-netease-victory", "required": true, "status": "SATISFIED", "blocking": false, "machine_evidence": ["source-netease-12-standard"], "human_review": "PENDING"},
+    {"requirement_id": "claim-community-sheriff-election-tie", "required": true, "status": "SATISFIED", "blocking": false, "machine_evidence": ["source-langrensha-community"], "human_review": "PENDING"},
+    {"requirement_id": "claim-community-duotegame-sheriff-election-tie", "required": false, "status": "DEFERRED", "blocking": false, "machine_evidence": ["source-duotegame-12-sheriff"], "human_review": "REQUIRED_BEFORE_RELEASE"},
+    {"requirement_id": "claim-community-lingyuq-sheriff-election-tie", "required": false, "status": "DEFERRED", "blocking": false, "machine_evidence": ["source-lingyuq-12-sheriff"], "human_review": "REQUIRED_BEFORE_RELEASE"},
+    {"requirement_id": "claim-netease-witch-no-self-heal", "required": true, "status": "SATISFIED", "blocking": false, "machine_evidence": ["source-netease-12-standard"], "human_review": "PENDING"},
+    {"requirement_id": "claim-netease-witch-one-potion-per-night", "required": true, "status": "SATISFIED", "blocking": false, "machine_evidence": ["source-netease-12-standard"], "human_review": "PENDING"},
+    {"requirement_id": "claim-netease-hunter-trigger", "required": true, "status": "SATISFIED", "blocking": false, "machine_evidence": ["source-netease-12-standard"], "human_review": "PENDING"},
+    {"requirement_id": "claim-netease-hunter-poison-block", "required": true, "status": "SATISFIED", "blocking": false, "machine_evidence": ["source-netease-12-standard"], "human_review": "PENDING"},
+    {"requirement_id": "claim-netease-idiot-exile", "required": true, "status": "SATISFIED", "blocking": false, "machine_evidence": ["source-netease-12-standard"], "human_review": "PENDING"},
+    {"requirement_id": "claim-netease-night-order", "required": false, "status": "DEFERRED", "blocking": false, "machine_evidence": ["source-netease-12-standard"], "human_review": "SYSTEM_DESIGN_REVIEW_REQUIRED"},
+    {"requirement_id": "claim-netease-day-vote", "required": true, "status": "SATISFIED", "blocking": false, "machine_evidence": ["source-netease-12-standard"], "human_review": "PENDING"},
+    {"requirement_id": "claim-community-witch-target-information", "required": true, "status": "SATISFIED", "blocking": false, "machine_evidence": ["source-langrensha-community"], "human_review": "PENDING"},
+    {"requirement_id": "claim-community-wolf-consensus", "required": true, "status": "SATISFIED", "blocking": false, "machine_evidence": ["source-langrensha-community"], "human_review": "PENDING"},
+    {"requirement_id": "claim-community-day-vote-pk", "required": true, "status": "SATISFIED", "blocking": false, "machine_evidence": ["source-langrensha-community"], "human_review": "PENDING"},
+    {"requirement_id": "claim-community-sheriff-transfer", "required": true, "status": "SATISFIED", "blocking": false, "machine_evidence": ["source-langrensha-community"], "human_review": "PENDING"}
+  ]
+}

@@ -1,0 +1,47 @@
+schema_version: 1
+
+# Board independent action types. A published ruleset selects which actions
+# are enabled in each window and supplies role, target, and resource context.
+actions:
+  - action_code: 101
+    action_name: WOLF_KILL
+    target_policy: alive_non_authorized_wolf
+    target_count: 1
+  - action_code: 102
+    action_name: SEER_INSPECT
+    target_policy: other_alive
+    target_count: 1
+  - action_code: 103
+    action_name: WITCH_POISON
+    target_policy: board_eligible
+    target_count: 1
+    resource_id: witch_poison
+  - action_code: 104
+    action_name: WITCH_HEAL
+    target_policy: current_kill_not_self
+    target_count: 1
+    resource_id: witch_heal
+  - action_code: 105
+    action_name: HUNTER_SHOOT
+    target_policy: other_alive
+    target_count: 1
+  - action_code: 106
+    action_name: GUARD_PROTECT
+    target_policy: board_eligible
+    target_count: 1
+  - action_code: 107
+    action_name: SELF_SACRIFICE_TAKE
+    target_policy: self_and_other_alive
+    target_count: 2
+  - action_code: 201
+    action_name: VOTE
+    target_policy: candidate
+    target_count: 1
+  - action_code: 202
+    action_name: ABSTAIN
+    target_policy: none
+    target_count: 0
+  - action_code: 299
+    action_name: PASS
+    target_policy: none
+    target_count: 0

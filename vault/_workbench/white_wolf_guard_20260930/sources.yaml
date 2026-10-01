@@ -1,0 +1,46 @@
+schema_version: 1
+sources:
+  - schema_version: 1
+    source_id: source-white-wolf-king-guide
+    url: https://langrensha.com/hantiao/juese/2018/07/09/26896_763548.html
+    title: 白狼王守卫板子角色规则摘要
+    publisher: langrensha.com 页面（来源身份待人工复核）
+    source_class: PLATFORM_RULES
+    fetched_at: 2026-09-30T00:00:00Z
+    content_sha256: ffa8aa0fc4556e24335a790cfb9e270da09af37f9cf43928a0d0231fce4c2dd6
+    excerpt: >-
+      Agent Reach 网页搜索摘要：页面介绍白狼王守卫板子，并说明白狼王可以在白天自爆并带走一名玩家；摘要同时提到该效果不因女巫解药或守卫保护而取消。该记录只对保存的研究摘要负责，不声称保存了网页原文；自爆精确窗口、目标存活条件和结算顺序待人工复核。
+    retrieval_method: agent_reach_search_excerpt
+  - schema_version: 1
+    source_id: source-wpl-2019-board
+    url: https://langrensha.com/m/2019/wpl/rules.html
+    title: WPL 2019 白狼王守卫十二人板子摘要
+    publisher: langrensha.com 页面（来源身份待人工复核）
+    source_class: PLATFORM_RULES
+    fetched_at: 2026-09-30T00:00:00Z
+    content_sha256: 226188a8aa43e60d27ee7da4b8385035141a15536af9b64409d1052bbf42a761
+    excerpt: >-
+      Agent Reach 网页搜索摘要：规则页列出12人白狼王守卫板子，包括3名普通狼人、1名白狼王、4名平民，以及预言家、女巫、猎人、守卫各1名。警长、平票、遗言及夜间结算等主持细节未由本摘要冻结。
+    retrieval_method: agent_reach_search_excerpt
+  - schema_version: 1
+    source_id: source-guard-strategy
+    url: https://www.langrensha.net/strategy/2023011002.html
+    title: 守卫技能与白狼王守卫板子攻略摘要
+    publisher: langrensha.net 社区攻略
+    source_class: STRATEGY_GUIDE
+    fetched_at: 2026-09-30T00:00:00Z
+    content_sha256: c7fb7b371db0d3d0a3f8100af07f2d711232b66156714093dc5ff6810e55254b
+    excerpt: >-
+      Agent Reach 网页搜索摘要：资料说明守卫每晚可保护一名玩家，通常不能连续两晚保护同一目标，并补充白狼王守卫板子的屠边胜负口径。守卫能否自守及其与女巫解药的同时效果待人工复核。
+    retrieval_method: agent_reach_search_excerpt
+  - schema_version: 1
+    source_id: source-guard-interaction
+    url: https://m.17u1u.com/xiuxian/lrbxs/702797.html
+    title: 守卫与白狼王自爆交互规则摘要
+    publisher: 17u1u 社区资料
+    source_class: COMMUNITY
+    fetched_at: 2026-09-30T00:00:00Z
+    content_sha256: 841b41963cf178d332f28977ce8639d98cd011f88433bf303a9377b85b81b866
+    excerpt: >-
+      Agent Reach 网页搜索摘要：资料补充描述守卫保护、女巫解药以及白狼王自爆之间的常见处理方式，但不同主持版本可能对同时效果、先后顺序和自爆无视保护有差异。本候选只把它作为冲突线索，不编译成运行时裁定。
+    retrieval_method: agent_reach_search_excerpt

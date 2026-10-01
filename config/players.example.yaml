@@ -1,0 +1,12 @@
+schema_version: 1
+players:
+  - seat: 1
+    runtime: pi
+    provider: provider_a
+    model: model_a
+    reasoning: medium
+  - seat: 2
+    runtime: pi
+    provider: provider_b
+    model: model_b
+    reasoning: high

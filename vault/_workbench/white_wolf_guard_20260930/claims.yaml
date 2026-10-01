@@ -1,0 +1,101 @@
+schema_version: 1
+claims:
+  - schema_version: 1
+    claim_id: claim-wwg-board-composition
+    ruleset_candidate_id: classic_12_white_wolf_guard
+    key: board.role_composition
+    value:
+      wolf: 3
+      white_wolf_king: 1
+      villager: 4
+      seer: 1
+      witch: 1
+      hunter: 1
+      guard: 1
+    scope: BOARD
+    conditions: {}
+    evidence_ids: [source-wpl-2019-board]
+    confidence: 0.9
+    extraction_note: WPL 2019 摘要列出的12人角色构成；来源身份和原文仍需人工复核。
+    status: SUPPORTED
+  - schema_version: 1
+    claim_id: claim-wwg-self-explode
+    ruleset_candidate_id: classic_12_white_wolf_guard
+    key: white_wolf_king.self_explode_enabled
+    value: true
+    scope: ROLE
+    conditions: {}
+    evidence_ids: [source-white-wolf-king-guide]
+    confidence: 0.86
+    extraction_note: 搜索摘要支持白狼王拥有白天自爆并带人的主动能力；精确窗口和目标条件不在本 claim 中冻结。
+    status: SUPPORTED
+  - schema_version: 1
+    claim_id: claim-guard-night-protect
+    ruleset_candidate_id: classic_12_white_wolf_guard
+    key: guard.nightly_protect
+    value:
+      targets_per_night: 1
+      active_phase: NIGHT_ACTION
+    scope: ROLE
+    conditions: {}
+    evidence_ids: [source-guard-strategy]
+    confidence: 0.84
+    extraction_note: 社区攻略摘要支持守卫每晚选择一名保护目标；自守细节待决策。
+    status: SUPPORTED
+  - schema_version: 1
+    claim_id: claim-guard-no-repeat
+    ruleset_candidate_id: classic_12_white_wolf_guard
+    key: guard.same_target_consecutive_nights
+    value: false
+    scope: ROLE
+    conditions: {}
+    evidence_ids: [source-guard-strategy]
+    confidence: 0.8
+    extraction_note: 社区攻略摘要支持守卫不能连续两晚保护同一目标。
+    status: SUPPORTED
+  - schema_version: 1
+    claim_id: claim-wwg-wolf-victory
+    ruleset_candidate_id: classic_12_white_wolf_guard
+    key: board.wolf_victory
+    value:
+      any_of: [all_gods_dead, all_villagers_dead]
+      requires_surviving_wolf: true
+    scope: BOARD
+    conditions: {}
+    evidence_ids: [source-guard-strategy]
+    confidence: 0.7
+    extraction_note: 该胜负口径来自补充攻略摘要；与主持版本的同时满足优先级和“存活狼人”安全约束仍需人工审核。
+    status: SUPPORTED
+  - schema_version: 1
+    claim_id: claim-guard-self-protect
+    ruleset_candidate_id: classic_12_white_wolf_guard
+    key: guard.can_self_protect
+    value: null
+    scope: ROLE
+    conditions: {}
+    evidence_ids: [source-guard-strategy, source-guard-interaction]
+    confidence: 0.2
+    extraction_note: 摘要没有可靠冻结守卫是否可以自守；留待主持版本决策。
+    status: UNVERIFIED
+  - schema_version: 1
+    claim_id: claim-guard-witch-resolution
+    ruleset_candidate_id: classic_12_white_wolf_guard
+    key: guard.witch_resolution_order
+    value: null
+    scope: INTERACTION
+    conditions: {}
+    evidence_ids: [source-guard-interaction]
+    confidence: 0.2
+    extraction_note: 守卫保护与女巫解药同时生效的顺序和死亡裁定未被来源一致说明；不得作为运行时规则。
+    status: UNVERIFIED
+  - schema_version: 1
+    claim_id: claim-wwg-explosion-target-window
+    ruleset_candidate_id: classic_12_white_wolf_guard
+    key: white_wolf_king.self_explode_target_and_window
+    value: null
+    scope: ROLE
+    conditions: {}
+    evidence_ids: [source-white-wolf-king-guide, source-guard-interaction]
+    confidence: 0.25
+    extraction_note: 白天自爆的精确主持窗口、被带走目标是否必须存活以及无视保护的结算次序待人工决定。
+    status: UNVERIFIED

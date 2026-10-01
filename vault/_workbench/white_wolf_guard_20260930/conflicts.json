@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "candidate_id": "classic_12_white_wolf_guard",
+  "human_review_required": true,
+  "needs_human_decision": true,
+  "conflicts": [
+    {
+      "conflict_id": "conflict-white-wolf-king-window",
+      "field": "white_wolf_king.self_explode_target_and_window",
+      "sources": ["source-white-wolf-king-guide", "source-guard-interaction"],
+      "status": "REVIEW_REQUIRED",
+      "resolution": "DEFERRED_TO_HUMAN_REVIEW",
+      "note": "机器角色文档保留白天 DAY_SPEECH 主动窗口和有序双目标契约以便联调；目标存活条件、精确发动时点、无视守护/解药的结算顺序仍未冻结。"
+    },
+    {
+      "conflict_id": "conflict-guard-self-protect",
+      "field": "guard.can_self_protect",
+      "sources": ["source-guard-strategy", "source-guard-interaction"],
+      "status": "REVIEW_REQUIRED",
+      "resolution": "DEFERRED_TO_HUMAN_REVIEW",
+      "note": "守卫自守规则没有可靠一致证据，角色文档暂不把它写入 board override。"
+    },
+    {
+      "conflict_id": "conflict-guard-witch-order",
+      "field": "guard.witch_resolution_order",
+      "sources": ["source-guard-interaction"],
+      "status": "REVIEW_REQUIRED",
+      "resolution": "DEFERRED_TO_HUMAN_REVIEW",
+      "note": "守卫和女巫同时效果的结算顺序保持 NEEDS_DECISION，运行时不得从该候选推断。"
+    },
+    {
+      "conflict_id": "conflict-source-identity",
+      "field": "source.publisher_identity",
+      "sources": ["source-white-wolf-king-guide", "source-wpl-2019-board"],
+      "status": "REVIEW_REQUIRED",
+      "resolution": "REFETCH_BEFORE_APPROVAL",
+      "note": "本次网络读取超时；工作台保存的是 Agent Reach 搜索摘要和摘要文件哈希，不是网页原文哈希。正式审核前必须重新抓取并核实来源身份。"
+    }
+  ],
+  "unresolved_conflicts": [
+    "white_wolf_king.self_explode_target_and_window",
+    "guard.can_self_protect",
+    "guard.witch_resolution_order"
+  ],
+  "resolution_note": "这是可供加载和编译的候选知识包，保留人工决策门禁，不得直接发布到 vault/compiled。"
+}

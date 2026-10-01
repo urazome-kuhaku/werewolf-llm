@@ -1,0 +1,5 @@
+# Minimal configuration placeholder for the environment skeleton.
+# Game and model settings are introduced by later milestones.
+project:
+  name: werewolf-arena
+  board: pre-witch-hunter-white

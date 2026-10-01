@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "sources": [
+    {
+      "schema_version": 1,
+      "source_id": "source-netease-12-standard",
+      "url": "https://langrensha.163.com/wanfa/guize/2017/10/18/26899_719311.html",
+      "title": "《狼人杀·官方正版》12人标准场规则",
+      "publisher": "网易狼人杀·官方正版",
+      "source_class": "PLATFORM_RULES",
+      "published_at": null,
+      "fetched_at": "2026-09-28T01:19:39Z",
+      "content_sha256": "1c82028f483a04b6ec45b4a7ba0038e2a12d8991098b57f26faf88a694fa8a1b",
+      "excerpt_path": "sources/source-netease-12-standard.md",
+      "retrieval_method": "curl_https_raw_body",
+      "raw_path": "sources/raw/source-netease-12-standard.html"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "source-lanke-rulebook-secondary",
+      "url": "https://lanke.fun/wp-content/uploads/2024/06/%E7%AC%AC%E4%BA%8C%E7%89%88%E7%8B%BC%E4%BA%BA%E6%9D%80%E6%B3%95%E5%85%B8.pdf",
+      "title": "第二版狼人杀法典",
+      "publisher": "烂柯法典（补充资料）",
+      "source_class": "MATURE_RULE_GUIDE",
+      "published_at": null,
+      "fetched_at": "2026-09-28T01:19:39Z",
+      "content_sha256": "39d68b7b3f4cbebb91c22179474f7bd695e4c68f8f242e2404e9500c5bbf6420",
+      "excerpt_path": "sources/source-lanke-rulebook-secondary.md",
+      "retrieval_method": "curl_https_raw_body",
+      "raw_path": "sources/raw/source-lanke-rulebook-secondary.pdf"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "source-langrensha-community",
+      "url": "https://www.langrensha.net/strategy/2021050801.html",
+      "title": "狼人杀规则补充：警长、投票与女巫刀口",
+      "publisher": "领域圈（转载/社区规则说明）",
+      "source_class": "COMMUNITY",
+      "published_at": null,
+      "fetched_at": "2026-09-28T01:19:39Z",
+      "content_sha256": "72ff9ef493b9801cae3269446a2634f18ccfc7c2115bd93fb7dd8bea9ba8608d",
+      "excerpt_path": "sources/source-langrensha-community.md",
+      "retrieval_method": "curl_https_raw_body",
+      "raw_path": "sources/raw/source-langrensha-community.html"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "source-duotegame-12-sheriff",
+      "url": "https://www.duotegame.com/mgl/31582.html",
+      "title": "狼人杀12人局基本玩法",
+      "publisher": "多特游戏（攻略整理）",
+      "source_class": "COMMUNITY",
+      "published_at": "2021-10-15T13:11:07Z",
+      "fetched_at": "2026-09-28T01:16:26Z",
+      "content_sha256": "cf7c7804cbff74edd895e54aac8e1148d7aeed30f2928e498c2522badf5a40fa",
+      "excerpt_path": "sources/source-duotegame-12-sheriff.md",
+      "retrieval_method": "saved_excerpt_sha256"
+    },
+    {
+      "schema_version": 1,
+      "source_id": "source-lingyuq-12-sheriff",
+      "url": "https://www.lingyuq.com/guides/81407.html",
+      "title": "狼人杀标准游戏规则（领域圈转载）",
+      "publisher": "领域圈（转载页面）",
+      "source_class": "COMMUNITY",
+      "published_at": null,
+      "fetched_at": "2026-09-28T01:16:26Z",
+      "content_sha256": "27ba195f7d0f36e9a6c50fb89ae345876fcc2c388fe8b36ebcb555e2a9b01034",
+      "excerpt_path": "sources/source-lingyuq-12-sheriff.md",
+      "retrieval_method": "saved_excerpt_sha256"
+    }
+  ]
+}

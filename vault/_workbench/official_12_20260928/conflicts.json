@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "candidate_id": "classic_12_seer_witch_hunter_idiot",
+  "human_review_required": true,
+  "needs_human_decision": false,
+  "conflicts": [
+    {
+      "conflict_id": "conflict-day-vote-tie",
+      "field": "mechanic.day_vote_tie",
+      "sources": ["source-netease-12-standard", "source-langrensha-community"],
+      "status": "REVIEW_REQUIRED",
+      "resolution": "DEFERRED_TO_HUMAN_REVIEW",
+      "note": "主来源未完整说明普通投票平票；当前机器候选采用社区来源的 PK 后再次平票不放逐，需人工确认版本适配性。"
+    },
+    {
+      "conflict_id": "conflict-witch-target-information",
+      "field": "witch.knows_wolf_target",
+      "sources": ["source-netease-12-standard", "source-langrensha-community"],
+      "status": "REVIEW_REQUIRED",
+      "resolution": "DEFERRED_TO_HUMAN_REVIEW",
+      "note": "网易页面未冻结刀口告知时序；当前只保留社区来源的条件化候选。"
+    },
+    {
+      "conflict_id": "conflict-sheriff-transfer",
+      "field": "board.sheriff_transfer",
+      "sources": ["source-netease-12-standard", "source-langrensha-community"],
+      "status": "REVIEW_REQUIRED",
+      "resolution": "DEFERRED_TO_HUMAN_REVIEW",
+      "note": "警徽移交或撕徽由补充来源提出，网易主来源未完整说明。"
+    },
+    {
+      "conflict_id": "conflict-community-sheriff-vote-weight",
+      "field": "board.sheriff_vote_weight",
+      "sources": ["source-netease-12-standard", "source-langrensha-community"],
+      "status": "REVIEW_REQUIRED",
+      "resolution": "PRIMARY_SOURCE_PRIORITY",
+      "note": "社区页面存在2票口径；候选保留网易主来源的1.5票，并将主来源优先级留给人工审核确认。"
+    },
+    {
+      "conflict_id": "conflict-retrieval-freshness",
+      "field": "source.retrieval_freshness",
+      "sources": ["source-duotegame-12-sheriff", "source-lingyuq-12-sheriff"],
+      "status": "REVIEW_REQUIRED",
+      "resolution": "REFETCH_BEFORE_APPROVAL",
+      "note": "这两条来源保留先前 HTTPS/MCP 抓取记录和 hash；本次直接 HTTPS 重取分别返回404/未成功，批准前需重新核验。"
+    },
+    {
+      "conflict_id": "conflict-victory-priority",
+      "field": "board.victory_conditions_priority",
+      "sources": ["source-netease-12-standard"],
+      "status": "REVIEW_REQUIRED",
+      "resolution": "HOST_DECISION_REQUIRED",
+      "note": "主来源明确屠边条件，但未冻结至少一名狼人存活的安全约束，也未说明双方终局条件同时成立时的优先顺序；运行时必须由主持版本明确。"
+    },
+    {
+      "conflict_id": "conflict-night-resolution-boundary",
+      "field": "mechanic.night_resolution",
+      "sources": ["source-netease-12-standard"],
+      "status": "REVIEW_REQUIRED",
+      "resolution": "SYSTEM_DESIGN_REQUIRED",
+      "note": "官方页面列出角色夜间行动，但没有规定实现层是否必须采用单一 NIGHT_RESOLVE 阶段；当前字段是系统调度选择，需随主持/运行时版本审核。"
+    },
+    {
+      "conflict_id": "conflict-runtime-default-fields",
+      "field": "board.runtime_default_fields",
+      "sources": ["source-netease-12-standard", "source-langrensha-community"],
+      "status": "REVIEW_REQUIRED",
+      "resolution": "SYSTEM_DESIGN_REQUIRED",
+      "note": "night_windows 的依赖/顺序、day_flow 的公开时点、knife_rule.final_target_required、投票公开粒度及 action request/resolve 的写入边界是实现字段；现有来源只部分描述主持流程，未逐项冻结这些机器语义。"
+    }
+  ],
+  "unresolved_conflicts": [],
+  "resolution_note": "机器结构门禁可评估；REVIEW_REQUIRED 仅表示发布前必须有人审核，不代表已经人工批准。"
+}
