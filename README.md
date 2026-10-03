@@ -232,6 +232,8 @@ uv run werewolf archive verify .runtime/cli-ascii-final-20261001/games/archive/2
 
 ## 开发检查
 
+在 `werewolf-dev` 分支开发时，修改前执行 `git pull --ff-only` 同步远端，提交后执行 `git push` 推送变更。
+
 ```powershell
 uv run pytest
 uv run ruff check .
