@@ -14,7 +14,7 @@ import math
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 from pydantic import JsonValue
 
@@ -41,6 +41,7 @@ from .events import (
     PrivateSeerResultPayload,
     PublicAnnouncementPayload,
     PublicSpeechPayload,
+    PublicVoteBallot,
     PublicVoteResultPayload,
     TeamSpeechPayload,
 )
@@ -438,6 +439,69 @@ def _vote_state_payload(state: VoteState) -> dict[str, object]:
     """Return the JSON snapshot form used by ``GameState.vote_state``."""
 
     return state.model_dump(mode="json")
+
+
+def _validate_vote_board(board: BoardDefinition, state: GameState) -> None:
+    """Check that a vote publication policy belongs to this frozen game."""
+
+    if not isinstance(board, BoardDefinition):
+        raise VoteError("BOARD_INVALID", "board must be a validated BoardDefinition")
+    if board.status != "published" or (
+        board.reviewed_by == "pending-human-review" and not experimental_preview_enabled()
+    ):
+        raise VoteError("BOARD_NOT_REVIEWED", "vote publication requires a reviewed board")
+    if (
+        state.ruleset is None
+        or state.ruleset.board_id != board.board_id
+        or state.ruleset.version != board.version
+    ):
+        raise VoteError("RULESET_MISMATCH", "board does not match the frozen game ruleset")
+
+
+def _public_vote_payload(
+    vote_state: VoteState,
+    *,
+    board: BoardDefinition | None,
+    vote_kind: Literal["day", "day_pk", "sheriff", "sheriff_pk"],
+    elected_seat: int | None = None,
+) -> PublicVoteResultPayload:
+    """Project a confirmed private vote according to the frozen board policy.
+
+    A missing board is retained only for older low-level callers and produces
+    the historical tally-only event.  Production coordinators always pass
+    their validated board, so no caller-controlled reveal flag can widen the
+    projection.
+    """
+
+    result = vote_state.public_result
+    if result is None:  # pragma: no cover - callers confirm before projecting
+        raise EventCommitError("VOTE_RESULT_INVALID: confirmation produced no result")
+    reveal = "totals_only" if board is None else board.day_flow.vote.reveal_after_close
+    if reveal == "ballots_and_totals":
+        ballots = tuple(
+            PublicVoteBallot(
+                voter_seat=seat,
+                target_seat=ballot.target_seat,
+                weight=ballot.vote_weight,
+            )
+            for seat, ballot in sorted(vote_state.ballots.items())
+        )
+        tally = dict(result.tally.counts)
+    elif reveal == "totals_only":
+        ballots = ()
+        tally = dict(result.tally.counts)
+    elif reveal == "none":
+        ballots = ()
+        tally = {}
+    else:  # pragma: no cover - BoardDefinition constrains this field
+        raise EventCommitError("VOTE_POLICY_INVALID: unsupported reveal_after_close policy")
+    return PublicVoteResultPayload(
+        vote_kind=vote_kind,
+        eliminated_seat=(None if vote_kind.startswith("sheriff") else result.eliminated_seat),
+        elected_seat=elected_seat,
+        tally=tally,
+        ballots=ballots,
+    )
 
 
 def _load_sheriff_election(raw: object) -> SheriffElectionState:
@@ -1706,14 +1770,31 @@ def _reduce_action_resolution(
 
 
 def _typed_events(state: GameState) -> tuple[GameEvent, ...]:
-    """Return protocol events and reject legacy records for new commits."""
+    """Restore typed events from in-memory or JSON snapshot representations."""
 
-    legacy = tuple(event for event in state.events if not isinstance(event, GameEvent))
-    if legacy:
+    restored: list[GameEvent] = []
+    for event in state.events:
+        if isinstance(event, GameEvent):
+            restored.append(event)
+            continue
+        if isinstance(event, dict):
+            try:
+                restored.append(GameEvent.model_validate_json(json.dumps(event)))
+            except (TypeError, ValueError) as exc:
+                raise EventCommitError(
+                    "event delivery requires a typed event log; migrate the legacy "
+                    "JSON snapshot first"
+                ) from exc
+            continue
         raise EventCommitError(
             "event delivery requires a typed event log; migrate the legacy JSON snapshot first"
         )
-    return tuple(event for event in state.events if isinstance(event, GameEvent))
+    event_ids = tuple(event.event_id for event in restored)
+    if tuple(sorted(set(event_ids))) != event_ids:
+        raise EventCommitError("event delivery requires sorted, unique event IDs")
+    if any(event.game_id != state.game_id for event in restored):
+        raise EventCommitError("event delivery contains an event from another game")
+    return tuple(restored)
 
 
 def _validate_new_events(
@@ -2951,15 +3032,16 @@ class GameManager:
 
     async def confirm_vote_tally(
         self,
+        board: BoardDefinition | None = None,
         *,
         expected_revision: int | None = None,
         now: datetime | None = None,
     ) -> GameState:
         """Confirm a pending tally and append exactly one public result event.
 
-        The event contains only the safe tally projection.  The private
-        ``ballots`` map remains in the authoritative snapshot and is never
-        copied into the public payload.
+        The event contains the safe projection selected by the frozen board.
+        The private ``ballots`` map remains in the authoritative snapshot
+        until confirmation and is never copied wholesale into the payload.
         """
 
         async with self._lock:
@@ -2970,7 +3052,26 @@ class GameManager:
             if self._state.vote_state is None:
                 raise VoteError("VOTE_WINDOW_NOT_OPEN", "there is no active vote window")
             vote_state = _load_vote_state(self._state.vote_state)
-            confirmed = vote_state.confirm_tally()
+            if board is not None:
+                _validate_vote_board(board, self._state)
+            vote_kind: Literal["day", "day_pk"] = (
+                "day_pk" if self._state.phase is GamePhase.VOTE_PK else "day"
+            )
+            if vote_state.status is VoteStatus.RESOLVED:
+                correlation_id = vote_state.window.window_id
+                existing_events = _typed_events(self._state)
+                if any(
+                    event.event_type is EventType.VOTE_RESULT
+                    and event.correlation_id == correlation_id
+                    for event in existing_events
+                ):
+                    return self._state
+                # A legacy snapshot may contain a resolved vote without its
+                # event.  Reconstruct the missing event from the confirmed
+                # projection, preserving idempotent recovery semantics.
+                confirmed = vote_state
+            else:
+                confirmed = vote_state.confirm_tally()
             result = confirmed.public_result
             if result is None:  # pragma: no cover - guarded by confirm_tally
                 raise EventCommitError("VOTE_RESULT_INVALID: confirmation produced no result")
@@ -2978,9 +3079,10 @@ class GameManager:
             event_id = max((event.event_id for event in events), default=0) + 1
             commit_revision = self._state.state_revision + 1
             timestamp = now or utc_now()
-            payload = PublicVoteResultPayload(
-                eliminated_seat=result.eliminated_seat,
-                tally=dict(result.tally.counts),
+            payload = _public_vote_payload(
+                confirmed,
+                board=board,
+                vote_kind=vote_kind,
             )
             event = GameEvent.public(
                 event_id=event_id,
@@ -3010,6 +3112,7 @@ class GameManager:
 
     async def confirm_vote_and_transition(
         self,
+        board: BoardDefinition | None = None,
         *,
         expected_revision: int | None = None,
         now: datetime | None = None,
@@ -3034,6 +3137,8 @@ class GameManager:
             if self._state.vote_state is None:
                 raise VoteError("VOTE_WINDOW_NOT_OPEN", "there is no vote window to confirm")
             vote_state = _load_vote_state(self._state.vote_state)
+            if board is not None:
+                _validate_vote_board(board, self._state)
 
             if vote_state.status is VoteStatus.RESOLVED:
                 result = vote_state.public_result
@@ -3088,9 +3193,10 @@ class GameManager:
                 created_at=timestamp,
                 event_type=EventType.VOTE_RESULT,
                 eligible_seats=tuple(sorted(self._state.players)),
-                payload=PublicVoteResultPayload(
-                    eliminated_seat=result.eliminated_seat,
-                    tally=dict(result.tally.counts),
+                payload=_public_vote_payload(
+                    confirmed,
+                    board=board,
+                    vote_kind=("day_pk" if self._state.phase is GamePhase.VOTE_PK else "day"),
                 ),
                 correlation_id=vote_state.window.window_id,
             )
@@ -3415,12 +3521,40 @@ class GameManager:
             )
             _revision_check(self._state, revision)
             current = self._state
+            _validate_sheriff_board(board, current)
+            # A completed confirmation can be retried after a caller loses
+            # its response.  The event correlation is the frozen vote window
+            # ID, so this recovery path never appends a duplicate result.
+            if current.phase in {
+                GamePhase.SHERIFF_ELECTION_PK_SPEECH,
+                GamePhase.SHERIFF_TRANSFER,
+            }:
+                recovered = _load_sheriff_election(current.sheriff_election)
+                correlation_id: str | None = None
+                if (
+                    current.phase is GamePhase.SHERIFF_ELECTION_PK_SPEECH
+                    and recovered.status is SheriffElectionStatus.SPEECH
+                    and recovered.vote_history
+                ):
+                    correlation_id = recovered.vote_history[-1].window.window_id
+                elif (
+                    current.phase is GamePhase.SHERIFF_TRANSFER
+                    and recovered.status
+                    in {SheriffElectionStatus.RESOLVED, SheriffElectionStatus.NO_SHERIFF}
+                    and recovered.vote is not None
+                ):
+                    correlation_id = recovered.vote.window.window_id
+                if correlation_id is not None and any(
+                    event.event_type is EventType.VOTE_RESULT
+                    and event.correlation_id == correlation_id
+                    for event in _typed_events(current)
+                ):
+                    return current
             election = self._require_sheriff_phase(
                 current,
                 phase=(GamePhase.SHERIFF_ELECTION, GamePhase.SHERIFF_ELECTION_PK),
                 status=SheriffElectionStatus.WAITING_GM,
             )
-            _validate_sheriff_board(board, current)
             # Confirming the first tied tally is itself the atomic edge into
             # the PK speech phase.  The tied candidates and tie_round are
             # derived from the private tally; callers cannot replace either.
@@ -3430,21 +3564,53 @@ class GameManager:
                 and election.decision.action.name == "PK"
             ):
                 try:
-                    started_pk = election.begin_pk()
+                    if election.vote is None:
+                        raise SheriffElectionError(
+                            "TALLY_INVALID", "the pending sheriff tally has no vote state"
+                        )
+                    confirmed_vote = election.vote.confirm_tally()
+                    started_pk = election.model_copy(update={"vote": confirmed_vote}).begin_pk()
                 except SheriffElectionError:
                     raise
-                data = _state_data(current)
-                data["sheriff_election"] = _sheriff_election_payload(started_pk)
-                intermediate = GameState.model_validate(data)
-                try:
-                    committed = transition_phase(
-                        intermediate,
-                        GamePhase.SHERIFF_ELECTION_PK_SPEECH,
-                        expected_revision=revision,
-                        now=utc_now() if now is None else now,
+                except VoteError as exc:
+                    raise SheriffElectionError(exc.code, str(exc)) from exc
+                target_phase = GamePhase.SHERIFF_ELECTION_PK_SPEECH
+                if not can_transition(current.phase, target_phase):
+                    raise SheriffElectionError(
+                        "PHASE_INVALID", "sheriff election cannot enter PK speech"
                     )
-                except (TypeError, ValueError) as exc:
-                    raise SheriffElectionError("PHASE_INVALID", str(exc)) from exc
+                timestamp = now or utc_now()
+                events = _typed_events(current)
+                event = GameEvent.public(
+                    event_id=max((item.event_id for item in events), default=0) + 1,
+                    game_id=current.game_id,
+                    state_revision=current.state_revision + 1,
+                    round_no=current.round_no,
+                    phase=current.phase,
+                    created_at=timestamp,
+                    event_type=EventType.VOTE_RESULT,
+                    eligible_seats=tuple(sorted(current.players)),
+                    payload=_public_vote_payload(
+                        confirmed_vote,
+                        board=board,
+                        vote_kind="sheriff",
+                    ),
+                    correlation_id=confirmed_vote.window.window_id,
+                )
+                committed_events = _reduce_event_delivery(
+                    current,
+                    StatePatch.event_delivery(
+                        (event,),
+                        expected_revision=revision,
+                        now=timestamp,
+                    ),
+                )
+                data = _state_data(committed_events)
+                data["sheriff_election"] = _sheriff_election_payload(started_pk)
+                data["phase"] = target_phase
+                data["state_revision"] = committed_events.state_revision
+                data["updated_at"] = timestamp
+                committed = GameState.model_validate(data)
                 self._state = committed
                 return committed
             try:
@@ -3452,7 +3618,48 @@ class GameManager:
             except SheriffElectionError:
                 raise
 
-            data = _state_data(current)
+            if confirmed.vote is None or confirmed.vote.public_result is None:
+                raise SheriffElectionError(
+                    "TALLY_INVALID", "confirmed sheriff election has no public result"
+                )
+            target_phase = GamePhase.SHERIFF_TRANSFER
+            if not can_transition(current.phase, target_phase):
+                raise SheriffElectionError(
+                    "PHASE_INVALID", "sheriff election cannot enter transfer"
+                )
+            timestamp = now or utc_now()
+            events = _typed_events(current)
+            event = GameEvent.public(
+                event_id=max((item.event_id for item in events), default=0) + 1,
+                game_id=current.game_id,
+                state_revision=current.state_revision + 1,
+                round_no=current.round_no,
+                phase=current.phase,
+                created_at=timestamp,
+                event_type=EventType.VOTE_RESULT,
+                eligible_seats=tuple(sorted(current.players)),
+                payload=_public_vote_payload(
+                    confirmed.vote,
+                    board=board,
+                    vote_kind=(
+                        "sheriff_pk"
+                        if current.phase is GamePhase.SHERIFF_ELECTION_PK
+                        else "sheriff"
+                    ),
+                    elected_seat=confirmed.sheriff_seat,
+                ),
+                correlation_id=confirmed.vote.window.window_id,
+            )
+            committed_events = _reduce_event_delivery(
+                current,
+                StatePatch.event_delivery(
+                    (event,),
+                    expected_revision=revision,
+                    now=timestamp,
+                ),
+            )
+
+            data = _state_data(committed_events)
             data["sheriff_election"] = _sheriff_election_payload(confirmed)
             data["sheriff_seat"] = confirmed.sheriff_seat
             if confirmed.sheriff_seat is not None:
@@ -3466,16 +3673,10 @@ class GameManager:
                 player_data["vote_weight"] = board.day_flow.sheriff.vote_weight
                 players[confirmed.sheriff_seat] = player_data
                 data["players"] = players
-            intermediate = GameState.model_validate(data)
-            try:
-                committed = transition_phase(
-                    intermediate,
-                    GamePhase.SHERIFF_TRANSFER,
-                    expected_revision=revision,
-                    now=utc_now() if now is None else now,
-                )
-            except (TypeError, ValueError) as exc:
-                raise SheriffElectionError("PHASE_INVALID", str(exc)) from exc
+            data["phase"] = target_phase
+            data["state_revision"] = committed_events.state_revision
+            data["updated_at"] = timestamp
+            committed = GameState.model_validate(data)
             self._state = committed
             return committed
 

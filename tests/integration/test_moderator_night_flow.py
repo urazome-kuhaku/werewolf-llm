@@ -19,7 +19,7 @@ from werewolf.game import (
     RulesetRef,
     load_action_registry,
 )
-from werewolf.game.events import EventType
+from werewolf.game.events import EventType, GameEvent, TeamSpeechPayload
 from werewolf.knowledge.board import BoardDefinition
 from werewolf.knowledge.role import ResourceDefinition, TargetKind, TargetRule, UsageLimit
 from werewolf.moderator import ModeratorError, ModeratorShell
@@ -36,7 +36,9 @@ from werewolf.runtime.scripted_runtime import ScriptedRuntime
 NOW = datetime(2026, 9, 28, tzinfo=UTC)
 
 
-def _board() -> BoardDefinition:
+def _board(
+    *, final_target_required: bool = True, plan_confirmation_required: bool = True
+) -> BoardDefinition:
     return BoardDefinition.model_validate(
         {
             "schema_version": 1,
@@ -76,7 +78,12 @@ def _board() -> BoardDefinition:
                 "discussion_enabled": True,
                 "identity_visibility": "members",
             },
-            "knife_rule": {"selection_mode": "consensus", "target_visibility": "wolf_team"},
+            "knife_rule": {
+                "selection_mode": "consensus",
+                "target_visibility": "wolf_team",
+                "final_target_required": final_target_required,
+                "plan_confirmation_required": plan_confirmation_required,
+            },
             "night_windows": [
                 {"window_id": "wolf_team_chat", "visible_to": ["wolf"]},
                 {"window_id": "wolf_kill", "depends_on": ["wolf_team_chat"]},
@@ -180,11 +187,76 @@ async def _team_runtime(seat: int, script: list[object]) -> ScriptedRuntime:
 async def _open_action(flow: ModeratorNightFlow) -> None:
     await flow.open()
     # Existing action-window tests focus on the action/resolution boundary.
-    # Mark the private team round complete explicitly so the moderator guard
-    # still enforces that team speech cannot be skipped in production.
+    # Seed the same authenticated durable discussion and final-plan records
+    # that the real team schedulers would commit before crossing it.
+    await _seed_consensus_boundary(flow)
     flow._manager._state = flow.state.model_copy(update={"current_queue": ()})  # type: ignore[attr-defined]
     await flow.advance()
     await flow.open()
+
+
+async def _seed_consensus_boundary(flow: ModeratorNightFlow) -> None:
+    """Commit a complete team discussion and final plan for action fixtures."""
+
+    window = flow._current_team_window()
+    generation = await flow._start_team_discussion(window)
+    state = flow.state
+    next_event_id = (
+        max(
+            (getattr(event, "event_id", 0) for event in state.events),
+            default=0,
+        )
+        + 1
+    )
+    speeches = tuple(
+        GameEvent.team(
+            event_id=next_event_id + offset,
+            game_id=state.game_id,
+            state_revision=state.state_revision + 1,
+            round_no=state.round_no,
+            phase=GamePhase.NIGHT_TEAM_CHAT,
+            created_at=NOW,
+            event_type=EventType.TEAM_SPEECH,
+            authorized_seats=window.allowed_seats,
+            actor_seat=seat,
+            correlation_id=f"fixture-discussion-g{generation}-s{seat}",
+            payload=TeamSpeechPayload(speaker_seat=seat, content="fixture proposal"),
+        )
+        for offset, seat in enumerate(window.allowed_seats)
+    )
+    await flow._manager.commit_events(tuple(speeches), now=NOW)
+    state = flow.state
+    coordinator = flow.wolf_coordinator_seat
+    assert coordinator is not None
+    await flow._manager.commit_moderator_operation(
+        operation="WOLF_PLAN_STARTED",
+        command="night plan next",
+        expected_revision=state.state_revision,
+        reason=(
+            f"round={state.round_no};window={window.window_id};generation={generation};"
+            f"coordinator={coordinator}"
+        ),
+        now=NOW,
+    )
+    state = flow.state
+    plan = GameEvent.team(
+        event_id=max(
+            (getattr(event, "event_id", 0) for event in state.events),
+            default=0,
+        )
+        + 1,
+        game_id=state.game_id,
+        state_revision=state.state_revision + 1,
+        round_no=state.round_no,
+        phase=GamePhase.NIGHT_TEAM_CHAT,
+        created_at=NOW,
+        event_type=EventType.TEAM_SPEECH,
+        authorized_seats=window.allowed_seats,
+        actor_seat=coordinator,
+        correlation_id=flow._plan_logical_request_id(state, coordinator),
+        payload=TeamSpeechPayload(speaker_seat=coordinator, content="fixture final plan"),
+    )
+    await flow._manager.commit_events((plan,), now=NOW)
 
 
 def _witch_board() -> BoardDefinition:
@@ -402,6 +474,7 @@ async def test_night_flow_opens_windows_and_authorizes_one_wolf_submitter() -> N
 
     team = await flow.open()
     assert team.action_window.allowed_seats == (1, 2)
+    await _seed_consensus_boundary(flow)
     manager._state = manager.state.model_copy(update={"current_queue": ()})  # type: ignore[attr-defined]
     await flow.advance()
     action = await flow.open()
@@ -869,6 +942,7 @@ async def test_night_flow_rebuilds_wolf_coordinator_after_round_state_changes() 
     assert team.action_window.window_id == "wolf_team_chat-r1"
     assert team.action_window.allowed_seats == (2,)
 
+    await _seed_consensus_boundary(flow)
     manager._state = manager.state.model_copy(update={"current_queue": ()})  # type: ignore[attr-defined]
     await flow.advance()
     action = await flow.open()

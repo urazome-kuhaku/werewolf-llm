@@ -1,0 +1,14 @@
+# Prompt hashes cover raw UTF-8 bytes; keep checked-in strategy and reading
+# Markdown files on LF line endings across Windows and POSIX checkouts.
+/prompts/*.md text eol=lf
+
+# Published artifacts are immutable raw UTF-8 bytes; never normalize line endings.
+/vault/published/** -text
+
+# Workbench Markdown and candidate manifests are hashed as UTF-8/LF bytes.
+/vault/_workbench/**/draft/**/*.md text eol=lf
+/vault/_workbench/**/sources/*.md text eol=lf
+/vault/_workbench/**/publish-manifest.json text eol=lf
+
+# Source captures are hashed as the original response bytes; never normalize them.
+/vault/_workbench/**/sources/raw/** -text

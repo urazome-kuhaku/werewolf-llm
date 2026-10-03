@@ -104,7 +104,7 @@ def _config(tmp_path: Path, **overrides: Any) -> PiProcessConfig:
 
 
 def test_windows_launcher_uses_independent_argv_and_no_shell_wrapper(tmp_path: Path) -> None:
-    config = _config(tmp_path, append_system_prompt=tmp_path / "prompt.md")
+    config = _config(tmp_path, system_prompt=tmp_path / "prompt.md")
     args = build_pi_argv(
         config,
         session_id="00000000-0000-4000-8000-000000000000",
@@ -115,11 +115,24 @@ def test_windows_launcher_uses_independent_argv_and_no_shell_wrapper(tmp_path: P
     assert "cmd" not in {part.lower() for part in args}
     assert "cmd /c" not in " ".join(args).lower()
     assert args[args.index("--session-id") + 1] == "00000000-0000-4000-8000-000000000000"
-    assert args[args.index("--append-system-prompt") + 1].endswith("prompt.md")
+    assert args[args.index("--system-prompt") + 1].endswith("prompt.md")
     assert args[args.index("--tools") + 1] == (
         "get_board,get_role,get_mechanic,get_interaction,get_rule_topic,"
         "search_rules,get_skill_status"
     )
+
+
+def test_append_system_prompt_remains_explicit_and_mutually_exclusive(tmp_path: Path) -> None:
+    config = _config(tmp_path, append_system_prompt=tmp_path / "append.md")
+    args = build_pi_argv(config, session_id="session", session_dir=tmp_path / "seat")
+    assert args[args.index("--append-system-prompt") + 1].endswith("append.md")
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _config(
+            tmp_path,
+            system_prompt=tmp_path / "replace.md",
+            append_system_prompt=tmp_path / "append.md",
+        )
 
 
 def test_environment_is_allowlisted_and_provider_scoped(tmp_path: Path) -> None:

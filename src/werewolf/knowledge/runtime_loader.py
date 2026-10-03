@@ -241,6 +241,7 @@ def _load_package_from_snapshot(
         logical_manifest,
         snapshot,
         package_load,
+        board_definition_raw=cast(Mapping[str, object], payload["board_definition"]),
         board_definition=board,
     )
     document_digests = _manifest_digests(logical_manifest)
@@ -278,9 +279,7 @@ def _load_board_definition(
     except (TypeError, ValueError, ValidationError) as exc:
         raise _RuntimePayloadError("package.board_definition is invalid") from exc
 
-    expected_payload = board.model_dump(mode="json")
-    if _canonical_json(value) != _canonical_json(expected_payload):
-        raise _RuntimePayloadError("package.board_definition is not canonical")
+    _board_definition_payload(value, board)
     if board.board_ref != snapshot.board_ref:
         raise _RuntimePayloadError("package.board_definition reference disagrees with snapshot")
     if board.status != "published":
@@ -340,6 +339,40 @@ def _load_board_definition(
                 f"package.board_definition interaction dependency is missing: {reference.format()}"
             )
     return board
+
+
+def _board_definition_payload(
+    raw: Mapping[str, object],
+    board: BoardDefinition,
+) -> dict[str, object]:
+    """Return the canonical payload represented by a frozen board model.
+
+    Packages written before ``knife_rule.plan_confirmation_required`` was
+    published omit that one field.  Their payload and identity digests must
+    remain stable, so the loader accepts exactly that legacy shape after the
+    complete board has already passed Pydantic validation.
+    """
+
+    expected = cast(dict[str, object], board.model_dump(mode="json"))
+    if _canonical_json(raw) == _canonical_json(expected):
+        return expected
+
+    raw_knife = raw.get("knife_rule")
+    expected_knife = expected.get("knife_rule")
+    if not isinstance(raw_knife, Mapping) or not isinstance(expected_knife, Mapping):
+        raise _RuntimePayloadError("package.board_definition is not canonical")
+    if "plan_confirmation_required" in raw_knife:
+        raise _RuntimePayloadError("package.board_definition is not canonical")
+    if expected_knife.get("plan_confirmation_required") is not False:
+        raise _RuntimePayloadError("package.board_definition is not canonical")
+
+    legacy_knife = dict(expected_knife)
+    legacy_knife.pop("plan_confirmation_required")
+    legacy = dict(expected)
+    legacy["knife_rule"] = legacy_knife
+    if _canonical_json(raw) != _canonical_json(legacy):
+        raise _RuntimePayloadError("package.board_definition is not canonical")
+    return legacy
 
 
 def _verify_package_at_snapshot_root(
@@ -664,6 +697,7 @@ def _validate_logical_manifest(
     snapshot: KnowledgeSnapshot,
     package_load: CompiledKnowledgePackageLoad,
     *,
+    board_definition_raw: Mapping[str, object],
     board_definition: BoardDefinition,
 ) -> None:
     expected_keys = frozenset(
@@ -689,7 +723,9 @@ def _validate_logical_manifest(
     )
     if _SHA256_RE.fullmatch(board_digest) is None:
         raise _RuntimePayloadError("package.manifest.board_definition_sha256 is invalid")
-    if board_digest != _sha256_json(board_definition.model_dump(mode="json")):
+    if board_digest != _sha256_json(
+        _board_definition_payload(board_definition_raw, board_definition)
+    ):
         raise _RuntimePayloadError("package.manifest disagrees with board_definition")
     raw_documents = manifest.get("documents")
     if not isinstance(raw_documents, list) or not raw_documents:

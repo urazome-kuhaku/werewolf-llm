@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -20,6 +21,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 def test_builds_isolated_scripted_preview_and_config(tmp_path: Path) -> None:
     output = tmp_path / "play"
+    compiled_root = PROJECT_ROOT / "vault" / "compiled"
+    before_compiled = {
+        path.relative_to(compiled_root): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in compiled_root.rglob("*")
+        if path.is_file()
+    }
 
     report = build_play_setup(output, all_scripted=True, project_root=PROJECT_ROOT)
 
@@ -28,9 +35,12 @@ def test_builds_isolated_scripted_preview_and_config(tmp_path: Path) -> None:
     assert report["source_files_verified"] == 13
     assert report["action_contract"] == "validated"
     assert (output / "preview" / "compiled").is_dir()
-    assert not (
-        PROJECT_ROOT / "vault" / "compiled" / "classic_12_seer_witch_hunter_idiot@1.0.0"
-    ).exists()
+    after_compiled = {
+        path.relative_to(compiled_root): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in compiled_root.rglob("*")
+        if path.is_file()
+    }
+    assert after_compiled == before_compiled
 
     config = yaml.safe_load((output / "game.yaml").read_text(encoding="utf-8"))
     assert config["paths"] == {"compiled_root": "preview/compiled", "games_root": "games"}

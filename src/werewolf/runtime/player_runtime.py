@@ -363,6 +363,10 @@ class InitialContext(_StrictRuntimeModel):
     seat: int = Field(ge=1)
     session_epoch: int = Field(ge=0)
     role_id: NonEmptyId | None = None
+    # This is copied from the validated assignment plan.  It is used only to
+    # select the faction strategy layer; prompt composition never infers a
+    # faction from role_id (special wolf-side roles are allowed).
+    faction_id: NonEmptyId | None = None
     system_prompt: str | None = Field(default=None, max_length=100_000)
 
 

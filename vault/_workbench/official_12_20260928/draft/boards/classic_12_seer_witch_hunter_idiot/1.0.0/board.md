@@ -79,6 +79,7 @@ knife_rule:
   selection_mode: consensus
   target_visibility: wolf_team
   final_target_required: false
+  plan_confirmation_required: true
   available_after_window: wolf_team_chat
 identity_reveal:
   reveal_on_death: false
@@ -111,7 +112,7 @@ day_flow:
   announce_deaths: true
   speech_phase: DAY_SPEECH
   vote:
-    visibility_during_collection: public
+    visibility_during_collection: secret
     reveal_after_close: ballots_and_totals
     tie_policy: pk_then_no_exile_on_retie
     eligible_voters: alive_with_vote

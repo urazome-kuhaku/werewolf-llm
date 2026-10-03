@@ -15,6 +15,7 @@ from werewolf.runtime.knowledge_bootstrap import (
 )
 from werewolf.runtime.prompt_composer import (
     DEFAULT_MAX_READING_SKILL_BYTES,
+    PromptComposerError,
     ReadingSkillIntegrityError,
     ReadingSkillNotFoundError,
     ReadingSkillTooLargeError,
@@ -106,6 +107,28 @@ def test_composed_prompt_is_stable_and_contains_only_own_card_context(
     assert "seer" not in first
     assert "effective_rules" not in first
     assert "完整规则" not in first
+
+
+def test_strategy_layer_uses_trusted_faction_and_keeps_legacy_common_only(
+    tmp_path: Path, card: KnowledgeBootstrapCard
+) -> None:
+    skill, digest = _skill(tmp_path, "读取冻结规则。\n")
+
+    good = compose_system_prompt(card, digest, reading_skill_path=skill, faction_id="good")
+    # A special role ID is irrelevant; only the trusted faction selects the
+    # wolf layer.
+    wolf = compose_system_prompt(card, digest, reading_skill_path=skill, faction_id="wolf")
+    assert "好人阵营策略" in good
+    assert "狼人阵营策略" in wolf
+    assert "悍跳" in wolf
+    assert "好人阵营策略" not in wolf
+
+    legacy = compose_system_prompt(card, digest, reading_skill_path=skill)
+    assert "共同决策原则" in legacy
+    assert "好人阵营策略" not in legacy
+
+    with pytest.raises(PromptComposerError, match="unsupported faction_id"):
+        compose_system_prompt(card, digest, reading_skill_path=skill, faction_id="neutral")
 
 
 def test_composer_rejects_oversized_final_prompt(

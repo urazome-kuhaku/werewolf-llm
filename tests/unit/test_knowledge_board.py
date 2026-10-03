@@ -108,6 +108,8 @@ def test_board_definition_parses_formal_published_document() -> None:
     assert board.identity_reveal.reveal_on_death is True
     assert board.identity_reveal.reveal_on_exile is True
     assert board.reading_plan.board_ref == board.board_ref
+    assert board.knife_rule.final_target_required is True
+    assert board.knife_rule.plan_confirmation_required is False
 
 
 def test_board_definition_exposes_stable_board_reference() -> None:

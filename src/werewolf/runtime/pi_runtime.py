@@ -551,7 +551,7 @@ class PiRuntime:
             raise RuntimeLifecycleError(
                 "default PiRuntime requires knowledge_base_url and knowledge_token"
             )
-        append_system_prompt: Path | None = None
+        system_prompt: Path | None = None
         if context.system_prompt is not None:
             if self._knowledge_token and self._knowledge_token in context.system_prompt:
                 raise RuntimeLifecycleError("system prompt must not contain the knowledge token")
@@ -560,11 +560,11 @@ class PiRuntime:
                 prompt_root = prompt_root / f"seat_{context.seat}"
             prompt_root = prompt_root.expanduser().resolve()
             prompt_root.mkdir(parents=True, exist_ok=True)
-            append_system_prompt = write_system_prompt(
+            system_prompt = write_system_prompt(
                 prompt_root / f".system_prompt_{uuid.uuid4().hex}.md",
                 context.system_prompt,
             )
-            self._system_prompt_path = append_system_prompt
+            self._system_prompt_path = system_prompt
         process_config = PiProcessConfig(
             session_root=session_root,
             provider=config.provider or "github-copilot",
@@ -575,7 +575,7 @@ class PiRuntime:
             executable=config.executable or self._executable or DEFAULT_PI_EXECUTABLE,
             compatible_version=config.compatible_version or self._compatible_version,
             thinking=config.reasoning,
-            append_system_prompt=append_system_prompt,
+            system_prompt=system_prompt,
             extension=_default_knowledge_extension(),
         )
         return PiProcess(process_config)

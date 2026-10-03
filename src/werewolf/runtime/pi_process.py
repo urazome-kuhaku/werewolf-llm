@@ -109,6 +109,8 @@ class PiProcessConfig:
     executable: str | Path = DEFAULT_PI_EXECUTABLE
     compatible_version: str | None = None
     thinking: str = DEFAULT_THINKING
+    # ``append_system_prompt`` remains for embedders that explicitly need
+    # Pi's public append behavior.
     append_system_prompt: Path | None = None
     extension: Path | None = None
     pi_config_dir: Path | None = None
@@ -116,6 +118,9 @@ class PiProcessConfig:
     tools: tuple[str, ...] = DEFAULT_PI_TOOLS
     close_timeout_seconds: float = DEFAULT_CLOSE_TIMEOUT_SECONDS
     max_stderr_bytes: int = DEFAULT_MAX_STDERR_BYTES
+    # ``system_prompt`` replaces Pi's coding prompt and is intentionally last
+    # so adding replacement mode does not shift existing positional fields.
+    system_prompt: Path | None = None
 
     def __post_init__(self) -> None:
         for name in ("provider", "model", "thinking", "knowledge_base_url", "knowledge_token"):
@@ -148,6 +153,8 @@ class PiProcessConfig:
             not isinstance(tool, str) or not tool.strip() for tool in self.tools
         ):
             raise ValueError("tools must contain non-empty strings")
+        if self.system_prompt is not None and self.append_system_prompt is not None:
+            raise ValueError("system_prompt and append_system_prompt are mutually exclusive")
         for key, value in self.provider_environment.items():
             if not isinstance(key, str) or not _ENV_NAME_RE.fullmatch(key):
                 raise ValueError(f"invalid provider environment variable name: {key!r}")
@@ -155,6 +162,10 @@ class PiProcessConfig:
                 raise ValueError(f"invalid provider environment value for {key!r}")
         object.__setattr__(self, "session_root", Path(self.session_root))
         object.__setattr__(self, "executable", str(self.executable))
+        if self.system_prompt is not None:
+            object.__setattr__(self, "system_prompt", Path(self.system_prompt))
+        if self.append_system_prompt is not None:
+            object.__setattr__(self, "append_system_prompt", Path(self.append_system_prompt))
         object.__setattr__(
             self, "provider_environment", MappingProxyType(dict(self.provider_environment))
         )
@@ -251,10 +262,19 @@ def build_pi_argv(
             "--no-approve",
         )
     )
-    if config.append_system_prompt is not None:
+    prompt_path: Path | None = None
+    prompt_option: str | None = None
+    if config.system_prompt is not None:
+        prompt_option = "--system-prompt"
+        prompt_path = config.system_prompt
+    elif config.append_system_prompt is not None:
+        prompt_option = "--append-system-prompt"
+        prompt_path = config.append_system_prompt
+    if prompt_option is not None and prompt_path is not None:
         # Keep this option as two independent argv entries.  Pi accepts it
-        # anywhere among the global options.
-        args.extend(("--append-system-prompt", str(Path(config.append_system_prompt).resolve())))
+        # anywhere among the global options; its resource loader reads the
+        # referenced file contents before constructing the system message.
+        args.extend((prompt_option, str(Path(prompt_path).resolve())))
     return tuple(args)
 
 

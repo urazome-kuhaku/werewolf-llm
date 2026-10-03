@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "reviewed_by": "项目所有者（本会话用户）",
+  "reviewed_at": "2026-10-03",
+  "decision": "APPROVED",
+  "approved_manifest_sha256": "5de33314bc58d3f30bf01175bb57a8eb5758d26bc14210b2b204b5041f957928",
+  "note": "用户明确授权同版本修正：“那你修复一下吧 直接修改1.0.0板子就行 因为其实这也是我们初版没验证出来的问题，跑了实测对局以后才发现的”。本次修正仅更新 board-owned plan_confirmation_required=true 与 day_flow.vote.visibility_during_collection=secret；保留 knife_rule.final_target_required=false 和 reveal_after_close=ballots_and_totals。"
+}

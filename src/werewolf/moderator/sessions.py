@@ -192,6 +192,7 @@ class PlayerSessionService:
                         bundle,
                         player,
                         assignment.role_id,
+                        assignment.faction_id,
                         assignment.session_epoch,
                     )
                     token = gateway.issue_token(
@@ -207,6 +208,7 @@ class PlayerSessionService:
                     prompt = compose_system_prompt(
                         card,
                         self._reading_skill_sha256,
+                        faction_id=assignment.faction_id,
                         reading_skill_path=self._reading_skill_path,
                     )
                     runtime = await self._create_runtime(player, gateway_url, token)
@@ -348,6 +350,7 @@ def _context_for(
     bundle: RuntimeKnowledgeBundle,
     player: PlayerSessionConfig,
     role_id: str,
+    faction_id: str,
     session_epoch: int,
 ) -> InitialContext:
     del bundle
@@ -356,6 +359,7 @@ def _context_for(
         seat=player.seat,
         session_epoch=session_epoch,
         role_id=role_id,
+        faction_id=faction_id,
     )
 
 

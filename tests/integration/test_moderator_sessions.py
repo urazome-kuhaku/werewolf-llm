@@ -67,6 +67,7 @@ async def test_start_issues_seat_bound_token_and_closes_everything(tmp_path: Pat
     record = records[1]
     assert record.runtime_ref.seat == 1
     assert record.context.role_id == assignments.players[1].role_id
+    assert record.context.faction_id == assignments.players[1].faction_id
     assert record.context.system_prompt is not None
     assert record.token not in record.context.system_prompt
 
@@ -182,7 +183,7 @@ async def test_default_pi_process_receives_and_removes_seat_prompt(tmp_path: Pat
         ),
         tmp_path,
     )
-    prompt_path = process.config.append_system_prompt
+    prompt_path = process.config.system_prompt
     assert prompt_path is not None
     assert prompt_path.parent == tmp_path.resolve()
     assert prompt_path.read_text(encoding="utf-8") == prompt

@@ -230,6 +230,9 @@ class ModeratorShell:
         "night team next",
         "night team retry",
         "night team again",
+        "night plan status",
+        "night plan next",
+        "night plan retry",
         "night action next [seat]",
         "night action retry [seat]",
         "night pending",
@@ -1252,8 +1255,24 @@ class ModeratorShell:
                     return payload
                 raise ModeratorError("night action requires next or retry")
             elif action == "team":
+                if len(args) == 3 and args[1].lower() == "plan":
+                    subcommand = args[2].lower()
+                    if subcommand == "next":
+                        result = await flow.plan_next()
+                    elif subcommand == "retry":
+                        result = await flow.plan_retry()
+                    elif subcommand == "status":
+                        result = flow.plan_progress()
+                    else:
+                        raise ModeratorError("night team plan requires next, retry, or status")
+                    payload = self._night_payload()
+                    payload["plan"] = result
+                    return payload
                 if len(args) != 2:
-                    raise ModeratorError("night team syntax: next | retry | again")
+                    raise ModeratorError(
+                        "night team syntax: next | retry | again | plan next | plan retry | "
+                        "plan status"
+                    )
                 subcommand = args[1].lower()
                 if subcommand == "next":
                     result = await flow.team_next()
@@ -1265,6 +1284,21 @@ class ModeratorShell:
                     raise ModeratorError("night team requires next, retry, or again")
                 payload = self._night_payload()
                 payload["team"] = result
+                return payload
+            elif action == "plan":
+                if len(args) != 2:
+                    raise ModeratorError("night plan syntax: next | retry | status")
+                subcommand = args[1].lower()
+                if subcommand == "next":
+                    result = await flow.plan_next()
+                elif subcommand == "retry":
+                    result = await flow.plan_retry()
+                elif subcommand in {"status", "show"}:
+                    result = flow.plan_progress()
+                else:
+                    raise ModeratorError("night plan requires next, retry, or status")
+                payload = self._night_payload()
+                payload["plan"] = result
                 return payload
             elif action == "resolve":
                 await flow.resolve(tuple(args[1:]))
@@ -1283,7 +1317,8 @@ class ModeratorShell:
             else:
                 raise ModeratorError(
                     "night syntax: status | open | advance | team next | team retry | "
-                    "team again | action next [seat] | action retry [seat] | pending | "
+                    "team again | plan next | plan retry | plan status | "
+                    "action next [seat] | action retry [seat] | pending | "
                     "resolve <json-file> | auto-resolve"
                 )
         except ModeratorNightError as exc:

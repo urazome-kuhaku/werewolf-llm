@@ -1,8 +1,8 @@
 """Build the seat-specific system prompt used to start a Pi session.
 
-Only the frozen reading instructions and the small, authenticated bootstrap
-card cross the runtime boundary here.  The reading instructions are pinned by
-their raw UTF-8 SHA-256 digest before they are decoded.  The bootstrap card is
+Only reviewed strategy and reading layers and the small, authenticated
+bootstrap card cross the runtime boundary here.  Each Markdown layer is pinned
+by its raw UTF-8 SHA-256 digest before it is decoded.  The bootstrap card is
 rendered as data in a clearly delimited section so that its summaries cannot
 silently become new system instructions.
 """
@@ -28,8 +28,38 @@ _SHA256_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
 DEFAULT_READING_SKILL_PATH: Final[Path] = (
     Path(__file__).resolve().parents[3] / "prompts" / "werewolf_reading.md"
 )
+DEFAULT_COMMON_DECISION_PATH: Final[Path] = (
+    Path(__file__).resolve().parents[3] / "prompts" / "common_decision_principles.md"
+)
+DEFAULT_GOOD_STRATEGY_PATH: Final[Path] = (
+    Path(__file__).resolve().parents[3] / "prompts" / "good_faction_strategy.md"
+)
+DEFAULT_WOLF_STRATEGY_PATH: Final[Path] = (
+    Path(__file__).resolve().parents[3] / "prompts" / "wolf_faction_strategy.md"
+)
 DEFAULT_MAX_READING_SKILL_BYTES: Final[int] = 64 * 1024
 DEFAULT_MAX_SYSTEM_PROMPT_BYTES: Final[int] = 128 * 1024
+
+# These pins are deliberately checked in beside the launch code.  Strategy
+# text is a frozen input just like the reading protocol; callers can override
+# the paths and pins together for an independently reviewed deployment.
+DEFAULT_COMMON_DECISION_SHA256: Final[str] = (
+    "ab8a6f8c39551c7edf1ffe2947c24ad244f293293236c791fd2e240859b3032a"
+)
+DEFAULT_GOOD_STRATEGY_SHA256: Final[str] = (
+    "d949a1999f4ced66d6d16144fd09b7411b648a26ddcfe6178ba3e4f5be1239c1"
+)
+DEFAULT_WOLF_STRATEGY_SHA256: Final[str] = (
+    "083ca0a87c8232e5856499cc0971db20510dbdedafca0220be61bd419dd687d1"
+)
+
+# Boards historically use a few spellings for the wolf-side faction.  The
+# choice is still made exclusively from the trusted assignment faction_id;
+# role_id is intentionally never consulted here.
+WOLF_FACTION_IDS: Final[frozenset[str]] = frozenset({"wolf", "wolves", "werewolf", "werewolves"})
+GOOD_FACTION_IDS: Final[frozenset[str]] = frozenset(
+    {"good", "town", "village", "villager", "villagers", "human", "humans"}
+)
 
 # Keep this short and stable.  It defines behavior at the system boundary;
 # detailed rule reading remains in the frozen skill and knowledge tools.
@@ -165,6 +195,22 @@ def load_frozen_reading_skill(
         raise ReadingSkillIntegrityError("reading skill is not valid UTF-8") from exc
 
 
+def load_frozen_strategy(
+    path: PathLike,
+    expected_sha256: str,
+    *,
+    max_bytes: int = DEFAULT_MAX_READING_SKILL_BYTES,
+) -> str:
+    """Load a reviewed strategy layer using the same frozen-file checks.
+
+    Keeping this as a named operation documents that common and faction
+    strategy are reviewed prompt inputs, while sharing the byte, UTF-8, and
+    symlink protections used for the pinned reading protocol.
+    """
+
+    return load_frozen_reading_skill(path, expected_sha256, max_bytes=max_bytes)
+
+
 def _card_context(card: KnowledgeBootstrapCard) -> str:
     """Render only public startup-card fields in a deterministic data block."""
 
@@ -194,36 +240,72 @@ def compose_system_prompt(
     card: KnowledgeBootstrapCard,
     expected_reading_skill_sha256: str,
     *,
+    faction_id: str | None = None,
     reading_skill_path: PathLike = DEFAULT_READING_SKILL_PATH,
+    common_decision_path: PathLike = DEFAULT_COMMON_DECISION_PATH,
+    common_decision_sha256: str = DEFAULT_COMMON_DECISION_SHA256,
+    good_strategy_path: PathLike = DEFAULT_GOOD_STRATEGY_PATH,
+    good_strategy_sha256: str = DEFAULT_GOOD_STRATEGY_SHA256,
+    wolf_strategy_path: PathLike = DEFAULT_WOLF_STRATEGY_PATH,
+    wolf_strategy_sha256: str = DEFAULT_WOLF_STRATEGY_SHA256,
     max_skill_bytes: int = DEFAULT_MAX_READING_SKILL_BYTES,
     max_prompt_bytes: int = DEFAULT_MAX_SYSTEM_PROMPT_BYTES,
 ) -> str:
     """Compose a stable seat-specific system prompt from a trusted card.
 
-    ``expected_reading_skill_sha256`` must come from frozen configuration or a
-    snapshot field, rather than being calculated from ``reading_skill_path``
-    during this call.  The output contains the frozen reading protocol, global behavior
-    boundaries, and the current card's board/own-role navigation data.  It
-    does not load rule Markdown, a seat roster, another player's role, or any
-    arbitrary Skill file.
+    ``expected_reading_skill_sha256`` and the strategy pins must come from
+    frozen configuration or a snapshot field, rather than being calculated
+    from their paths during this call.  ``faction_id`` is trusted assignment
+    data and selects only the good or wolf strategy layer; ``role_id`` is not
+    consulted.  The output does not load a seat roster, another player's role,
+    or an arbitrary Skill file.
     """
 
     if not isinstance(card, KnowledgeBootstrapCard):
         raise TypeError("card must be a KnowledgeBootstrapCard")
+    if faction_id is not None and (
+        not isinstance(faction_id, str) or not faction_id.strip() or "\x00" in faction_id
+    ):
+        raise PromptComposerError("faction_id must be a non-empty string without NUL")
+    if faction_id is not None:
+        normalized_faction = faction_id.casefold()
+        if normalized_faction not in WOLF_FACTION_IDS | GOOD_FACTION_IDS:
+            raise PromptComposerError(f"unsupported faction_id: {faction_id!r}")
     prompt_limit = _validate_positive_limit(max_prompt_bytes, field_name="max_prompt_bytes")
+    common = load_frozen_strategy(
+        common_decision_path,
+        common_decision_sha256,
+        max_bytes=max_skill_bytes,
+    )
+    faction_strategy: str | None = None
+    if faction_id is not None:
+        is_wolf = faction_id.casefold() in WOLF_FACTION_IDS
+        faction_strategy = load_frozen_strategy(
+            wolf_strategy_path if is_wolf else good_strategy_path,
+            wolf_strategy_sha256 if is_wolf else good_strategy_sha256,
+            max_bytes=max_skill_bytes,
+        )
     skill = load_frozen_reading_skill(
         reading_skill_path,
         expected_reading_skill_sha256,
         max_bytes=max_skill_bytes,
     )
+    card_context = _card_context(card)
     sections = [
         "# Werewolf Arena 玩家系统提示",
         "## 全局行为边界",
         *[f"- {item}" for item in GLOBAL_BEHAVIOR_BOUNDARY],
-        _card_context(card),
+        "## 共同决策原则",
+        common.rstrip("\r\n"),
+        card_context,
         "## 冻结的规则阅读协议",
         skill.rstrip("\r\n"),
     ]
+    if faction_strategy is not None:
+        sections[sections.index(card_context) : sections.index(card_context)] = [
+            "## 阵营策略",
+            faction_strategy.rstrip("\r\n"),
+        ]
     prompt = "\n\n".join(sections).rstrip() + "\n"
     if len(prompt.encode("utf-8")) > prompt_limit:
         raise SystemPromptTooLargeError(
@@ -310,8 +392,15 @@ write_system_prompt_file = write_system_prompt
 __all__ = [
     "DEFAULT_MAX_READING_SKILL_BYTES",
     "DEFAULT_MAX_SYSTEM_PROMPT_BYTES",
+    "DEFAULT_COMMON_DECISION_PATH",
+    "DEFAULT_COMMON_DECISION_SHA256",
+    "DEFAULT_GOOD_STRATEGY_PATH",
+    "DEFAULT_GOOD_STRATEGY_SHA256",
     "DEFAULT_READING_SKILL_PATH",
+    "DEFAULT_WOLF_STRATEGY_PATH",
+    "DEFAULT_WOLF_STRATEGY_SHA256",
     "GLOBAL_BEHAVIOR_BOUNDARY",
+    "GOOD_FACTION_IDS",
     "PromptComposerError",
     "ReadingSkillIntegrityError",
     "ReadingSkillNotFoundError",
@@ -320,7 +409,9 @@ __all__ = [
     "SystemPromptTooLargeError",
     "compose_system_prompt",
     "load_frozen_reading_skill",
+    "load_frozen_strategy",
     "load_reading_skill",
+    "WOLF_FACTION_IDS",
     "write_system_prompt",
     "write_system_prompt_file",
 ]

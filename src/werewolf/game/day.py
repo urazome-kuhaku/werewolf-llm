@@ -727,7 +727,7 @@ class DayCoordinator:
         if pending.status is not VoteStatus.WAITING_GM:
             if pending.status is VoteStatus.RESOLVED:
                 self._restore_pk_candidates(state)
-                return await self._manager.confirm_vote_and_transition(now=now)
+                return await self._manager.confirm_vote_and_transition(self._board, now=now)
             raise DayCoordinatorError(
                 "TALLY_NOT_PENDING", "a vote tally is not awaiting confirmation"
             )
@@ -738,7 +738,7 @@ class DayCoordinator:
                     "PK_DISABLED", "tie resolver requested PK but board PK is disabled"
                 )
             self._pk_candidates = tuple(sorted(decision.candidates))
-        return await self._manager.confirm_vote_and_transition(now=now)
+        return await self._manager.confirm_vote_and_transition(self._board, now=now)
 
     async def confirm_exile(
         self,

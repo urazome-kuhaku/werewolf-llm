@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "kind": "ruleset_same_version_correction",
+  "corrected_at": "2026-10-03",
+  "authorized_by": "项目所有者（本会话用户）",
+  "authorization_quote": "那你修复一下吧 直接修改1.0.0板子就行 因为其实这也是我们初版没验证出来的问题，跑了实测对局以后才发现的",
+  "package_id": "classic_12_seer_witch_hunter_idiot@1.0.0",
+  "reason": "实测对局发现初版板子遗漏了狼人计划确认门禁和投票收集期间的保密性配置。",
+  "scope": [
+    {
+      "path": "boards/classic_12_seer_witch_hunter_idiot/1.0.0/board.md",
+      "changes": [
+        {
+          "field": "knife_rule.final_target_required",
+          "old": false,
+          "new": false,
+          "note": "保持目标可选，不以计划确认门禁替代目标要求。"
+        },
+        {
+          "field": "knife_rule.plan_confirmation_required",
+          "old": null,
+          "new": true,
+          "note": "新增独立的狼人队伍计划确认要求。"
+        },
+        {
+          "field": "day_flow.vote.visibility_during_collection",
+          "old": "public",
+          "new": "secret",
+          "note": "投票收集期间保持秘密。"
+        },
+        {
+          "field": "day_flow.vote.reveal_after_close",
+          "old": "ballots_and_totals",
+          "new": "ballots_and_totals",
+          "note": "收集关闭后仍统一公开选票和票数汇总。"
+        }
+      ]
+    }
+  ],
+  "artifacts": {
+    "old": {
+      "workbench_board_sha256": "15f753f0de1fcc5550e3dbd216cb1e90d82c707c331434754b1f4287b4e2e340",
+      "candidate_manifest_canonical_sha256": "1aec24876a5f4d72e3575f12c35f1a8af51985ffe44bff48ed5beb2851a904da",
+      "candidate_manifest_file_sha256": "29bef53520b5af5e4c893a048ade0ff18fdf25445a0582d8e2240a31904608fe",
+      "published_board_sha256": "cc70ad6cfc849e1df40fe041a20cd93a4eef4943d0dfcef7144c0cd8d4e6df26",
+      "published_manifest_file_sha256": "e6e062f56e26de7e26e522cdcb6651f6fe7f895eabf28ac1cec735020b76340f",
+      "published_documents_sha256": "92b067f15c83fd5051965bbf7aa03e78494110cd37620ddc3aae00c1ef8ae9c1",
+      "published_manifest_logical_sha256": "a8708cd09dcc906aaf3a143b982e0a4b00ae8eb124f35fb1aa5051682887927d",
+      "compiled_manifest_file_sha256": "3fc38289c4072cff8d5409a961f0943623574b0bd8a91c39a999b26835c49624",
+      "compiled_logical_manifest_sha256": "8f6f017ee5fd040b776f9ad19ae2da5ea5de5f244768ca544da001258cca44d2",
+      "compiled_package_sha256": "a8342b8c78205113348b077c084c5e0736d7837bbd4b452fbf31ab5972ded2c3"
+    },
+    "new": {
+      "workbench_board_sha256": "5baa83ff307416afbc6372104ac3910f25e2e3dac816fd116dfcb12fa57d5dea",
+      "candidate_manifest_canonical_sha256": "5de33314bc58d3f30bf01175bb57a8eb5758d26bc14210b2b204b5041f957928",
+      "candidate_manifest_file_sha256": "8f65ea9bafcbdf59ad11b376f805c6c2c3ed1206d37688d4a4e3fc31c4724d5b",
+      "published_board_sha256": "cd249018bf61707610752fefe3b46d49d2ab45096aec4d8466d580aebc6e0f46",
+      "published_manifest_file_sha256": "9c77ce2848b72362c21e20c95a901994f3e094cdb517897c0cd9e184b3981f75",
+      "published_documents_sha256": "8a259321486725022775c9161a6c2c156b3350c3b7a0f640acecdec7023f893f",
+      "published_manifest_logical_sha256": "6e764ac226379b695e6d4e4821422999bf96940df50e6573151ca45134168499",
+      "compiled_manifest_file_sha256": "af0bb39f966688deb9b30412f25364bc4ed25a99da6744e8f4be3807f4e8ffc6",
+      "compiled_logical_manifest_sha256": "4b9af25e9ab722ea0a7ec25ac9c557d220aa56fd9c18e2c8197e063347d3b814",
+      "compiled_package_sha256": "cb68523105de8e9971705057d99f8c451927952bc9495ab9ac9d0525b24657f8"
+    }
+  },
+  "release": {
+    "publisher_api": "RulesetPublisher.publish",
+    "compiler": "KnowledgePackageCompiler",
+    "compiled_store": "CompiledKnowledgeStore",
+    "idempotent": false,
+    "old_release_evidence_backup": ".runtime/classic_12_correction_backup_20261003",
+    "pre_publish_active_move": ".runtime/classic_12_correction_active_moved_20261003",
+    "generated_compiled_files_were_manually_edited": false
+  },
+  "compatibility": {
+    "new_games": "Use the corrected 1.0.0 package and its new compiled identity.",
+    "existing_games": "Existing games retain their frozen ruleset snapshots, snapshots, and archives.",
+    "old_compiled_identity": "The previous compiled package is retained in the ignored backup for recovery paths that require the old identity.",
+    "automatic_migration": false,
+    "old_game_automatic_compatibility_claim": false
+  }
+}

@@ -1,10 +1,10 @@
 # Werewolf Arena V1
 
-Werewolf Arena 是一个由主持器、冻结知识库和多个玩家运行时组成的狼人杀实验框架。当前可以直接准备和运行的目标是“预女猎白”12 人候选板：4 狼、4 民、预言家、女巫、猎人、白痴各 1 人，采用屠边胜利。主持器保存唯一的权威状态，Pi 或脚本运行时只能通过座位绑定的请求提交发言和行动。
+Werewolf Arena 是一个由主持器、冻结知识库和多个玩家运行时组成的狼人杀实验框架。当前可以直接准备和运行的目标是已正式发布的“预女猎白”12 人板：4 狼、4 民、预言家、女巫、猎人、白痴各 1 人，采用屠边胜利。主持器保存唯一的权威状态，Pi 或脚本运行时只能通过座位绑定的请求提交发言和行动。
 
-当前候选板仍处于 `CANDIDATE_PENDING_HUMAN_REVIEW`。`play init` 会将它编译到独立的 preview 目录，`--experimental-preview` 只是显式允许这份候选规则用于实验，不会把它发布为正式知识，也不会修改 `vault/compiled/`。
+`classic_12_seer_witch_hunter_idiot@1.0.0` 已于 2026-10-01 经项目所有者批准并正式发布到 `vault/published/`，对应运行时编译包位于 `vault/compiled/classic_12_seer_witch_hunter_idiot@1.0.0`。2026-10-03 根据实测对局发现的初版遗漏已获项目所有者明确授权，使用同一版本号修正为新的发布闭包；修正授权、旧/新哈希和历史快照边界见 `vault/_workbench/official_12_20260928/correction-provenance.json`。已创建游戏只要保有完整的冻结 snapshot，就继续按该 snapshot 的原规则独立恢复，不会自动迁移到本次修正；只有依赖旧 compiled identity 且缺失完整冻结包的恢复路径，才需要修正前的 compiled package 备份。新 runtime loader 对旧 frozen package 中缺少的 `knife_rule.plan_confirmation_required` 按 `false` 读取，并保持原 package identity；删除 source 与 compiled 后仅凭完整 snapshot 的恢复已实测成功，但不据此声称全部历史局都已实测恢复。审核记录和发布结果分别保存在 `vault/_workbench/official_12_20260928/human-review.json` 与 `vault/_workbench/official_12_20260928/publish-result.json`。`play init` 仍是候选复测入口，会将工作台内容编译到独立的 preview 目录；这些 setup 继续使用 `--experimental-preview`，不会改写正式发布包。
 
-老板子当前冻结规则的关键点是：暗牌且普通死亡/放逐不翻身份；首日有警长竞选，警长票权为 1.5 且默认最后发言；狼人需要在队伍讨论后形成刀口；女巫不能自救，每晚最多使用一瓶药，只有在解药仍可用且板子有效规则允许时，才会在狼刀确认后看到当晚刀口；猎人被狼刀或放逐时进入玩家选择触发窗口，被毒死不触发；白痴只在被放逐时自动翻牌存活并失去投票权。夜间首夜死亡和每天符合规则的放逐者可发表遗言；普通投票和平票重投进入板子定义的 PK，PK 再平票则无人放逐；胜负按冻结的屠边条件在结算边界检查。完整字段和来源见 `doc/老板子初版实现说明.md` 及板子 `board.md`。
+老板子当前冻结规则的关键点是：暗牌且普通死亡/放逐不翻身份；首日有警长竞选，警长票权为 1.5 且默认最后发言；狼人需要在队伍讨论后形成刀口，并由 `knife_rule.plan_confirmation_required: true` 强制完成独立的计划确认，`knife_rule.final_target_required` 仍为 `false`；女巫不能自救，每晚最多使用一瓶药，只有在解药仍可用且板子有效规则允许时，才会在狼刀确认后看到当晚刀口；猎人被狼刀或放逐时进入玩家选择触发窗口，被毒死不触发；白痴只在被放逐时自动翻牌存活并失去投票权。白天投票按 `visibility_during_collection: secret` 在收集期间保持秘密，收集关闭后按 `reveal_after_close: ballots_and_totals` 统一公开选票和票数汇总；夜间首夜死亡和每天符合规则的放逐者可发表遗言；普通投票和平票重投进入板子定义的 PK，PK 再平票则无人放逐；胜负按冻结的屠边条件在结算边界检查。完整字段和来源见 `doc/老板子初版实现说明.md` 及板子 `board.md`。
 
 ## 环境与安装
 
@@ -19,7 +19,7 @@ uv run werewolf --help
 
 ## 知识库和诊断
 
-知识源文件位于 `vault/_workbench/`，发布包是带版本的不可变快照。不要直接编辑 `vault/compiled/`；板子变更应在 workbench 中产生新的语义版本，再经过审核和发布。
+知识源文件位于 `vault/_workbench/`，正式发布包是带版本的不可变快照。不要直接编辑 `vault/published/` 或 `vault/compiled/`；通常的板子变更应在 workbench 中产生新的语义版本，再经过审核和发布。若实测发现初版遗漏，只有在项目所有者明确授权、提供 correction provenance 并保留旧/新哈希与历史快照边界时，才能按同版本修正流程重新发布；这不改变 Publisher 对普通版本冲突的拒绝规则。`vault/compiled/` 是本地生成且被 gitignore 的运行时缓存；在新机器上可用既有 `KnowledgePackageLoader`、`KnowledgePackageCompiler` 和 `CompiledKnowledgeStore` 从 `vault/published/` 重建，已存在正式 Markdown 但缺少 compiled 时，重复调用 publisher 不会自动恢复它。
 
 ```powershell
 # 校验配置包络
@@ -27,6 +27,9 @@ uv run werewolf config validate config/game.example.yaml
 
 # 校验老板子及其依赖闭包
 uv run werewolf rules validate vault/_workbench/official_12_20260928/draft/boards/classic_12_seer_witch_hunter_idiot/1.0.0/board.md
+
+# 校验正式发布的老板子及其依赖闭包
+uv run werewolf rules validate vault/published/boards/classic_12_seer_witch_hunter_idiot/1.0.0/board.md
 
 # 只检查本机 Pi 可执行文件和版本
 uv run werewolf pi doctor
@@ -65,7 +68,7 @@ uv run werewolf play run --config "$pi3Dir\game.yaml" --experimental-preview --m
 uv run werewolf play run --config "$pi4Dir\game.yaml" --experimental-preview --max-rounds 20
 ```
 
-不要在同一目录中先后运行 3 Pi 和 4 Pi；每局都重新执行上面的目录生成和 `play init`。`--experimental-preview` 必须保留，因为当前候选板仍是 `CANDIDATE_PENDING_HUMAN_REVIEW`。
+不要在同一目录中先后运行 3 Pi 和 4 Pi；每局都重新执行上面的目录生成和 `play init`。这些由 `play init` 生成的 setup 仍是候选 preview，因此 `--experimental-preview` 必须保留。正式发布包的启动配置见下一节，不使用这个标记。
 
 `play init` 会在输出目录生成：
 
@@ -78,6 +81,22 @@ uv run werewolf play run --config "$pi4Dir\game.yaml" --experimental-preview --m
 
 ```powershell
 uv run werewolf play run --config "$pi3Dir\game.yaml" --experimental-preview
+```
+
+## 使用正式发布包启动
+
+正式发布本身不会改变 `play init` 的候选 preview 流程。需要直接运行正式知识时，保留现有 `game.yaml` 的 `game`、`players` 等配置，删除顶层 `play_setup` 段，并将 `paths` 改为指向正式 compiled 根目录（下面示例假定 `game.yaml` 位于仓库根目录）：
+
+```yaml
+paths:
+  compiled_root: vault/compiled
+  games_root: .runtime/formal-games
+```
+
+使用该配置运行时不加 `--experimental-preview`：
+
+```powershell
+uv run werewolf play run --config .\game.yaml --max-rounds 20
 ```
 
 生成的 `game.yaml` 可以按测试机器修改。例如要指定 Pi 可执行文件和进程策略，在顶层加入：
@@ -126,7 +145,7 @@ uv run werewolf moderator --config "$pi3Dir\game.yaml" --experimental-preview
 老板子候选的人工主持顺序如下，照这条链路执行即可：
 
 1. 建局：`new` → `next` → `next` → `start`；在 `PLAYER_PREPARE` 中反复 `prepare status` / `prepare next [seat]`，全部 ready 后执行顶层 `next`。
-2. 每夜：`night open` → 反复 `night team next`（失败用 `night team retry`，需要新一轮时用 `night team again`）→ `night advance` → `night open` → 反复 `night action next [seat]`（失败用 retry）→ `night advance` → `night open` → `night auto-resolve` 或 `night resolve <json-file>`。
+2. 每夜：`night open` → 反复 `night team next`（失败用 `night team retry`，需要新一轮时用 `night team again`）→ `night plan status` 确认当前代次为 `READY` → `night plan next`（失败用 `night plan retry`；`night team plan status/next/retry` 是等价别名）→ `night advance` → `night open` → 反复 `night action next [seat]`（失败用 retry）→ `night advance` → `night open` → `night auto-resolve` 或 `night resolve <json-file>`。`night plan` 产生当前夜冻结的团队共识；只有它完成并满足板子 `knife_rule.available_after_window` 后，`night advance` 才进入夜间行动。
 3. 夜间结算后先看 `phase`。没有触发窗口时执行 `victory night-check`；若为 `TRIGGER_ACTION`，执行 `trigger open` → `trigger pending`；对每个玩家选择请求反复执行 `trigger next/retry [seat]`，请求全部提交后再执行一次 `trigger resolve <json-file>` 或板子支持的 `trigger auto-resolve`，最后 `trigger finish`。自动触发没有玩家请求时也要先推进空请求队列，再执行 resolver。夜间来源的 `trigger finish` 会回到 `DAY_ANNOUNCE`，随后再执行 `victory night-check`。
 4. 首日警长：`victory night-check` 为 `ONGOING` 后，先执行 `sheriff start <candidate...>`，再完成 `sheriff speech`、`sheriff vote` 和必要的 PK，最后 `sheriff transfer`。这一步发生在死亡公告之前；合法候选可以包括有本首夜死亡 provenance 但尚未公告的死者。`sheriff transfer` 实际进入 `DAY_SPEECH`；随后先执行 `day announce` 提交死亡公告，再完成必要的警徽移交和遗言，最后才 `day speech open` 打开普通白天发言。
 5. 普通白天：公告后，反复执行 `last-words status` / `last-words next [seat]`，再 `day speech open` → `day speech next/retry` → `day speech close` → `day vote open` → `day vote next/retry [seat]` → `day vote collect` → `day vote confirm`。平票时改走 `day pk speech ...` 和 `day pk vote ...`，仍按同一顺序完成 PK。
@@ -139,7 +158,7 @@ uv run werewolf moderator --config "$pi3Dir\game.yaml" --experimental-preview
 | --- | --- | --- |
 | 建局 | `new` → `next` → `next` → `start` | `new` 后两次 `next` 依次进入 `RULESET_READY`、`ASSIGNED`；`start` 启动座位运行时并进入 `PLAYER_PREPARE`。 |
 | 身份准备 | `prepare status`、`prepare next [seat]` | 按 status 反复执行，直到所有座位收到知识回执；再执行顶层 `next` 进入首夜狼队讨论。 |
-| 首夜狼队讨论 | `night open`、`night team next`、`night team retry`、`night team again`、`night advance` | `night open` 打开当前夜间窗口。每个狼人完成发言后，必要时用 `team again` 开始下一轮讨论；队列耗尽后 `night advance` 进入 `NIGHT_ACTION`。 |
+| 首夜狼队讨论与计划 | `night open`、`night team next`、`night team retry`、`night team again`、`night plan status`、`night plan next`、`night plan retry`、`night advance` | `night open` 打开当前夜间窗口。每个狼人完成提案后，必要时用 `team again` 开始下一轮讨论；队列耗尽后先用 `night plan status` 确认 `READY`，再执行 `night plan next`（失败用 `night plan retry`，`night team plan ...` 为别名）。计划完成后才可 `night advance` 进入 `NIGHT_ACTION`；新一轮讨论会使旧计划失效。 |
 | 首夜行动 | `night open`、`night action next [seat]`、`night action retry [seat]`、`night advance` | `night open` 打开行动窗口；按 status 消耗全部合法座位，再用 `night advance` 进入 `NIGHT_RESOLVE`。 |
 | 夜间结算 | `night open`、`night auto-resolve` 或 `night resolve <json-file>` | 老板子可以用自动结算；手工主持其他明确结算时使用严格 JSON resolution 文件。结算后没有触发就走 `victory night-check`；有 `TRIGGER_ACTION` 就先完成 trigger，再用 `trigger finish` 回到 `DAY_ANNOUNCE`，不要执行顶层 `next`。 |
 | 首日警长 | `sheriff start <candidate...>`、`sheriff speech next/retry`、`sheriff vote open`、`sheriff vote next/retry [seat]`、`sheriff vote collect`、`sheriff vote confirm`、`sheriff transfer` | `victory night-check` 为 `ONGOING` 后、死亡公告前执行。候选由 helper 计算时可以包含首夜已死但尚未公告的座位；完成候选发言、投票和必要 PK 后才 `transfer`。平票时会进入 `SHERIFF_ELECTION_PK_SPEECH` / `SHERIFF_ELECTION_PK`，重复同类 speech/vote 命令完成 PK。 |
@@ -203,8 +222,8 @@ uv run werewolf archive verify .runtime/cli-ascii-final-20261001/games/archive/2
 
 ### 当前边界与非目标
 
-- 老板子候选仍待真实人工审核，实验必须显式加 `--experimental-preview`，不能当作正式发布板。
-- `play init` 是隔离编译和启动准备步骤，不会发布知识或改写正式 compiled store。
+- 老板子 `classic_12_seer_witch_hunter_idiot@1.0.0` 已完成真实人工审核并正式发布；`play init` 仍是隔离编译和启动准备步骤，生成的 setup 继续使用 `--experimental-preview` 做候选复测，不会发布知识或改写正式 compiled store。
+- 正式运行可使用不含 `play_setup` 的 `game.yaml`，将 `paths.compiled_root` 指向 `vault/compiled`；`play run` 不需要 `--experimental-preview`。
 - 本版本正式支持的运行时是 Pi 和确定性的脚本 harness；本轮没有新增角色专属分支。任意板子技能解释器、运行时真正热插拔和 TUI harness 仍未完成，完整任意板子自动生成也仍未完成。
 - `classic_resolution` 是老板子范围的有界结算器，依赖冻结的 action contract、effective rules 和 trigger grants；新增板子需要先完成对应知识审核和契约验证。
 - 自动入口默认从板子定义的首日合法参与资格中选前两个警长候选，当前没有自主报名/退水模型。

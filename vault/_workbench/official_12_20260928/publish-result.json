@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "published_at": "2026-10-03",
+  "job": "official_12_20260928",
+  "package_id": "classic_12_seer_witch_hunter_idiot@1.0.0",
+  "board_ref": "classic_12_seer_witch_hunter_idiot@1.0.0",
+  "candidate_manifest_sha256": "5de33314bc58d3f30bf01175bb57a8eb5758d26bc14210b2b204b5041f957928",
+  "compiled_package_sha256": "cb68523105de8e9971705057d99f8c451927952bc9495ab9ac9d0525b24657f8",
+  "published_manifest_sha256": "9c77ce2848b72362c21e20c95a901994f3e094cdb517897c0cd9e184b3981f75",
+  "published_root": "vault/published",
+  "compiled_path": "vault/compiled/classic_12_seer_witch_hunter_idiot@1.0.0",
+  "idempotent": false,
+  "correction_provenance": "vault/_workbench/official_12_20260928/correction-provenance.json",
+  "gates": {
+    "sources": "passed",
+    "claims": "passed",
+    "coverage": "passed",
+    "conflicts": "passed",
+    "document_closure": "passed",
+    "role_action_contract": "passed",
+    "compiler": "passed"
+  },
+  "document_count": 13
+}

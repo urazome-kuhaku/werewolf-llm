@@ -316,6 +316,10 @@ class ClassicPlayRunner:
                 isinstance(night, Mapping) and night.get("team_queue") == []
             ):
                 break
+        plan_status = await self.command("night plan status")
+        plan = plan_status.get("plan")
+        if isinstance(plan, Mapping) and plan.get("enabled") is True:
+            await self.command("night plan next")
         await self.command("night advance")
 
     async def _night_actions(self) -> None:

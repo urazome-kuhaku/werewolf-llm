@@ -128,6 +128,11 @@ def _write_four_seat_package(root: Path) -> None:
                 **dict(board["victory"]),
                 "special_conditions": ["good_wins_when_all_wolves_are_dead"],
             },
+            "knife_rule": {
+                "selection_mode": "consensus",
+                "target_visibility": "wolf_team",
+                "plan_confirmation_required": True,
+            },
             "roles": [
                 {
                     "role_ref": "wolf@1.0.0",
@@ -393,6 +398,9 @@ async def test_four_seat_moderator_cycle_uses_real_reads_actions_votes_and_snaps
     assert len(team_events) == 2
     assert all(event.channel is Channel.TEAM for event in team_events)
     assert all(event.audience == wolves for event in team_events)
+    plan = await shell.execute("night plan next")
+    assert plan is not None
+    assert plan["phase"] == GamePhase.NIGHT_TEAM_CHAT.value
     assert (await shell.execute("night advance"))["phase"] == GamePhase.NIGHT_ACTION.value
 
     opened_action = await shell.execute("night open")

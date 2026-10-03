@@ -5,7 +5,7 @@
   "candidate_id": "classic_12_seer_witch_hunter_idiot",
   "status": "CANDIDATE_PENDING_HUMAN_REVIEW",
   "files": [
-    {"path": "boards/classic_12_seer_witch_hunter_idiot/1.0.0/board.md", "sha256": "15f753f0de1fcc5550e3dbd216cb1e90d82c707c331434754b1f4287b4e2e340"},
+    {"path": "boards/classic_12_seer_witch_hunter_idiot/1.0.0/board.md", "sha256": "5baa83ff307416afbc6372104ac3910f25e2e3dac816fd116dfcb12fa57d5dea"},
     {"path": "interactions/hunter-death-trigger/1.0.0/interaction.md", "sha256": "4b7516c77f25c8a3523859684e6621e8b1a906a98e27b1a20c9189a08e62eac6"},
     {"path": "interactions/idiot-exile/1.0.0/interaction.md", "sha256": "ed80a7480623d68b27ccd27995eddc8f9a7429a3f748baea54c9e80cd878df9e"},
     {"path": "interactions/witch-poison-hunter/1.0.0/interaction.md", "sha256": "462ac25d57040b1994844757e752041df45b4f5e05bacf1444a9e0b9ff80ea11"},

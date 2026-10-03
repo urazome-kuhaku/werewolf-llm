@@ -33,6 +33,7 @@ from werewolf.game.events import (
     PrivateNoticePayload,
     PrivateWitchTargetPayload,
     TeamNoticePayload,
+    TeamSpeechPayload,
 )
 from werewolf.game.manager import EventCommitError, GameManager
 from werewolf.game.night import (
@@ -68,6 +69,40 @@ def _load_window(raw: object) -> ActionWindow:
         return ActionWindow.model_validate(data)
     except ValueError as exc:
         raise ModeratorNightError("stored night window is malformed") from exc
+
+
+def _typed_events(state: GameState) -> tuple[GameEvent, ...]:
+    """Project an in-memory or JSON-restored event log into typed events.
+
+    ``GameState`` still accepts legacy JSON event dictionaries so old
+    snapshots can be loaded.  Delivery already restores those dictionaries at
+    its boundary; the moderator's durable night gates must use the same
+    projection or a restart would make a completed discussion/plan disappear.
+    Malformed legacy entries fail closed and therefore cannot satisfy a gate.
+    """
+
+    restored: list[GameEvent] = []
+    for raw in state.events:
+        if isinstance(raw, GameEvent):
+            restored.append(raw)
+        elif isinstance(raw, Mapping):
+            try:
+                restored.append(GameEvent.model_validate_json(json.dumps(raw)))
+            except (TypeError, ValueError) as exc:
+                raise ModeratorNightError(
+                    "event delivery requires a typed event log; migrate the legacy "
+                    "JSON snapshot first"
+                ) from exc
+        else:
+            raise ModeratorNightError(
+                "event delivery requires a typed event log; migrate the legacy JSON snapshot first"
+            )
+    event_ids = tuple(event.event_id for event in restored)
+    if tuple(sorted(set(event_ids))) != event_ids:
+        raise ModeratorNightError("event delivery requires sorted, unique event IDs")
+    if any(event.game_id != state.game_id for event in restored):
+        raise ModeratorNightError("event delivery contains an event from another game")
+    return tuple(restored)
 
 
 class ModeratorNightFlow:
@@ -108,6 +143,18 @@ class ModeratorNightFlow:
             runtimes,
             timeout_seconds=timeout_seconds,
             phase=GamePhase.NIGHT_TEAM_CHAT,
+        )
+        # The final plan is a separate logical speech boundary.  It uses the
+        # same private team channel as discussion, but only the deterministic
+        # knife submitter is placed in its queue.  Keeping a separate
+        # scheduler makes retries and reconstruction distinguishable from a
+        # normal discussion turn.
+        self.wolf_plan_scheduler = SerialTurnScheduler(
+            manager,
+            runtimes,
+            timeout_seconds=timeout_seconds,
+            phase=GamePhase.NIGHT_TEAM_CHAT,
+            logical_label="wolf-plan",
         )
 
     @property
@@ -414,11 +461,16 @@ class ModeratorNightFlow:
             )
         board_window = self._current_board_window()
         if board_window.phase is GamePhase.NIGHT_TEAM_CHAT:
+            team_window_id = self._physical_window_id(board_window.window_id, self.state.round_no)
             # Team speech is a durable queue.  A missing queue means that the
             # moderator has not started the first discussion round; a
             # non-empty queue means one or more authorized wolves still need
             # to speak.  Only an explicitly exhausted queue may be advanced.
             if self.state.serial_turn is not None:
+                if self._is_plan_turn(self.state):
+                    raise ModeratorNightError(
+                        "WOLF_PLAN_INCOMPLETE: finish or retry the active final wolf plan"
+                    )
                 raise ModeratorNightError(
                     "TEAM_SPEECH_IN_PROGRESS: finish or retry the active team speaker "
                     "before advancing"
@@ -428,9 +480,44 @@ class ModeratorNightFlow:
                     "TEAM_SPEECH_NOT_STARTED: run night team next before advancing"
                 )
             if self.state.current_queue:
+                if self._wolf_plan_enabled(
+                    self.state
+                ) and self._plan_started_for_current_generation(self.state, team_window_id):
+                    raise ModeratorNightError(
+                        "WOLF_PLAN_INCOMPLETE: finish or retry the active final wolf plan"
+                    )
                 raise ModeratorNightError(
                     "TEAM_SPEECH_INCOMPLETE: every authorized team seat must speak before advancing"
                 )
+            # A complete discussion is not the consensus boundary on boards
+            # that require a frozen wolf kill plan.  The final speech is
+            # persisted as a TEAM event and is checked again after restart.
+            if self._wolf_plan_enabled(self.state):
+                generation = self._team_generation(self.state, team_window_id)
+                if generation is None:
+                    raise ModeratorNightError(
+                        "TEAM_SPEECH_NOT_STARTED: run night team next before advancing"
+                    )
+                team_window = self._current_team_window()
+                if self._discussion_speakers(self.state, team_window, generation) != frozenset(
+                    team_window.allowed_seats
+                ):
+                    raise ModeratorNightError(
+                        "TEAM_SPEECH_INCOMPLETE: every authorized team seat must submit "
+                        "a proposal before advancing"
+                    )
+                if (
+                    self._plan_event_for_generation(
+                        self.state,
+                        team_window_id,
+                        generation,
+                        authorized_seats=team_window.allowed_seats,
+                    )
+                    is None
+                ):
+                    raise ModeratorNightError(
+                        "WOLF_PLAN_REQUIRED: run night plan next before advancing"
+                    )
         try:
             return await self.coordinator.advance_from_current_window(
                 expected_window_id=board_window.window_id,
@@ -485,21 +572,48 @@ class ModeratorNightFlow:
         window = self._current_team_window()
         state = self.state
         if state.serial_turn is not None:
+            if self._is_plan_turn(state):
+                raise ModeratorNightError(
+                    "WOLF_PLAN_IN_PROGRESS: use night plan retry for the active final plan"
+                )
             raise ModeratorNightError(
                 "TEAM_SPEECH_IN_PROGRESS: use night team retry for the active speaker"
             )
-        if state.current_queue is None or (
-            not state.current_queue and self._team_queue_window_id != window.window_id
-        ):
+        if state.current_queue is None:
+            generation = self._team_generation(state, window.window_id)
+            if generation is None:
+                generation = await self._start_team_discussion(window)
+            elif self._plan_started_for_current_generation(state, window.window_id):
+                raise ModeratorNightError(
+                    "WOLF_PLAN_NOT_STARTED: run night plan next for the completed discussion"
+                )
             try:
                 await self.team_scheduler.start(queue=window.allowed_seats)
             except (SerialTurnError, RuntimeError, ValueError) as exc:
                 raise ModeratorNightError(str(exc)) from exc
             self._team_queue_window_id = window.window_id
         elif not state.current_queue:
-            raise ModeratorNightError(
-                "TEAM_SPEECH_COMPLETE: use night team again for another discussion round"
-            )
+            # ``current_queue`` is shared across phases.  A new physical
+            # window starts with the drained tuple from the previous night,
+            # so use the persisted window marker to distinguish it from a
+            # completed discussion in this same window.
+            generation = self._team_generation(state, window.window_id)
+            if generation is None:
+                await self._start_team_discussion(window)
+            elif self._discussion_speakers(state, window, generation) == frozenset(
+                window.allowed_seats
+            ):
+                raise ModeratorNightError(
+                    "TEAM_SPEECH_COMPLETE: use night team again for another discussion round"
+                )
+            # A marker already present means the process may have stopped
+            # between the marker commit and queue installation.  Reuse that
+            # generation and repair only the missing queue.
+            try:
+                await self.team_scheduler.start(queue=window.allowed_seats)
+            except (SerialTurnError, RuntimeError, ValueError) as exc:
+                raise ModeratorNightError(str(exc)) from exc
+            self._team_queue_window_id = window.window_id
         try:
             result = await self.team_scheduler.run_next()
         except (SerialTurnError, RuntimeError, ValueError) as exc:
@@ -515,6 +629,10 @@ class ModeratorNightFlow:
         if state.serial_turn is None:
             raise ModeratorNightError(
                 "TEAM_SPEECH_NOT_IN_PROGRESS: no active team speaker can be retried"
+            )
+        if self._is_plan_turn(state):
+            raise ModeratorNightError(
+                "WOLF_PLAN_IN_PROGRESS: use night plan retry for the active final plan"
             )
         if state.current_queue is None or not state.current_queue:
             raise ModeratorNightError("TEAM_SPEECH_QUEUE_INVALID: no pending team seat to retry")
@@ -542,6 +660,7 @@ class ModeratorNightFlow:
             raise ModeratorNightError(
                 "TEAM_SPEECH_INCOMPLETE: finish the current discussion round before again"
             )
+        generation = await self._start_team_discussion(window)
         try:
             await self.team_scheduler.start(queue=window.allowed_seats)
         except (SerialTurnError, RuntimeError, ValueError) as exc:
@@ -549,8 +668,332 @@ class ModeratorNightFlow:
         return {
             "status": "ready",
             "queue": list(window.allowed_seats),
+            "generation": generation,
             "phase": GamePhase.NIGHT_TEAM_CHAT.value,
         }
+
+    def _wolf_plan_enabled(self, state: GameState) -> bool:
+        """Return whether this frozen board requires the final consensus speech."""
+
+        knife_rule = getattr(self._board, "knife_rule", None)
+        if knife_rule is None:
+            return False
+        available_after_window = getattr(knife_rule, "available_after_window", None)
+        if not isinstance(available_after_window, str):
+            return False
+        team_window_ids = {
+            item.window_id
+            for item in self._board.night_windows
+            if item.phase is GamePhase.NIGHT_TEAM_CHAT
+        }
+        if state.phase is GamePhase.NIGHT_TEAM_CHAT:
+            try:
+                current_window = self._current_board_window()
+            except ModeratorNightError:
+                return False
+            if current_window.window_id != available_after_window:
+                return False
+        return bool(
+            self._board.wolf_team_visibility.discussion_enabled
+            and knife_rule.selection_mode == "consensus"
+            and knife_rule.plan_confirmation_required
+            and available_after_window in team_window_ids
+            and self._wolf_coordinator_seat is not None
+            and self._action_definition_by_name("WOLF_KILL") is not None
+        )
+
+    @staticmethod
+    def _audit_marker(item: Mapping[str, object], key: str) -> str | None:
+        reason = item.get("reason")
+        if not isinstance(reason, str):
+            return None
+        for part in reason.split(";"):
+            name, separator, value = part.partition("=")
+            if separator and name == key:
+                return value
+        return None
+
+    def _stage_audits(
+        self,
+        state: GameState,
+        operation: str,
+        window_id: str,
+    ) -> tuple[tuple[int, int], ...]:
+        markers: list[tuple[int, int]] = []
+        for item in state.moderator_audit:
+            if item.get("operation") != operation:
+                continue
+            if self._audit_marker(item, "round") != str(state.round_no):
+                continue
+            if self._audit_marker(item, "window") != window_id:
+                continue
+            generation = self._audit_marker(item, "generation")
+            revision = item.get("committed_revision")
+            if generation is None or not generation.isdigit() or type(revision) is not int:
+                continue
+            markers.append((int(generation), revision))
+        return tuple(sorted(markers))
+
+    def _team_generation(self, state: GameState, window_id: str) -> int | None:
+        markers = self._stage_audits(state, "WOLF_TEAM_DISCUSSION_STARTED", window_id)
+        return markers[-1][0] if markers else None
+
+    def _generation_revision(self, state: GameState, window_id: str, generation: int) -> int:
+        markers = self._stage_audits(state, "WOLF_TEAM_DISCUSSION_STARTED", window_id)
+        for marker_generation, revision in reversed(markers):
+            if marker_generation == generation:
+                return revision
+        return -1
+
+    def _plan_started_for_current_generation(self, state: GameState, window_id: str) -> bool:
+        generation = self._team_generation(state, window_id)
+        if generation is None:
+            return False
+        return any(
+            item_generation == generation
+            for item_generation, _ in self._stage_audits(state, "WOLF_PLAN_STARTED", window_id)
+        )
+
+    def _plan_logical_request_id(self, state: GameState, coordinator: int) -> str:
+        return SerialTurnScheduler._logical_request_id(
+            state.game_id,
+            state.round_no,
+            coordinator,
+            phase=GamePhase.NIGHT_TEAM_CHAT,
+            label="wolf-plan",
+        )
+
+    def _plan_event_for_generation(
+        self,
+        state: GameState,
+        window_id: str,
+        generation: int,
+        *,
+        authorized_seats: tuple[int, ...] | None = None,
+    ) -> GameEvent | None:
+        coordinator = self._wolf_coordinator_seat
+        if coordinator is None:
+            return None
+        start_revision = self._generation_revision(state, window_id, generation)
+        logical_id = self._plan_logical_request_id(state, coordinator)
+        candidates = [
+            event
+            for event in _typed_events(state)
+            if event.event_type is EventType.TEAM_SPEECH
+            and event.phase is GamePhase.NIGHT_TEAM_CHAT
+            and event.round_no == state.round_no
+            and event.actor_seat == coordinator
+            and event.correlation_id == logical_id
+            and event.state_revision > start_revision
+            and isinstance(event.payload, TeamSpeechPayload)
+            and event.payload.speaker_seat == coordinator
+            and (authorized_seats is None or event.audience == authorized_seats)
+        ]
+        return candidates[-1] if candidates else None
+
+    def _discussion_speakers(
+        self,
+        state: GameState,
+        window: ActionWindow,
+        generation: int,
+    ) -> frozenset[int]:
+        """Return seats with a persisted proposal in the current generation."""
+
+        start_revision = self._generation_revision(state, window.window_id, generation)
+        plan_ids = (
+            {self._plan_logical_request_id(state, self._wolf_coordinator_seat)}
+            if self._wolf_coordinator_seat is not None
+            else set()
+        )
+        return frozenset(
+            event.actor_seat
+            for event in _typed_events(state)
+            if event.event_type is EventType.TEAM_SPEECH
+            and event.phase is GamePhase.NIGHT_TEAM_CHAT
+            and event.round_no == state.round_no
+            and event.state_revision > start_revision
+            and event.actor_seat in window.allowed_seats
+            and event.audience == window.allowed_seats
+            and event.correlation_id not in plan_ids
+            and event.actor_seat is not None
+            and isinstance(event.payload, TeamSpeechPayload)
+            and event.payload.speaker_seat == event.actor_seat
+        )
+
+    async def _start_team_discussion(self, window: ActionWindow) -> int:
+        """Persist a new discussion generation before installing its queue."""
+
+        state = self.state
+        previous = self._team_generation(state, window.window_id)
+        generation = 1 if previous is None else previous + 1
+        reason = f"round={state.round_no};window={window.window_id};generation={generation}"
+        try:
+            await self._manager.commit_moderator_operation(
+                operation="WOLF_TEAM_DISCUSSION_STARTED",
+                command="night team next",
+                expected_revision=state.state_revision,
+                reason=reason,
+                now=self._clock(),
+            )
+        except (EventCommitError, ValueError, TypeError) as exc:
+            raise ModeratorNightError(str(exc)) from exc
+        return generation
+
+    @staticmethod
+    def _is_plan_turn(state: GameState) -> bool:
+        turn = state.serial_turn
+        return bool(turn is not None and "-wolf-plan-" in turn.logical_request_id)
+
+    async def plan_next(self) -> dict[str, object]:
+        """Run the coordinator-only final wolf plan speech."""
+
+        self._refresh_configuration(self._manager.state)
+        window = self._current_team_window()
+        state = self.state
+        if not self._wolf_plan_enabled(state):
+            raise ModeratorNightError(
+                "WOLF_PLAN_UNAVAILABLE: this board has no consensus wolf plan"
+            )
+        coordinator = self._wolf_coordinator_seat
+        if coordinator is None:
+            raise ModeratorNightError(
+                "WOLF_PLAN_UNAVAILABLE: no final wolf coordinator is eligible"
+            )
+        physical_id = window.window_id
+        generation = self._team_generation(state, physical_id)
+        if generation is None:
+            raise ModeratorNightError("WOLF_PLAN_NOT_READY: complete the team discussion first")
+        if state.serial_turn is not None:
+            if self._is_plan_turn(state):
+                raise ModeratorNightError("WOLF_PLAN_IN_PROGRESS: use night plan retry")
+            raise ModeratorNightError(
+                "TEAM_SPEECH_IN_PROGRESS: finish the active team speaker first"
+            )
+        if state.current_queue is None:
+            raise ModeratorNightError("WOLF_PLAN_NOT_READY: complete the team discussion first")
+        if state.current_queue:
+            if self._plan_started_for_current_generation(state, physical_id):
+                raise ModeratorNightError("WOLF_PLAN_IN_PROGRESS: use night plan retry")
+            raise ModeratorNightError("TEAM_SPEECH_INCOMPLETE: finish every team speaker first")
+        if self._discussion_speakers(state, window, generation) != frozenset(window.allowed_seats):
+            raise ModeratorNightError(
+                "WOLF_PLAN_NOT_READY: every authorized team seat must submit a proposal first"
+            )
+        if (
+            self._plan_event_for_generation(
+                state,
+                physical_id,
+                generation,
+                authorized_seats=window.allowed_seats,
+            )
+            is not None
+        ):
+            raise ModeratorNightError("WOLF_PLAN_COMPLETE: final wolf plan is already committed")
+        if not self._plan_started_for_current_generation(state, physical_id):
+            reason = (
+                f"round={state.round_no};window={window.window_id};generation={generation};"
+                f"coordinator={self._wolf_coordinator_seat}"
+            )
+            try:
+                await self._manager.commit_moderator_operation(
+                    operation="WOLF_PLAN_STARTED",
+                    command="night plan next",
+                    expected_revision=state.state_revision,
+                    reason=reason,
+                    now=self._clock(),
+                )
+            except (EventCommitError, ValueError, TypeError) as exc:
+                raise ModeratorNightError(str(exc)) from exc
+        try:
+            await self.wolf_plan_scheduler.start(queue=(coordinator,))
+            result = await self.wolf_plan_scheduler.run_next()
+        except (SerialTurnError, RuntimeError, ValueError) as exc:
+            raise ModeratorNightError(str(exc)) from exc
+        return self._team_turn_payload(result, window_id=window.window_id)
+
+    async def plan_retry(self) -> dict[str, object]:
+        """Retry the persisted coordinator plan request without changing its queue."""
+
+        self._refresh_configuration(self._manager.state)
+        window = self._current_team_window()
+        state = self.state
+        if state.serial_turn is None or not self._is_plan_turn(state):
+            raise ModeratorNightError("WOLF_PLAN_NOT_IN_PROGRESS: no final plan can be retried")
+        try:
+            result = await self.wolf_plan_scheduler.retry()
+        except (SerialTurnError, RuntimeError, ValueError) as exc:
+            raise ModeratorNightError(str(exc)) from exc
+        return self._team_turn_payload(result, window_id=window.window_id)
+
+    def plan_progress(self) -> dict[str, object]:
+        """Project durable plan state for moderator status and recovery."""
+
+        self._refresh_configuration(self._manager.state)
+        state = self.state
+        payload: dict[str, object] = {
+            "enabled": self._wolf_plan_enabled(state),
+            "coordinator_seat": self._wolf_coordinator_seat,
+            "generation": None,
+            "status": "UNAVAILABLE",
+            "queue": None,
+            "turn": None,
+            "proposal_seats": [],
+        }
+        if state.phase is not GamePhase.NIGHT_TEAM_CHAT:
+            return payload
+        try:
+            window = self._current_board_window()
+        except ModeratorNightError:
+            return payload
+        if window.phase is not GamePhase.NIGHT_TEAM_CHAT:
+            return payload
+        physical_id = self._physical_window_id(window.window_id, state.round_no)
+        raw = state.action_windows.get(physical_id)
+        if raw is None:
+            payload["status"] = "NOT_OPEN"
+            return payload
+        try:
+            action_window = _load_window(raw)
+        except ModeratorNightError:
+            payload["status"] = "INVALID"
+            return payload
+        generation = self._team_generation(state, physical_id)
+        payload["generation"] = generation
+        if generation is None:
+            payload["status"] = "DISCUSSION_NOT_STARTED"
+            return payload
+        speakers = sorted(self._discussion_speakers(state, action_window, generation))
+        payload["proposal_seats"] = speakers
+        payload["queue"] = list(state.current_queue) if state.current_queue is not None else None
+        if state.serial_turn is not None and self._is_plan_turn(state):
+            payload["status"] = "IN_PROGRESS"
+            payload["turn"] = state.serial_turn.model_dump(mode="json")
+        elif (
+            self._plan_event_for_generation(
+                state,
+                physical_id,
+                generation,
+                authorized_seats=action_window.allowed_seats,
+            )
+            is not None
+        ):
+            payload["status"] = "COMPLETE"
+        elif state.current_queue:
+            payload["status"] = (
+                "PLAN_PENDING"
+                if self._plan_started_for_current_generation(state, physical_id)
+                else "DISCUSSION_IN_PROGRESS"
+            )
+        elif state.current_queue == ():
+            payload["status"] = (
+                "READY"
+                if self._discussion_speakers(state, action_window, generation)
+                == frozenset(action_window.allowed_seats)
+                else "DISCUSSION_PENDING"
+            )
+        else:
+            payload["status"] = "DISCUSSION_PENDING"
+        return payload
 
     @staticmethod
     def _pending_kill_target(
@@ -933,6 +1376,7 @@ class ModeratorNightFlow:
                 if state.phase is GamePhase.NIGHT_TEAM_CHAT and state.serial_turn is not None
                 else None
             ),
+            "wolf_plan": self.plan_progress(),
         }
         candidates = [item for item in self._board.night_windows if item.phase is state.phase]
         for board_window in sorted(candidates, key=lambda item: item.order):

@@ -7,9 +7,11 @@ import pytest
 from werewolf.domain.enums import GamePhase
 from werewolf.game import (
     EventCommitError,
+    EventType,
     GameManager,
     GameState,
     PlayerState,
+    PublicVoteResultPayload,
     RulesetRef,
     SheriffCampaignSpeechRequest,
     SheriffElectionError,
@@ -204,6 +206,24 @@ async def test_manager_commits_unique_election_and_installs_weight() -> None:
     assert confirmed.phase is GamePhase.SHERIFF_TRANSFER
     assert confirmed.sheriff_seat == 2
     assert confirmed.players[2].vote_weight == 1.5
+    result_events = [
+        event for event in confirmed.events if event.event_type is EventType.VOTE_RESULT
+    ]
+    assert len(result_events) == 1
+    payload = result_events[0].payload
+    assert isinstance(payload, PublicVoteResultPayload)
+    assert payload.vote_kind == "sheriff"
+    assert payload.elected_seat == 2
+    assert payload.eliminated_seat is None
+    assert [(ballot.voter_seat, ballot.target_seat) for ballot in payload.ballots] == [
+        (1, 2),
+        (2, 2),
+        (3, 1),
+    ]
+    replay = await manager.confirm_sheriff_election(
+        board, expected_revision=confirmed.state_revision
+    )
+    assert replay is confirmed
     assert (
         await manager.complete_sheriff_transfer(expected_revision=confirmed.state_revision)
     ).phase is (GamePhase.DAY_SPEECH)
@@ -266,6 +286,17 @@ async def test_manager_pk_revote_elects_winner_and_retains_first_ballot() -> Non
     assert pk_speech.sheriff_election is not None
     assert pk_speech.sheriff_election["tie_round"] == 1
     assert len(pk_speech.sheriff_election["vote_history"]) == 1
+    first_event = [
+        event for event in pk_speech.events if event.event_type is EventType.VOTE_RESULT
+    ][0]
+    assert isinstance(first_event.payload, PublicVoteResultPayload)
+    assert first_event.payload.vote_kind == "sheriff"
+    assert first_event.payload.elected_seat is None
+    assert first_event.payload.eliminated_seat is None
+    assert first_event.payload.ballots[-1].target_seat is None
+    assert (
+        await manager.confirm_sheriff_election(board, expected_revision=pk_speech.state_revision)
+    ) is pk_speech
 
     for seat in (1, 2):
         current = await manager.snapshot()
@@ -326,6 +357,15 @@ async def test_manager_pk_revote_elects_winner_and_retains_first_ballot() -> Non
     assert confirmed.sheriff_seat == 2
     assert confirmed.sheriff_election is not None
     assert len(confirmed.sheriff_election["vote_history"]) == 1
+    result_events = [
+        event for event in confirmed.events if event.event_type is EventType.VOTE_RESULT
+    ]
+    assert len(result_events) == 2
+    assert result_events[0].correlation_id != result_events[1].correlation_id
+    assert isinstance(result_events[1].payload, PublicVoteResultPayload)
+    assert result_events[1].payload.vote_kind == "sheriff_pk"
+    assert result_events[1].payload.elected_seat == 2
+    assert result_events[1].payload.eliminated_seat is None
 
 
 @pytest.mark.asyncio

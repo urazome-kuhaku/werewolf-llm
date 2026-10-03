@@ -148,17 +148,54 @@ class PublicSpeechPayload(_Payload):
     content: _Content = Field(validation_alias=AliasChoices("content", "text"))
 
 
+class PublicVoteBallot(_Payload):
+    """The minimum public projection of one confirmed ballot.
+
+    Request identifiers, session/observation revisions, and other runtime
+    metadata stay in the moderator-owned vote state.  ``target_seat=None``
+    is the explicit public representation of an abstention.
+    """
+
+    voter_seat: _Seat = Field(validation_alias=AliasChoices("voter_seat", "voter"))
+    target_seat: _Seat | None = Field(
+        default=None,
+        validation_alias=AliasChoices("target_seat", "target"),
+    )
+    weight: float = Field(gt=0, strict=True)
+
+    @field_validator("weight")
+    @classmethod
+    def validate_weight(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("ballot weights must be finite")
+        return value
+
+
 class PublicVoteResultPayload(_Payload):
     """A completed, authorized vote result.
 
-    The individual ballots are deliberately not represented here.  A future
-    board can introduce another typed public result once its publication rule
-    has been reviewed.
+    Ballots are present only when the frozen board's post-close policy is
+    ``ballots_and_totals``.  The default keeps older event snapshots valid and
+    represents the historical tally-only projection.
     """
 
     kind: Literal["vote_result"] = "vote_result"
+    vote_kind: Literal["day", "day_pk", "sheriff", "sheriff_pk"] | None = None
     eliminated_seat: _Seat | None = None
+    elected_seat: _Seat | None = None
     tally: dict[_Seat, float] = Field(default_factory=dict)
+    ballots: tuple[PublicVoteBallot, ...] = Field(
+        default=(),
+        exclude_if=lambda value: not value,
+    )
+
+    @field_validator("ballots")
+    @classmethod
+    def validate_ballots(cls, value: tuple[PublicVoteBallot, ...]) -> tuple[PublicVoteBallot, ...]:
+        seats = tuple(ballot.voter_seat for ballot in value)
+        if tuple(sorted(seats)) != seats or len(set(seats)) != len(seats):
+            raise ValueError("public ballots must be sorted by unique voter seat")
+        return value
 
     @field_validator("tally")
     @classmethod
@@ -598,6 +635,7 @@ __all__ = [
     "PrivateSeerResultPayload",
     "PrivateWitchTargetPayload",
     "PublicAnnouncementPayload",
+    "PublicVoteBallot",
     "PublicPayload",
     "PublicSpeechPayload",
     "PublicVoteResultPayload",

@@ -358,6 +358,12 @@ class SerialTurnScheduler:
             summary=(
                 "你当前获得的是遗言发言机会；请发表本局遗言，不要把它当作普通存活玩家的日常发言。"
                 if self._logical_label == "last-words"
+                else (
+                    "你当前是狼人团队的最终协调员。请综合本夜所有队友提案，明确刀口及理由、"
+                    "战术分工与备选方案，并说明如何处理分歧。这里只提交团队最终方案说明；"
+                    "实际刀口必须在后续结构化 WOLF_KILL 行动中提交，文字不会改变目标。"
+                )
+                if self._logical_label == "wolf-plan"
                 else ""
             ),
             events=[

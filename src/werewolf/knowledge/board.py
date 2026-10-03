@@ -460,7 +460,12 @@ class WolfTeamVisibility(_StrictBoardModel):
 
 
 class KnifeRule(_StrictBoardModel):
-    """How the wolf team forms and exposes the final knife target."""
+    """Define wolf target semantics and optional private plan confirmation.
+
+    ``final_target_required`` describes the target/action contract, while
+    ``plan_confirmation_required`` describes whether the coordinator must
+    summarize the team's discussion before the night can advance.
+    """
 
     selection_mode: Literal["consensus", "designated", "majority"] = Field(
         default="consensus",
@@ -471,6 +476,7 @@ class KnifeRule(_StrictBoardModel):
         validation_alias=AliasChoices("target_visibility", "target_visible_to"),
     )
     final_target_required: bool = True
+    plan_confirmation_required: bool = False
     available_after_window: LogicalId = "wolf_team_chat"
 
     @field_validator("selection_mode", "target_visibility", mode="before")
