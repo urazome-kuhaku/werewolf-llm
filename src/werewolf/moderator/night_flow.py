@@ -8,6 +8,7 @@ into a small moderator command surface.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
 from datetime import UTC, datetime
@@ -23,9 +24,9 @@ from werewolf.game.action_turn import (
 from werewolf.game.actions import (
     ActionDefinition,
     ActionRegistry,
+    ActionRequest,
     ActionValidationContext,
     ActionWindow,
-    load_action_registry,
 )
 from werewolf.game.events import (
     EventType,
@@ -35,22 +36,30 @@ from werewolf.game.events import (
     TeamNoticePayload,
     TeamSpeechPayload,
 )
-from werewolf.game.manager import EventCommitError, GameManager
+from werewolf.game.manager import EventCommitError, GameManager, ResolutionError
 from werewolf.game.night import (
     NightCoordinator,
     NightCoordinatorError,
     NightWindowConfig,
     NightWindowProgress,
 )
-from werewolf.game.resolution import ActionResolution
+from werewolf.game.resolution import (
+    ActionDisposition,
+    ActionResolution,
+    ActionResolutionEntry,
+    ResolutionStatus,
+)
 from werewolf.game.serial_turn import (
     SerialSpeechResult,
     SerialTurnError,
     SerialTurnScheduler,
 )
-from werewolf.game.state import GameState, GrantedAbility, PlayerState
+from werewolf.game.state import AbilityInstanceState, GameState, GrantedAbility, PlayerState
 from werewolf.knowledge.board import BoardDefinition, NightWindow
 from werewolf.moderator.classic_resolution import build_classic_night_resolutions
+from werewolf.rules.models import SkillSpec
+from werewolf.rules.scheduler import skill_dependency_ranks
+from werewolf.rules.selectors import select_seats
 from werewolf.runtime.player_runtime import PlayerRuntime
 
 
@@ -69,6 +78,56 @@ def _load_window(raw: object) -> ActionWindow:
         return ActionWindow.model_validate(data)
     except ValueError as exc:
         raise ModeratorNightError("stored night window is malformed") from exc
+
+
+def _rule_engine_acknowledgements(
+    state: GameState,
+    action_window_id: str,
+    *,
+    now: datetime,
+) -> tuple[ActionResolution, ...]:
+    """Build neutral envelopes for pending requests handled by the interpreter."""
+
+    output: list[ActionResolution] = []
+    for request_id, raw in sorted(state.action_requests.items()):
+        if (
+            not isinstance(raw, Mapping)
+            or raw.get("window_id") != action_window_id
+            or raw.get("status") != "PENDING"
+        ):
+            continue
+        payload = {key: raw[key] for key in ActionRequest.model_fields if key in raw}
+        phase = payload.get("phase")
+        if isinstance(phase, str):
+            payload["phase"] = GamePhase(phase)
+        request = ActionRequest.model_validate(payload)
+        digest = hashlib.sha256(
+            f"{state.game_id}:{state.round_no}:{request_id}".encode()
+        ).hexdigest()[:32]
+        output.append(
+            ActionResolution(
+                resolution_id=f"rule-ack-{digest}",
+                bundle_id=f"rule-bundle-{digest}",
+                game_id=state.game_id,
+                window_id=action_window_id,
+                request_id=request.request_id,
+                session_epoch=request.session_epoch,
+                base_revision=state.state_revision,
+                status=ResolutionStatus.CONFIRMED,
+                actions=tuple(
+                    ActionResolutionEntry(
+                        action_index=index,
+                        requested_action=action,
+                        disposition=ActionDisposition.CONFIRMED,
+                    )
+                    for index, action in enumerate(request.actions)
+                ),
+                moderator_id="rule-interpreter",
+                reason="neutral request envelope; package interpreter decides effects",
+                created_at=now,
+            )
+        )
+    return tuple(output)
 
 
 def _typed_events(state: GameState) -> tuple[GameEvent, ...]:
@@ -201,17 +260,48 @@ class ModeratorNightFlow:
         return frozenset(role_ids)
 
     def _wolf_seats(self, state: GameState) -> tuple[int, ...]:
-        players = state.players
+        if self._manager.execution_package is not None:
+            authorized_groups = {
+                group_id
+                for player in state.players.values()
+                if player.alive
+                for group_id in player.chat_group_ids
+            }
+            return tuple(
+                seat
+                for seat, player in sorted(state.players.items())
+                if player.alive and authorized_groups.intersection(player.chat_group_ids)
+            )
         role_ids = self._team_role_ids()
-        seats: list[int] = []
-        for seat, player in sorted(players.items()):
-            if not player.alive:
-                continue
-            if (role_ids and player.role_id in role_ids) or (
-                not role_ids and player.faction_id.casefold() in {"wolf", "werewolf"}
-            ):
-                seats.append(seat)
-        return tuple(seats)
+        configured_groups = {
+            group_id
+            for player in state.players.values()
+            if player.alive and player.role_id in role_ids
+            for group_id in player.chat_group_ids
+        }
+        if self._manager.execution_package is None:
+            # Schema-one games predate explicit team visibility. Keep their
+            # classic manual-resolution path working from the frozen board.
+            return tuple(
+                seat
+                for seat, player in sorted(state.players.items())
+                if player.alive
+                and (
+                    player.role_id in role_ids
+                    if role_ids
+                    else player.faction_id.casefold() in {"wolf", "werewolf"}
+                )
+            )
+        return tuple(
+            seat
+            for seat, player in sorted(state.players.items())
+            if player.alive
+            and player.chat_group_ids
+            and (not role_ids or player.role_id in role_ids)
+            and (
+                not configured_groups or bool(configured_groups.intersection(player.chat_group_ids))
+            )
+        )
 
     def _select_wolf_coordinator(self, state: GameState) -> int | None:
         """Choose the deterministic final wolf submitter for this round.
@@ -220,6 +310,24 @@ class ModeratorNightFlow:
         state.  It is recorded in moderator audit when the action window is
         first opened; it is never added to the role knowledge document.
         """
+
+        execution = self._manager.execution_package
+        if execution is not None:
+            candidates: dict[tuple[str, str], int] = {}
+            for seat, player in sorted(state.players.items()):
+                if not player.alive:
+                    continue
+                for _instance, skill in self._manager._rule_skill_instances(
+                    state,
+                    seat,
+                    GamePhase.NIGHT_ACTION.value,
+                ):
+                    if skill.coordination_scope != "CHAT_GROUP":
+                        continue
+                    for group_id in player.chat_group_ids:
+                        key = (skill.skill_id, group_id)
+                        candidates[key] = min(seat, candidates.get(key, seat))
+            return min(candidates.values()) if candidates else None
 
         wolf_kill = self._action_definition_by_name("WOLF_KILL")
         if wolf_kill is None:
@@ -249,21 +357,114 @@ class ModeratorNightFlow:
         return None
 
     def _action_definition_by_name(self, name: str) -> ActionDefinition | None:
-        # NightCoordinator and GameManager independently load the same
-        # registry.  Importing through the manager is intentionally avoided so
-        # this adapter cannot mutate or replace its authoritative registry.
-        registry = load_action_registry()
+        """Resolve an action from the manager's frozen package registry."""
+
+        registry = self._manager.registry
         for definition in registry.actions:
             if definition.action_name == name:
                 return definition
         return None
 
     def _build_window_configs(self, state: GameState) -> dict[str, NightWindowConfig]:
+        execution = self._manager.execution_package
+        action_configs: dict[str, NightWindowConfig] = {}
+        if execution is not None:
+            action_specs = {action.action_code: action for action in execution.actions}
+            ranks = skill_dependency_ranks(execution.skills)
+            alive = tuple(seat for seat, player in sorted(state.players.items()) if player.alive)
+            for board_window in self._board.night_windows:
+                if board_window.phase is GamePhase.NIGHT_TEAM_CHAT:
+                    team_seats = self._wolf_seats(state)
+                    if team_seats:
+                        action_configs[board_window.window_id] = NightWindowConfig(
+                            allowed_seats=team_seats,
+                            allowed_role_ids=tuple(board_window.visible_to),
+                            allowed_action_codes=(299,),
+                            min_actions=0,
+                            max_actions=0,
+                            allow_pass=True,
+                        )
+                    continue
+                if board_window.phase is not GamePhase.NIGHT_ACTION:
+                    continue
+                eligible: list[tuple[AbilityInstanceState, SkillSpec]] = []
+                for seat, player in sorted(state.players.items()):
+                    if not player.alive:
+                        continue
+                    eligible.extend(
+                        self._manager._rule_skill_instances(
+                            state,
+                            seat,
+                            board_window.phase.value,
+                        )
+                    )
+                chat_group_coordinators: dict[tuple[str, str], int] = {}
+                for instance, skill in eligible:
+                    if skill.coordination_scope != "CHAT_GROUP":
+                        continue
+                    player = state.players[instance.actor_seat]
+                    for group_id in player.chat_group_ids:
+                        key = (skill.skill_id, group_id)
+                        chat_group_coordinators[key] = min(
+                            instance.actor_seat,
+                            chat_group_coordinators.get(key, instance.actor_seat),
+                        )
+                eligible = [
+                    (instance, skill)
+                    for instance, skill in eligible
+                    if skill.coordination_scope != "CHAT_GROUP"
+                    or any(
+                        chat_group_coordinators[(skill.skill_id, group_id)] == instance.actor_seat
+                        for group_id in state.players[instance.actor_seat].chat_group_ids
+                        if (skill.skill_id, group_id) in chat_group_coordinators
+                    )
+                ]
+                skills_by_seat: dict[int, list[SkillSpec]] = {}
+                for instance, skill in eligible:
+                    skills_by_seat.setdefault(instance.actor_seat, []).append(skill)
+                seats = set(skills_by_seat)
+                codes = {skill.action_code for _, skill in eligible}
+                pass_spec = action_specs.get(299)
+                allow_pass = bool(
+                    pass_spec is not None
+                    and pass_spec.allow_pass
+                    and any(
+                        seat_skills
+                        and all(
+                            (action_spec := action_specs.get(skill.action_code)) is not None
+                            and action_spec.allow_pass
+                            for skill in seat_skills
+                        )
+                        for seat_skills in skills_by_seat.values()
+                    )
+                )
+                if allow_pass:
+                    codes.add(299)
+                if not seats or not codes:
+                    continue
+                ordered_seats = tuple(
+                    sorted(
+                        seats,
+                        key=lambda seat: (
+                            min(ranks[skill.skill_id] for skill in skills_by_seat[seat]),
+                            seat,
+                        ),
+                    )
+                )
+                action_configs[board_window.window_id] = NightWindowConfig(
+                    allowed_seats=ordered_seats,
+                    allowed_action_codes=tuple(sorted(codes)),
+                    min_actions=1,
+                    max_actions=1,
+                    allow_pass=allow_pass,
+                    visible_context={"candidate_seats": list(alive)},
+                )
+            return action_configs
+
         players = state.players
         registry = self._action_registry()
         wolf_kill = self._action_definition_by_name("WOLF_KILL")
         wolf_kill_code = wolf_kill.action_code if wolf_kill is not None else None
-        action_configs: dict[str, NightWindowConfig] = {}
 
         for board_window in self._board.night_windows:
             if board_window.phase is GamePhase.NIGHT_TEAM_CHAT:
@@ -446,7 +647,14 @@ class ModeratorNightFlow:
             event_type=EventType.TEAM_NOTICE,
             authorized_seats=seats,
             correlation_id=correlation,
-            payload=TeamNoticePayload(content="狼人队伍成员座位：" + "、".join(map(str, seats))),
+            payload=TeamNoticePayload(
+                content=json.dumps(
+                    {"kind": "chat_group_roster", "member_seats": seats},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            ),
         )
         try:
             await self._manager.commit_events((event,), now=self._clock())
@@ -693,6 +901,21 @@ class ModeratorNightFlow:
                 return False
             if current_window.window_id != available_after_window:
                 return False
+        execution = self._manager.execution_package
+        if execution is not None:
+            has_shared_action = any(
+                skill.coordination_scope == "CHAT_GROUP"
+                and GamePhase.NIGHT_ACTION.value in skill.timing
+                for skill in execution.skills
+            )
+            return bool(
+                self._board.wolf_team_visibility.discussion_enabled
+                and knife_rule.selection_mode == "consensus"
+                and knife_rule.plan_confirmation_required
+                and available_after_window in team_window_ids
+                and self._wolf_coordinator_seat is not None
+                and has_shared_action
+            )
         return bool(
             self._board.wolf_team_visibility.discussion_enabled
             and knife_rule.selection_mode == "consensus"
@@ -1188,11 +1411,66 @@ class ModeratorNightFlow:
         if player is None:
             raise ModeratorNightError(f"seat {seat} is not assigned")
         registry = self._action_registry()
+        execution = self._manager.execution_package
+        if execution is not None:
+            rule_adapter = self._manager._rules
+            if rule_adapter is None:
+                raise ModeratorNightError("execution package adapter is unavailable")
+            observation = rule_adapter.observation(
+                state,
+                group_id=f"runtime-context:{state.round_no}:{window.window_id}:{seat}",
+                timing=window.phase.value,
+            )
+            observed_players = {item.seat: item for item in observation.players}
+            active_rule_skills = self._manager._rule_skill_instances(
+                state,
+                seat,
+                window.phase.value,
+                allowed_codes=set(window.allowed_action_codes),
+            )
+            rule_target_sets: dict[int, tuple[int, ...]] = {}
+            for instance, skill in active_rule_skills:
+                state_values = {
+                    item.key: item.value
+                    for item in observation.skill_state
+                    if item.ability_instance_id == instance.ability_instance_id
+                }
+                selected = select_seats(
+                    skill.targets.selector,
+                    {
+                        "actor": observed_players[seat],
+                        "observation": observation,
+                        "skill_state": state_values,
+                        "request_targets": (),
+                    },
+                )
+                previous = set(rule_target_sets.get(skill.action_code, ()))
+                rule_target_sets[skill.action_code] = tuple(sorted(previous | set(selected)))
+            alive = tuple(sorted(item.seat for item in observation.players if item.alive))
+            return ActionValidationContext(
+                game_id=state.game_id,
+                session_epoch=window.session_epoch,
+                active_request_id="moderator-night-request",
+                player_alive=player.alive,
+                player_qualified=seat in window.allowed_seats,
+                role_id=player.role_id,
+                authorized_action_codes=tuple(
+                    sorted(
+                        {
+                            *(skill.action_code for _instance, skill in active_rule_skills),
+                            *({299} if window.allow_pass else set()),
+                        }
+                    )
+                ),
+                skill_resources=dict(player.skill_resources),
+                alive_seats=alive,
+                eligible_targets_by_action=rule_target_sets,
+            )
         wolf_kill = next(
             (item for item in registry.actions if item.action_name == "WOLF_KILL"),
             None,
         )
-        active = tuple(
+        active_legacy_abilities = tuple(
             ability
             for ability in player.granted_abilities
             if ability.timing is GamePhase.NIGHT_ACTION
@@ -1216,8 +1494,8 @@ class ModeratorNightFlow:
             window.window_id,
             wolf_kill.action_code if wolf_kill is not None else None,
         )
-        target_sets: dict[int, tuple[int, ...]] = {}
-        for ability in active:
+        legacy_target_sets: dict[int, tuple[int, ...]] = {}
+        for ability in active_legacy_abilities:
             try:
                 definition = registry.get(ability.action_code)
             except KeyError:
@@ -1237,7 +1515,7 @@ class ModeratorNightFlow:
                 )
             elif definition.target_policy == "none":
                 candidates = set()
-            target_sets[ability.action_code] = tuple(sorted(candidates))
+            legacy_target_sets[ability.action_code] = tuple(sorted(candidates))
         return ActionValidationContext(
             game_id=state.game_id,
             session_epoch=window.session_epoch,
@@ -1248,20 +1526,21 @@ class ModeratorNightFlow:
             authorized_action_codes=tuple(
                 sorted(
                     {
-                        *{item.action_code for item in active},
+                        *{item.action_code for item in active_legacy_abilities},
                         *({299} if window.allow_pass else set()),
                     }
                 )
             ),
             skill_resources=dict(player.skill_resources),
             alive_seats=alive,
-            eligible_targets_by_action=target_sets,
+            eligible_targets_by_action=legacy_target_sets,
             current_kill_target_seat=kill_target,
         )
 
-    @staticmethod
-    def _action_registry() -> ActionRegistry:
-        return load_action_registry()
+    def _action_registry(self) -> ActionRegistry:
+        """Return the registry pinned to this game's execution package."""
+
+        return self._manager.registry
 
     def _submitted_seats(self, window: ActionWindow) -> set[int]:
         submitted: set[int] = set()
@@ -1311,15 +1590,27 @@ class ModeratorNightFlow:
         self._refresh_configuration(self._manager.state)
         window = self._current_action_window()
         selected = self._choose_seat(window, seat)
-        witch_seats = self._witch_target_seats(self.state)
-        if selected in witch_seats:
-            if self._wolf_coordinator_seat is not None and not self._wolf_submission_confirmed(
-                self.state, window
-            ):
-                raise ModeratorNightError(
-                    "WOLF_ACTION_REQUIRED: final wolf action must be accepted before witch input"
+        if self._manager.execution_package is not None:
+            try:
+                await self._manager.publish_rule_dependency_disclosures(
+                    selected,
+                    window.window_id,
+                    expected_revision=self.state.state_revision,
+                    now=self._clock(),
                 )
-            await self._publish_witch_target_notice(window)
+            except (EventCommitError, ResolutionError, TypeError, ValueError) as exc:
+                raise ModeratorNightError(str(exc)) from exc
+        else:
+            witch_seats = self._witch_target_seats(self.state)
+            if selected in witch_seats:
+                if self._wolf_coordinator_seat is not None and not self._wolf_submission_confirmed(
+                    self.state, window
+                ):
+                    raise ModeratorNightError(
+                        "WOLF_ACTION_REQUIRED: final wolf action must be accepted before "
+                        "witch input"
+                    )
+                await self._publish_witch_target_notice(window)
         try:
             result = await self.scheduler.run_turn(
                 window,
@@ -1580,15 +1871,38 @@ class ModeratorNightFlow:
     async def auto_resolve(self) -> GameState:
         """Apply the bounded classic-board night proposal for the current night.
 
-        The proposal builder is pure and only covers the published classic
-        twelve-seat board.  The coordinator remains the single serialized
-        commit boundary, so this convenience entry point cannot bypass the
-        normal pending-request and frozen-window checks.
+        Executable games receive neutral request envelopes and let the pinned
+        interpreter produce the effects. Only schema-1 games without an
+        execution package use the bounded classic proposal builder.
         """
 
         self._refresh_configuration(self._manager.state)
         try:
-            resolutions = build_classic_night_resolutions(self.state, self._board)
+            if self._manager.execution_package is not None:
+                action_board_windows = [
+                    item
+                    for item in self._board.night_windows
+                    if item.phase is GamePhase.NIGHT_ACTION
+                ]
+                if len(action_board_windows) != 1:
+                    raise ModeratorNightError(
+                        "ACTION_WINDOW_AMBIGUOUS: V1 rule execution requires one action window"
+                    )
+                physical_id = self._physical_window_id(
+                    action_board_windows[0].window_id,
+                    self.state.round_no,
+                )
+                raw_window = self.state.action_windows.get(physical_id)
+                if raw_window is None:
+                    raise ModeratorNightError("WINDOW_NOT_OPEN: night action window is missing")
+                action_window = _load_window(raw_window)
+                resolutions = _rule_engine_acknowledgements(
+                    self.state,
+                    action_window.window_id,
+                    now=self._clock(),
+                )
+            else:
+                resolutions = build_classic_night_resolutions(self.state, self._board)
             return await self.coordinator.resolve(resolutions, now=self._clock())
         except (NightCoordinatorError, ValueError, TypeError) as exc:
             raise ModeratorNightError(str(exc)) from exc

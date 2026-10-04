@@ -10,13 +10,14 @@ repaired.
 
 from __future__ import annotations
 
+import inspect
 from collections import deque
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 
 from pydantic import ValidationError
 
+from .deterministic_actions import build_deterministic_action_response
 from .player_runtime import (
-    Action,
     ActionResponse,
     InitialContext,
     Ready,
@@ -39,6 +40,7 @@ from .player_runtime import (
 
 ScriptedValue = object
 ResponseFactory = Callable[[TurnRequest], object]
+SkillStatusProvider = Callable[[TurnRequest], object | Awaitable[object]]
 
 
 class ScriptedRuntime:
@@ -52,8 +54,14 @@ class ScriptedRuntime:
     script items.
     """
 
-    def __init__(self, script: Iterable[ScriptedValue] = ()) -> None:
+    def __init__(
+        self,
+        script: Iterable[ScriptedValue] = (),
+        *,
+        skill_status_provider: SkillStatusProvider | None = None,
+    ) -> None:
         self._script = deque(script)
+        self._skill_status_provider = skill_status_provider
         self._session_ref: RuntimeRef | None = None
         self._context: InitialContext | None = None
         self._closed = False
@@ -91,7 +99,25 @@ class ScriptedRuntime:
         self._active_request_id = request.request_id
         self._requests.append(request)
         try:
-            raw = self._script.popleft() if self._script else self._default_response(request)
+            if self._script:
+                raw = self._script.popleft()
+            elif request.expected_kind is ResponseKind.ACTION:
+                status: Mapping[str, object] = {}
+                if self._skill_status_provider is not None:
+                    supplied = self._skill_status_provider(request)
+                    if inspect.isawaitable(supplied):
+                        supplied = await supplied
+                    if not isinstance(supplied, Mapping):
+                        raise RuntimeProtocolError(
+                            "skill status provider returned a malformed result"
+                        )
+                    status = supplied
+                try:
+                    raw = build_deterministic_action_response(request, status)
+                except ValueError as exc:
+                    raise RuntimeProtocolError(str(exc)) from exc
+            else:
+                raw = self._default_response(request)
             if callable(raw):
                 raw = raw(request)
             try:
@@ -229,18 +255,9 @@ class ScriptedRuntime:
                 speech=Speech(text=f"scripted speech for {request.logical_request_id}"),
             )
         if request.expected_kind is ResponseKind.ACTION:
-            action_code = 299
-            targets: list[int] = []
-            if request.action_window is not None:
-                window = request.action_window
-                if action_code not in window.allowed_action_codes or not window.allow_pass:
-                    action_code = window.allowed_action_codes[0]
-                    if window.candidate_seats:
-                        targets = [window.candidate_seats[0]]
-            return ActionResponse(
-                request_id=request_id,
-                actions=[Action(action_code=action_code, targets=targets)],
-            )
+            if request.action_window is None:
+                raise RuntimeProtocolError("action request did not include an action window")
+            return build_deterministic_action_response(request, {})
         return validate_turn_response(
             {
                 "schema_version": 1,

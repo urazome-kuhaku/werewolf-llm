@@ -770,6 +770,13 @@ class DayCoordinator:
                 "TARGET_MISMATCH", "exile target must match the confirmed vote result"
             )
         try:
+            if self._manager.execution_package is not None:
+                return await self._manager.commit_confirmed_vote_exile(
+                    target_seat=resolved.public_result.eliminated_seat,
+                    vote_window_id=resolved.window.window_id,
+                    expected_revision=state.state_revision,
+                    now=now,
+                )
             decision: DayExileDecision = build_day_exile_decision_for_window(
                 self._board,
                 state,

@@ -355,7 +355,7 @@ class WorkbenchArtifactStore:
             manifest = _parse_manifest(raw_manifest)
             if manifest != expected_manifest:
                 raise CorruptWorkbenchArtifactsError(
-                    "artifact manifest does not match the completed bundle",
+                    "artifact manifest does not match the canonical completed manifest",
                 )
 
             expected_by_path = dict(expected_artifacts.files)

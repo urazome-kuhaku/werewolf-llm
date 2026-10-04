@@ -16,13 +16,17 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import ValidationError
 
+from werewolf.rules.compiler import validate_execution_package
+from werewolf.rules.models import ExecutionPackage
+
 from .board import BoardDefinition
 from .compiled_store import (
-    _PACKAGE_FILES,
+    _PACKAGE_FILES_V1,
+    _PACKAGE_FILES_V2,
     CompiledKnowledgePackageLoad,
     CompiledKnowledgeStore,
     _verify_manifest_and_payload,
@@ -41,8 +45,11 @@ from .snapshot import (
     KnowledgeSnapshotBuilder,
 )
 
+if TYPE_CHECKING:
+    from werewolf.game.actions import ActionRegistry
+
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
-_PACKAGE_KEYS = frozenset(
+_PACKAGE_KEYS_V1 = frozenset(
     {
         "schema_version",
         "package_id",
@@ -56,6 +63,7 @@ _PACKAGE_KEYS = frozenset(
         "indexes",
     }
 )
+_PACKAGE_KEYS_V2 = _PACKAGE_KEYS_V1 | {"executable"}
 _RECORD_KEYS = frozenset(
     {"kind", "id", "version", "title", "aliases", "body", "topics", "related_ids"}
 )
@@ -206,8 +214,12 @@ def _load_package_from_snapshot(
         raise RuntimeKnowledgeLoaderError("compiled package digest does not match snapshot")
 
     payload = _mapping(package_load.package_payload, field_name="package")
-    _exact_keys(payload, _PACKAGE_KEYS, field_name="package")
-    if payload.get("schema_version") != 1:
+    package_schema_version = payload.get("schema_version")
+    if type(package_schema_version) is int and package_schema_version == 1:
+        _exact_keys(payload, _PACKAGE_KEYS_V1, field_name="package")
+    elif type(package_schema_version) is int and package_schema_version == 2:
+        _exact_keys(payload, _PACKAGE_KEYS_V2, field_name="package")
+    else:
         raise _RuntimePayloadError("package schema_version is unsupported")
     package_id = _string(payload.get("package_id"), field_name="package.package_id")
     board_ref_text = _string(payload.get("board_ref"), field_name="package.board_ref")
@@ -243,8 +255,22 @@ def _load_package_from_snapshot(
         package_load,
         board_definition_raw=cast(Mapping[str, object], payload["board_definition"]),
         board_definition=board,
+        executable_payload=payload.get("executable"),
+        package_schema_version=package_schema_version,
     )
     document_digests = _manifest_digests(logical_manifest)
+    execution: ExecutionPackage | None
+    action_registry: ActionRegistry | None
+    execution_source: str | None
+    execution_source_sha256: str | None
+    if package_schema_version == 2:
+        execution, action_registry, execution_source, execution_source_sha256 = (
+            _load_executable_artifact(payload.get("executable"), board, effective_roles)
+        )
+    else:
+        execution, action_registry, execution_source, execution_source_sha256 = _compat_executable(
+            board, effective_roles
+        )
 
     canonical_package_json = _canonical_json(payload)
     canonical_manifest_json = _canonical_json(logical_manifest)
@@ -261,7 +287,79 @@ def _load_package_from_snapshot(
         canonical_manifest_json=canonical_manifest_json,
         package_identity=snapshot.package_identity,
         manifest_sha256=hashlib.sha256(canonical_manifest_json.encode("utf-8")).hexdigest(),
+        execution=execution,
+        action_registry=action_registry,
+        execution_source=execution_source,
+        execution_source_sha256=execution_source_sha256,
     )
+
+
+def _compat_executable(
+    board: BoardDefinition,
+    effective_roles: Mapping[str, EffectiveRoleProfile],
+) -> tuple[ExecutionPackage | None, ActionRegistry | None, str | None, str | None]:
+    """Build only a known legacy plan without consulting any live registry."""
+
+    from werewolf.rules.compat import compile_legacy_execution_from_models
+
+    from .role import RoleDefinition
+
+    if board.board_ref != VersionedRef(
+        id="classic_12_seer_witch_hunter_idiot",
+        version="1.0.0",
+    ):
+        return None, None, None, None
+    roles = {
+        role_id: profile.base_role
+        for role_id, profile in effective_roles.items()
+        if isinstance(profile.base_role, RoleDefinition)
+    }
+    compiled = compile_legacy_execution_from_models(board, roles)
+    return (
+        compiled.execution,
+        compiled.action_registry,
+        compiled.source,
+        compiled.source_sha256,
+    )
+
+
+def _load_executable_artifact(
+    raw: object,
+    board: BoardDefinition,
+    effective_roles: Mapping[str, EffectiveRoleProfile],
+) -> tuple[ExecutionPackage, ActionRegistry, str, str]:
+    value = _mapping(raw, field_name="package.executable")
+    _exact_keys(
+        value,
+        frozenset({"execution", "action_registry", "source", "source_sha256"}),
+        field_name="package.executable",
+    )
+    source = _string(value.get("source"), field_name="package.executable.source")
+    source_digest = _string(
+        value.get("source_sha256"),
+        field_name="package.executable.source_sha256",
+    )
+    if _SHA256_RE.fullmatch(source_digest) is None:
+        raise _RuntimePayloadError("package.executable.source_sha256 is invalid")
+    if source != "declared" and not source.startswith("compat:"):
+        raise _RuntimePayloadError("package.executable.source is unsupported")
+    try:
+        from werewolf.game.actions import ActionRegistry
+
+        execution = ExecutionPackage.model_validate(value.get("execution"))
+        action_registry = ActionRegistry.model_validate(value.get("action_registry"))
+        if execution.board_id != board.board_id or execution.board_version != board.version:
+            raise _RuntimePayloadError("executable board reference disagrees with package")
+        validate_execution_package(
+            execution,
+            action_registry,
+            role_ids=set(effective_roles),
+        )
+    except _RuntimePayloadError:
+        raise
+    except (TypeError, ValueError, ValidationError) as exc:
+        raise _RuntimePayloadError("package.executable is invalid") from exc
+    return execution, action_registry, source, source_digest
 
 
 def _load_board_definition(
@@ -380,8 +478,16 @@ def _verify_package_at_snapshot_root(
 ) -> CompiledKnowledgePackageLoad:
     """Verify the embedded package while allowing snapshot.json beside it."""
 
+    available = set(snapshot.file_digests)
+    package_names = available - {"manifest.json"}
+    if package_names == set(_PACKAGE_FILES_V1):
+        filenames = (*_PACKAGE_FILES_V1, "manifest.json")
+    elif package_names == set(_PACKAGE_FILES_V2):
+        filenames = (*_PACKAGE_FILES_V2, "manifest.json")
+    else:
+        raise CorruptKnowledgeSnapshotError("snapshot compiled package file set is unsupported")
     files: dict[str, bytes] = {}
-    for filename in (*_PACKAGE_FILES, "manifest.json"):
+    for filename in filenames:
         path = snapshot.root / filename
         if path.is_symlink() or not path.is_file():
             raise CorruptKnowledgeSnapshotError(
@@ -699,6 +805,8 @@ def _validate_logical_manifest(
     *,
     board_definition_raw: Mapping[str, object],
     board_definition: BoardDefinition,
+    executable_payload: object,
+    package_schema_version: int,
 ) -> None:
     expected_keys = frozenset(
         {
@@ -709,8 +817,13 @@ def _validate_logical_manifest(
             "documents",
         }
     )
+    if package_schema_version == 2:
+        expected_keys = expected_keys | {"execution_sha256"}
     _exact_keys(manifest, expected_keys, field_name="package.manifest")
-    if manifest.get("schema_version") != 1:
+    if (
+        type(manifest.get("schema_version")) is not int
+        or manifest.get("schema_version") != package_schema_version
+    ):
         raise _RuntimePayloadError("package.manifest schema_version is unsupported")
     if (
         manifest.get("package_id") != snapshot.package_id
@@ -727,6 +840,15 @@ def _validate_logical_manifest(
         _board_definition_payload(board_definition_raw, board_definition)
     ):
         raise _RuntimePayloadError("package.manifest disagrees with board_definition")
+    if package_schema_version == 2:
+        execution_digest = _string(
+            manifest.get("execution_sha256"),
+            field_name="package.manifest.execution_sha256",
+        )
+        if _SHA256_RE.fullmatch(execution_digest) is None:
+            raise _RuntimePayloadError("package.manifest.execution_sha256 is invalid")
+        if execution_digest != _sha256_json(executable_payload):
+            raise _RuntimePayloadError("package.manifest disagrees with executable rules")
     raw_documents = manifest.get("documents")
     if not isinstance(raw_documents, list) or not raw_documents:
         raise _RuntimePayloadError("package.manifest.documents must be a non-empty list")

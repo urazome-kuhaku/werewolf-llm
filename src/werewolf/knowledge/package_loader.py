@@ -17,7 +17,10 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Generic, TypeVar, cast
 
+import yaml  # type: ignore[import-untyped]
 from pydantic import BaseModel, ValidationError
+
+from werewolf.persistence import PathSecurityError, resolve_contained_path
 
 from .board import BoardDefinition
 from .interaction import InteractionDefinition
@@ -40,7 +43,49 @@ class KnowledgePackageReferenceError(KnowledgePackageError):
     """Raised when the dependency or reading-plan closure is not complete."""
 
 
+class KnowledgePackageExecutionError(KnowledgePackageError):
+    """Raised when a board's optional executable definition cannot be read."""
+
+
+class _UniqueKeySafeLoader(yaml.SafeLoader):  # type: ignore[misc]
+    """Safe YAML loader that rejects duplicate mapping keys."""
+
+    def construct_mapping(self, node: object, deep: bool = False) -> dict[object, object]:
+        if not isinstance(node, yaml.MappingNode):
+            return cast(dict[object, object], super().construct_mapping(node, deep=deep))
+        self.flatten_mapping(node)
+        seen: set[object] = set()
+        for key_node, _ in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            try:
+                duplicate = key in seen
+                seen.add(key)
+            except TypeError as exc:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing an execution definition",
+                    node.start_mark,
+                    "mapping keys must be hashable",
+                    key_node.start_mark,
+                ) from exc
+            if duplicate:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing an execution definition",
+                    node.start_mark,
+                    f"duplicate mapping key {key!r}",
+                    key_node.start_mark,
+                )
+        return cast(dict[object, object], super().construct_mapping(node, deep=deep))
+
+
 ModelT = TypeVar("ModelT", bound=BaseModel, covariant=True)
+
+
+def _freeze_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return MappingProxyType({str(key): _freeze_value(item) for key, item in value.items()})
+    if isinstance(value, list | tuple):
+        return tuple(_freeze_value(item) for item in value)
+    return value
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +154,7 @@ class KnowledgePackage:
     mechanics: Mapping[str, PublishedKnowledgeDocument[MechanicDefinition]]
     interactions: Mapping[str, PublishedKnowledgeDocument[InteractionDefinition]]
     unresolved_reading_refs: tuple[KnowledgeRef, ...] = ()
+    execution_definition: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         """Freeze mapping containers at the aggregate boundary."""
@@ -117,6 +163,12 @@ class KnowledgePackage:
         object.__setattr__(self, "roles", MappingProxyType(dict(self.roles)))
         object.__setattr__(self, "mechanics", MappingProxyType(dict(self.mechanics)))
         object.__setattr__(self, "interactions", MappingProxyType(dict(self.interactions)))
+        if self.execution_definition is not None:
+            object.__setattr__(
+                self,
+                "execution_definition",
+                cast(Mapping[str, object], _freeze_value(self.execution_definition)),
+            )
 
     @property
     def board_ref(self) -> VersionedRef:
@@ -227,6 +279,7 @@ class KnowledgePackageLoader:
             mechanic_documents,
             interaction_documents,
         )
+        execution_definition = await self._load_execution_definition(requested_board)
 
         return KnowledgePackage(
             published_root=self._published_root,
@@ -235,7 +288,48 @@ class KnowledgePackageLoader:
             mechanics=mechanic_documents,
             interactions=interaction_documents,
             unresolved_reading_refs=unresolved_reading_refs,
+            execution_definition=execution_definition,
         )
+
+    async def _load_execution_definition(
+        self,
+        board_ref: VersionedRef,
+    ) -> Mapping[str, object] | None:
+        """Read an optional execution.yaml beside this exact board version.
+
+        Legacy published boards intentionally have no executable file and are
+        handled only by the explicit compatibility compiler. A present file
+        is never silently ignored when it is malformed.
+        """
+
+        relative_path = f"boards/{board_ref.id}/{board_ref.version}/execution.yaml"
+        source_path = self._published_root / relative_path
+        try:
+            path = resolve_contained_path(self._published_root, relative_path)
+        except PathSecurityError as exc:
+            raise KnowledgePackageExecutionError(
+                "board execution definition escapes the published root"
+            ) from exc
+        if source_path.is_symlink():
+            raise KnowledgePackageExecutionError("execution.yaml must not be a symlink")
+        if not path.exists():
+            return None
+        if not path.is_file():
+            raise KnowledgePackageExecutionError("execution.yaml must be a regular file")
+
+        try:
+            raw_bytes = await asyncio.to_thread(path.read_bytes)
+        except OSError as exc:
+            raise KnowledgePackageExecutionError("execution.yaml could not be read") from exc
+        if len(raw_bytes) > 1_048_576:
+            raise KnowledgePackageExecutionError("execution.yaml exceeds the 1 MiB limit")
+        try:
+            raw = yaml.load(raw_bytes.decode("utf-8"), Loader=_UniqueKeySafeLoader)
+        except (UnicodeDecodeError, yaml.YAMLError) as exc:
+            raise KnowledgePackageExecutionError("execution.yaml is not valid UTF-8 YAML") from exc
+        if not isinstance(raw, Mapping) or any(not isinstance(key, str) for key in raw):
+            raise KnowledgePackageExecutionError("execution.yaml must contain a YAML object")
+        return copy.deepcopy(dict(raw))
 
     async def _load_collection(
         self,

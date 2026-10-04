@@ -281,8 +281,7 @@ class NightCoordinator:
             allow_concurrent=board_window.parallel,
         )
 
-    @staticmethod
-    def _validate_action_config(state: GameState, config: NightWindowConfig) -> None:
+    def _validate_action_config(self, state: GameState, config: NightWindowConfig) -> None:
         """Validate an action window against per-seat setup grants.
 
         ``allowed_action_codes`` is a window union, while authorization is
@@ -302,6 +301,34 @@ class NightCoordinator:
             )
         action_codes = set(config.allowed_action_codes)
         grant_union: set[int] = set()
+        if self._manager.execution_package is not None:
+            for seat in config.allowed_seats:
+                player = state.players[seat]
+                if not player.alive:
+                    raise NightCoordinatorError(
+                        "PLAYER_DEAD", f"dead seat {seat} cannot receive a night action"
+                    )
+                active = self._manager._rule_skill_instances(
+                    state,
+                    seat,
+                    GamePhase.NIGHT_ACTION.value,
+                    allowed_codes=action_codes,
+                )
+                active_codes = {skill.action_code for _instance, skill in active}
+                grant_union.update(active_codes)
+                if not active_codes and not config.allow_pass:
+                    raise NightCoordinatorError(
+                        "ACTION_NOT_ALLOWED",
+                        f"seat {seat} has no active package skill in this night window",
+                    )
+            unsupported = action_codes - grant_union - ({299} if config.allow_pass else set())
+            if unsupported:
+                raise NightCoordinatorError(
+                    "ACTION_NOT_ALLOWED",
+                    "night window actions have no matching active package skills: "
+                    f"{tuple(sorted(unsupported))}",
+                )
+            return
         for seat in config.allowed_seats:
             player = state.players[seat]
             if not player.alive:
@@ -539,6 +566,7 @@ class NightCoordinator:
                 action_window_id=action_window_id,
                 resolve_window_id=resolve_window_id,
                 board=self._board,
+                use_rules_engine=self._manager.execution_package is not None,
                 expected_revision=state.state_revision,
                 now=now,
             )

@@ -223,6 +223,189 @@ class RandomStateRef(_StrictModel):
     draw_count: NonNegativeInt = 0
 
 
+class RuleExecutionIdentity(_StrictModel):
+    """Identity of the immutable executable package bound to a game."""
+
+    schema_version: Literal[1] = 1
+    package_id: LogicalId
+    board_id: LogicalId
+    board_version: Annotated[str, Field(min_length=1, max_length=64, strict=True)]
+    execution_digest: Annotated[str, Field(min_length=1, max_length=128, strict=True)]
+    action_registry_digest: Annotated[str | None, Field(strict=True)] = None
+
+    @field_validator("action_registry_digest")
+    @classmethod
+    def validate_action_registry_digest(cls, value: str | None) -> str | None:
+        if value is not None and _SHA256_PATTERN.fullmatch(value) is None:
+            raise ValueError("action_registry_digest must be 64 lowercase hexadecimal characters")
+        return value
+
+
+class AbilityInstanceState(_StrictModel):
+    """One durable, seat-bound instance of an executable package skill."""
+
+    schema_version: Literal[1] = 1
+    ability_instance_id: LogicalId
+    skill_id: LogicalId
+    grant_id: LogicalId
+    action_code: ActionCode
+    actor_seat: SeatNo
+    grant_kind: Literal["ACTIVE", "TRIGGER"]
+    uses_consumed: NonNegativeInt = 0
+    consumed: bool = False
+    enabled: bool = True
+
+
+class RuleStateValue(_StrictModel):
+    """One typed, declared state value written by a rules execution batch."""
+
+    schema_version: Literal[1] = 1
+    scope: Literal["GAME", "SEAT", "ABILITY"]
+    scope_id: LogicalId | None = None
+    key: LogicalId
+    value_type: LogicalId
+    value: JsonValue
+    source_batch_id: LogicalId
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def accept_frozen_json_value(cls, value: object) -> object:
+        """Thaw snapshot arrays before strict JsonValue validation."""
+
+        return _deep_thaw_json(value)
+
+    @field_serializer("value")
+    def serialize_rule_json_value(self, value: JsonValue) -> object:
+        """Restore JSON list containers at either serialization boundary."""
+
+        return _deep_thaw_json(value)
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> RuleStateValue:
+        if self.scope == "GAME" and self.scope_id is not None:
+            raise ValueError("game-scoped rule state must not have scope_id")
+        if self.scope != "GAME" and self.scope_id is None:
+            raise ValueError("seat- and ability-scoped rule state require scope_id")
+        return self
+
+
+class RuleUseRecord(_StrictModel):
+    """Typed committed use-history row retained for interpreter observations."""
+
+    schema_version: Literal[1] = 1
+    record_id: LogicalId
+    request_id: LogicalId
+    ability_instance_id: LogicalId
+    skill_id: LogicalId
+    action_code: ActionCode
+    actor_seat: SeatNo
+    round_number: NonNegativeInt
+    targets: tuple[SeatNo, ...] = ()
+    passed: bool = False
+    successful: bool = True
+    disposition: Literal["ACCEPTED", "PASSED", "REJECTED"] = "ACCEPTED"
+
+    @field_validator("targets", mode="before")
+    @classmethod
+    def accept_use_targets(cls, value: object) -> object:
+        return tuple(value) if isinstance(value, list) else value
+
+
+class RuleFactRecord(_StrictModel):
+    """Typed, private fact retained with the package execution provenance."""
+
+    schema_version: Literal[1] = 1
+    fact_id: LogicalId
+    fact_type: LogicalId
+    source_rule_id: LogicalId | None = None
+    source_request_id: LogicalId | None = None
+    actor_seat: SeatNo | None = None
+    target_seat: SeatNo | None = None
+    tags: tuple[LogicalId, ...] = ()
+    data: dict[str, JsonValue] = Field(default_factory=dict)
+
+    @field_validator("tags", mode="before")
+    @classmethod
+    def accept_fact_tags(cls, value: object) -> object:
+        return tuple(value) if isinstance(value, list) else value
+
+    @field_validator("data", mode="before")
+    @classmethod
+    def accept_frozen_fact_json(cls, value: object) -> object:
+        # State snapshots recursively freeze arrays as tuples. Thaw them at
+        # this validation boundary so strict JsonValue accepts Python-mode
+        # dumps during phase transitions and restore.
+        return _deep_thaw_json(value) if isinstance(value, dict) else value
+
+    @field_serializer("data")
+    def serialize_fact_json(self, value: dict[str, JsonValue]) -> object:
+        """Restore JSON list containers at either serialization boundary."""
+
+        return _deep_thaw_json(value)
+
+
+class RuleLedgerEntry(_StrictModel):
+    """Auditable provenance for one committed pure-interpreter batch."""
+
+    schema_version: Literal[1] = 1
+    batch_id: LogicalId
+    package_id: LogicalId
+    group_id: LogicalId
+    timing: LogicalId
+    read_revision: NonNegativeInt
+    committed_revision: NonNegativeInt
+    round_no: NonNegativeInt
+    request_ids: tuple[LogicalId, ...]
+    actor_seats: tuple[SeatNo, ...]
+    skill_ids: tuple[LogicalId, ...]
+    action_codes: tuple[ActionCode, ...]
+    history_updates: tuple[RuleUseRecord, ...] = ()
+    facts: tuple[RuleFactRecord, ...] = ()
+    outcome_digest: Annotated[str, Field(min_length=64, max_length=64, strict=True)]
+    created_at: datetime
+
+    @field_validator("request_ids", "actor_seats", "skill_ids", "action_codes", mode="before")
+    @classmethod
+    def accept_ledger_arrays(cls, value: object) -> object:
+        return tuple(value) if isinstance(value, list) else value
+
+    @field_validator("history_updates", "facts", mode="before")
+    @classmethod
+    def accept_nested_ledger_arrays(cls, value: object) -> object:
+        return tuple(value) if isinstance(value, list) else value
+
+    @field_validator("request_ids", "actor_seats", "skill_ids", "action_codes")
+    @classmethod
+    def validate_unique_ledger_values(cls, value: tuple[object, ...]) -> tuple[object, ...]:
+        if len(set(value)) != len(value):
+            raise ValueError("rule ledger values must be unique")
+        return value
+
+    @field_validator("created_at", mode="before")
+    @classmethod
+    def validate_created_at(cls, value: object) -> datetime:
+        return _utc_datetime(value)
+
+
+class RuleCommitReceipt(_StrictModel):
+    """Idempotency receipt for a committed interpreter batch."""
+
+    schema_version: Literal[1] = 1
+    batch_id: LogicalId
+    package_id: LogicalId
+    group_id: LogicalId
+    timing: LogicalId
+    read_revision: NonNegativeInt
+    committed_revision: NonNegativeInt
+    request_ids: tuple[LogicalId, ...]
+    outcome_digest: Annotated[str, Field(min_length=64, max_length=64, strict=True)]
+
+    @field_validator("request_ids", mode="before")
+    @classmethod
+    def accept_receipt_array(cls, value: object) -> object:
+        return tuple(value) if isinstance(value, list) else value
+
+
 class GrantedTriggerAbility(_StrictModel):
     """One trigger-capable ability granted to a seat at assignment time.
 
@@ -304,6 +487,8 @@ class PlayerState(_StrictModel):
     seat: SeatNo
     role_id: LogicalId
     faction_id: LogicalId
+    victory_group_id: LogicalId | None = None
+    chat_group_ids: tuple[LogicalId, ...] = ()
     alive: bool = True
     death_cause: LogicalId | None = None
     vote_weight: float = Field(default=1.0, ge=0.0, strict=True)
@@ -321,12 +506,26 @@ class PlayerState(_StrictModel):
     )
     confirmed_event_cursor: NonNegativeInt = 0
 
-    @field_validator("role_id", "faction_id", "death_cause")
+    @field_validator("role_id", "faction_id", "victory_group_id", "death_cause")
     @classmethod
     def validate_logical_ids(cls, value: str | None, info: object) -> str | None:
         if value is None:
             return None
         return _validate_id(value, name="logical ID")
+
+    @field_validator("chat_group_ids", mode="before")
+    @classmethod
+    def accept_chat_groups(cls, value: object) -> object:
+        return tuple(value) if isinstance(value, list) else value
+
+    @field_validator("chat_group_ids")
+    @classmethod
+    def validate_chat_groups(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        for group_id in value:
+            _validate_id(group_id, name="chat group ID")
+        if len(set(value)) != len(value):
+            raise ValueError("chat_group_ids must be unique")
+        return value
 
     @field_validator("skill_resources")
     @classmethod
@@ -406,6 +605,14 @@ class GameState(_StrictModel):
     day_no: NonNegativeInt = 0
     ruleset: RulesetRef | None = None
     rng: RandomStateRef | None = None
+    # The execution identity and interpreter-owned records are optional so
+    # schema-1 snapshots created before the rules engine remain loadable.  New
+    # games bind these records to the exact executable package at start.
+    execution_identity: RuleExecutionIdentity | None = None
+    ability_instances: tuple[AbilityInstanceState, ...] = ()
+    rule_state: tuple[RuleStateValue, ...] = ()
+    rule_ledger: tuple[RuleLedgerEntry, ...] = ()
+    rule_receipts: tuple[RuleCommitReceipt, ...] = ()
     players: dict[SeatNo, PlayerState] = Field(default_factory=dict)
 
     # Events and delivery cursors are protocol records rather than untyped
@@ -477,6 +684,17 @@ class GameState(_StrictModel):
     def validate_timestamps(cls, value: object) -> datetime:
         return _utc_datetime(value)
 
+    @field_validator(
+        "ability_instances",
+        "rule_state",
+        "rule_ledger",
+        "rule_receipts",
+        mode="before",
+    )
+    @classmethod
+    def accept_rule_record_arrays(cls, value: object) -> object:
+        return tuple(value) if isinstance(value, list) else value
+
     @field_validator("game_id")
     @classmethod
     def validate_game_id(cls, value: str) -> str:
@@ -508,6 +726,26 @@ class GameState(_StrictModel):
         for event in typed_events:
             if event.game_id != self.game_id:
                 raise ValueError("events may only refer to the current game")
+        instance_ids = tuple(item.ability_instance_id for item in self.ability_instances)
+        if len(set(instance_ids)) != len(instance_ids):
+            raise ValueError("ability instance IDs must be unique")
+        if any(item.actor_seat not in self.players for item in self.ability_instances):
+            raise ValueError("ability instances may only belong to assigned seats")
+        state_keys = tuple((item.scope, item.scope_id, item.key) for item in self.rule_state)
+        if len(set(state_keys)) != len(state_keys):
+            raise ValueError("rule state scope/key pairs must be unique")
+        batch_ids = tuple(item.batch_id for item in self.rule_receipts)
+        if len(set(batch_ids)) != len(batch_ids):
+            raise ValueError("rule batch receipts must be unique")
+        ledger_batches = tuple(item.batch_id for item in self.rule_ledger)
+        if len(set(ledger_batches)) != len(ledger_batches):
+            raise ValueError("rule ledger batch IDs must be unique")
+        if self.execution_identity is not None and self.ruleset is not None:
+            if (
+                self.execution_identity.board_id != self.ruleset.board_id
+                or self.execution_identity.board_version != self.ruleset.version
+            ):
+                raise ValueError("execution identity must match the frozen ruleset reference")
         return self
 
 
@@ -515,10 +753,17 @@ __all__ = [
     "SCHEMA_VERSION",
     "GameId",
     "GameState",
+    "AbilityInstanceState",
     "GrantedAbility",
     "GrantedTriggerAbility",
     "LogicalId",
     "PlayerState",
+    "RuleCommitReceipt",
+    "RuleExecutionIdentity",
+    "RuleLedgerEntry",
+    "RuleStateValue",
+    "RuleUseRecord",
+    "RuleFactRecord",
     "SerialTurnBinding",
     "RandomStateRef",
     "RulesetRef",

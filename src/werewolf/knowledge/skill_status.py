@@ -26,6 +26,8 @@ def project_skill_status(
     snapshot_id: str,
     seat: int,
     session_epoch: int,
+    execution_package: object | None = None,
+    action_registry: object | None = None,
 ) -> dict[str, object]:
     """Return a seat-only skill projection after validating its binding."""
 
@@ -47,11 +49,29 @@ def project_skill_status(
     if player is None or getattr(player, "session_epoch", None) != session_epoch:
         raise SkillStatusSessionMismatch("player session is obsolete")
 
-    abilities: list[dict[str, object]] = []
-    for ability in getattr(player, "granted_abilities", ()):
-        abilities.append(_active_ability(ability))
-    for ability in getattr(player, "granted_trigger_abilities", ()):
-        abilities.append(_trigger_ability(ability))
+    compiled_abilities = _compiled_ability_projection(
+        state,
+        seat=seat,
+        execution_package=execution_package,
+    )
+    if compiled_abilities is None:
+        abilities = [
+            _active_ability(ability) for ability in getattr(player, "granted_abilities", ())
+        ]
+        abilities.extend(
+            _trigger_ability(ability)
+            for ability in getattr(player, "granted_trigger_abilities", ())
+        )
+        active_abilities = tuple(getattr(player, "granted_abilities", ()))
+        trigger_abilities = tuple(getattr(player, "granted_trigger_abilities", ()))
+    else:
+        abilities = compiled_abilities
+        active_abilities = tuple(
+            ability for ability in compiled_abilities if ability.get("kind") == "ACTIVE"
+        )
+        trigger_abilities = tuple(
+            ability for ability in compiled_abilities if ability.get("kind") == "TRIGGER"
+        )
 
     windows = _open_windows(
         getattr(state, "action_windows", {}),
@@ -59,14 +79,15 @@ def project_skill_status(
         pending_resolution=getattr(state, "pending_resolution", None),
         game_id=game_id,
         seat=seat,
-        active_abilities=getattr(player, "granted_abilities", ()),
-        trigger_abilities=getattr(player, "granted_trigger_abilities", ()),
+        active_abilities=active_abilities,
+        trigger_abilities=trigger_abilities,
         resources=getattr(player, "skill_resources", {}),
         session_epoch=session_epoch,
         players=players,
         sheriff_seat=getattr(state, "sheriff_seat", None),
         sheriff_badge=getattr(state, "sheriff_badge", None),
         sheriff_election=getattr(state, "sheriff_election", None),
+        action_registry=action_registry,
     )
 
     mask_first_night_death = should_mask_unannounced_first_night_death(state, seat)
@@ -84,6 +105,7 @@ def project_skill_status(
         "alive": True if mask_first_night_death else getattr(player, "alive", False),
         "death_cause": None if mask_first_night_death else getattr(player, "death_cause", None),
         "abilities": abilities,
+        "actions": _action_registry_projection(action_registry),
         "resources": dict(getattr(player, "skill_resources", {})),
         "windows": windows,
     }
@@ -105,6 +127,270 @@ def _active_ability(ability: Any) -> dict[str, object]:
         "resource": _resource(ability.resource),
         "consumed": consumed,
     }
+
+
+def _compiled_ability_projection(
+    state: Any,
+    *,
+    seat: int,
+    execution_package: object | None,
+) -> list[dict[str, object]] | None:
+    """Project only frozen package skills instantiated for this seat.
+
+    The state stores actor-resolved ability instances; executable contracts are
+    joined by skill ID against the package frozen with the game. Runtime status
+    never consults the live source tree or a process-global registry.
+    """
+
+    instances = getattr(state, "ability_instances", None)
+    if not isinstance(instances, (list, tuple)) or not instances:
+        return None
+    if execution_package is None:
+        raise SkillStatusSessionMismatch("frozen execution package is unavailable")
+    skills_raw = _field(execution_package, "skills", ())
+    if not isinstance(skills_raw, (list, tuple)):
+        raise SkillStatusSessionMismatch("frozen execution package has no skill registry")
+    skills: dict[str, dict[str, object]] = {}
+    for value in skills_raw:
+        skill = _model_mapping(value)
+        if skill is None:
+            continue
+        skill_id = skill.get("skill_id")
+        if isinstance(skill_id, str):
+            skills[skill_id] = skill
+
+    result: list[dict[str, object]] = []
+    current_round = getattr(state, "round_no", 0)
+    for instance_value in instances:
+        instance = _model_mapping(instance_value)
+        if instance is None or instance.get("actor_seat") != seat:
+            continue
+        skill_id = instance.get("skill_id")
+        if not isinstance(skill_id, str) or skill_id not in skills:
+            raise SkillStatusSessionMismatch("frozen ability instance has no package skill")
+        skill = skills[skill_id]
+        action_code = instance.get("action_code", skill.get("action_code"))
+        if type(action_code) is not int or action_code <= 0:
+            raise SkillStatusSessionMismatch("frozen ability instance has an invalid action code")
+        grant_kind = instance.get("grant_kind", "ACTIVE")
+        if grant_kind not in {"ACTIVE", "TRIGGER"}:
+            raise SkillStatusSessionMismatch("frozen ability instance has an invalid grant kind")
+        targets = _model_mapping(skill.get("targets")) or {}
+        usage = _model_mapping(skill.get("usage")) or {}
+        costs = usage.get("costs", ())
+        cost_records = (
+            [_model_mapping(value) for value in costs if _model_mapping(value) is not None]
+            if isinstance(costs, (list, tuple))
+            else []
+        )
+        timing = skill.get("timing", ())
+        timing_values = list(timing) if isinstance(timing, (list, tuple)) else []
+        parameters_raw = skill.get("parameters", ())
+        parameters = (
+            [_model_mapping(value) for value in parameters_raw if _model_mapping(value) is not None]
+            if isinstance(parameters_raw, (list, tuple))
+            else []
+        )
+        instance_id = instance.get("ability_instance_id")
+        history = (
+            _private_ability_history(state, instance_id, actor_seat=seat)
+            if isinstance(instance_id, str)
+            else []
+        )
+        usage_scope = usage.get("scope", "GAME")
+        uses_consumed = instance.get("uses_consumed", 0)
+        if usage_scope == "ROUND" and type(current_round) is int:
+            pass_updates_history = usage.get("pass_updates_history") is True
+            uses_consumed = sum(
+                1
+                for record in history
+                if record.get("round_number") == current_round
+                and (
+                    record.get("disposition") == "ACCEPTED"
+                    or (pass_updates_history and record.get("disposition") == "PASSED")
+                )
+            )
+        maximum_uses = usage.get("max_uses")
+        consumed = (instance.get("consumed", False) is True and usage_scope != "ROUND") or (
+            type(uses_consumed) is int
+            and type(maximum_uses) is int
+            and uses_consumed >= maximum_uses
+        )
+        record: dict[str, object] = {
+            "skill_id": skill_id,
+            "ability_id": instance.get("ability_instance_id", skill_id),
+            "ability_instance_id": instance.get("ability_instance_id"),
+            "grant_id": instance.get("grant_id"),
+            "action_code": action_code,
+            "kind": grant_kind,
+            "timing": timing_values,
+            "allowed_phases": timing_values,
+            "target_rule": targets,
+            "parameters": parameters,
+            "uses_consumed": uses_consumed,
+            "usage_limit": {
+                "max_uses": maximum_uses,
+                "scope": usage_scope,
+            },
+            "pass_updates_history": usage.get("pass_updates_history", False),
+            "charge_on_pass": usage.get("charge_on_pass", False),
+            "costs": cost_records,
+            "consumed": consumed,
+            "enabled": instance.get("enabled", True),
+            "history": history,
+        }
+        if isinstance(instance_id, str):
+            record["state"] = _private_ability_state(state, instance_id)
+        if grant_kind == "TRIGGER":
+            record["trigger"] = {
+                "events": timing_values,
+                "allow_pass": _execution_action_allows_pass(execution_package, action_code),
+            }
+        result.append(record)
+    result.sort(key=_ability_sort_key)
+    return result
+
+
+def _ability_sort_key(item: Mapping[str, object]) -> tuple[int, str, str]:
+    code = item.get("action_code")
+    return (
+        code if type(code) is int else 0,
+        str(item.get("skill_id", "")),
+        str(item.get("ability_instance_id", "")),
+    )
+
+
+def _execution_action_allows_pass(execution_package: object, action_code: int) -> bool:
+    actions = _field(execution_package, "actions", ())
+    if not isinstance(actions, (list, tuple)):
+        return False
+    return any(
+        _field(action, "action_code") == action_code and _field(action, "allow_pass", False) is True
+        for action in actions
+    )
+
+
+def _private_ability_state(state: Any, instance_id: str) -> dict[str, object]:
+    projected: dict[str, object] = {}
+    values = getattr(state, "rule_state", ())
+    if not isinstance(values, (list, tuple)):
+        return projected
+    for value in values:
+        item = _model_mapping(value)
+        if item is None or item.get("scope") != "ABILITY" or item.get("scope_id") != instance_id:
+            continue
+        key = item.get("key")
+        if isinstance(key, str):
+            projected[key] = item.get("value")
+    return projected
+
+
+def _private_ability_history(
+    state: Any,
+    instance_id: str,
+    *,
+    actor_seat: int,
+) -> list[dict[str, object]]:
+    """Project only the current seat's records for this exact ability instance."""
+
+    result: list[dict[str, object]] = []
+    entries = getattr(state, "rule_ledger", ())
+    if not isinstance(entries, (list, tuple)):
+        return result
+    for entry_value in entries:
+        entry = _model_mapping(entry_value)
+        if entry is None:
+            continue
+        records = entry.get("history_updates", ())
+        if not isinstance(records, (list, tuple)):
+            continue
+        for record_value in records:
+            record = _model_mapping(record_value)
+            if (
+                record is None
+                or record.get("ability_instance_id") != instance_id
+                or record.get("actor_seat") != actor_seat
+            ):
+                continue
+            projected = {
+                key: record[key]
+                for key in (
+                    "record_id",
+                    "request_id",
+                    "ability_instance_id",
+                    "skill_id",
+                    "action_code",
+                    "actor_seat",
+                    "round_number",
+                    "targets",
+                    "passed",
+                    "successful",
+                    "disposition",
+                )
+                if key in record
+            }
+            targets = projected.get("targets")
+            if isinstance(targets, (list, tuple)) and len(targets) == 1:
+                projected["target_seat"] = targets[0]
+            result.append(projected)
+    return result[-1024:]
+
+
+def _action_registry_projection(action_registry: object | None) -> list[dict[str, object]]:
+    if action_registry is None:
+        return []
+    actions = _field(action_registry, "actions", ())
+    if not isinstance(actions, (list, tuple)):
+        return []
+    projected: list[dict[str, object]] = []
+    for value in actions:
+        action = _model_mapping(value)
+        if action is None:
+            continue
+        code = action.get("action_code")
+        if type(code) is not int or code <= 0:
+            continue
+        name = action.get("action_name")
+        item: dict[str, object] = {"action_code": code}
+        if isinstance(name, str):
+            item["action_name"] = name
+            item["is_pass"] = name == "PASS"
+        target_count = action.get("target_count")
+        if type(target_count) is int and target_count >= 0:
+            item["target_count"] = target_count
+        policy = action.get("target_policy")
+        if isinstance(policy, str):
+            item["target_policy"] = policy
+            item["target_rule"] = {
+                "kind": "NONE" if policy == "none" else "PLAYER",
+                "min_targets": target_count if type(target_count) is int else 0,
+                "max_targets": target_count if type(target_count) is int else 0,
+                "allow_self": policy == "candidate",
+            }
+        projected.append(item)
+    projected.sort(key=_registry_action_sort_key)
+    return projected
+
+
+def _registry_action_sort_key(item: Mapping[str, object]) -> int:
+    code = item.get("action_code")
+    return code if type(code) is int else 0
+
+
+def _field(value: object, name: str, default: object = None) -> object:
+    if isinstance(value, Mapping):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _model_mapping(value: object) -> dict[str, object] | None:
+    if isinstance(value, Mapping):
+        return dict(value)
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        dumped = model_dump(mode="json")
+        return dict(dumped) if isinstance(dumped, Mapping) else None
+    return None
 
 
 def _trigger_ability(ability: Any) -> dict[str, object]:
@@ -169,6 +455,7 @@ def _open_windows(
     sheriff_seat: object,
     sheriff_badge: object,
     sheriff_election: object,
+    action_registry: object | None,
 ) -> list[dict[str, object]]:
     """Project only current, actionable windows for this authenticated seat.
 
@@ -209,9 +496,12 @@ def _open_windows(
             sheriff_badge=sheriff_badge,
             sheriff_election=sheriff_election,
             players=players,
+            action_registry=action_registry,
         )
         if badge_candidates is not None:
-            visible_codes = [201, 202]
+            visible_codes = _badge_action_codes(raw, action_registry)
+            if visible_codes is None:
+                continue
             window_id = raw.get("window_id", key)
             if not isinstance(window_id, str) or not window_id:
                 window_id = key
@@ -292,6 +582,7 @@ def _bound_badge_candidates(
     sheriff_badge: object,
     sheriff_election: object,
     players: Mapping[Any, Any],
+    action_registry: object | None,
 ) -> tuple[int, ...] | None:
     """Return frozen badge targets only for the currently held office.
 
@@ -334,7 +625,7 @@ def _bound_badge_candidates(
         return None
     if raw_window.get("allowed_seats") not in ([seat], (seat,)):
         return None
-    if raw_window.get("allowed_action_codes") not in ([201, 202], (201, 202)):
+    if _badge_action_codes(raw_window, action_registry) is None:
         return None
     if raw_window.get("min_actions", 1) != 1 or raw_window.get("max_actions", 1) != 1:
         return None
@@ -368,6 +659,35 @@ def _bound_badge_candidates(
     return frozen
 
 
+def _badge_action_codes(
+    raw_window: Mapping[str, Any],
+    action_registry: object | None,
+) -> list[int] | None:
+    raw_codes = raw_window.get("allowed_action_codes")
+    if not isinstance(raw_codes, (list, tuple)):
+        return None
+    if any(type(code) is not int or code <= 0 for code in raw_codes):
+        return None
+    codes = list(raw_codes)
+    if len(codes) != 2 or len(set(codes)) != 2:
+        return None
+    if action_registry is None:
+        # Old snapshots predate the frozen package registry. Their badge
+        # contract remains explicitly bounded to the existing common codes.
+        return codes if codes == [201, 202] else None
+    registered = {
+        action.get("action_code")
+        for value in _registry_actions(action_registry)
+        if (action := _model_mapping(value)) is not None
+    }
+    return codes if all(code in registered for code in codes) else None
+
+
+def _registry_actions(action_registry: object) -> tuple[object, ...]:
+    actions = _field(action_registry, "actions", ())
+    return tuple(actions) if isinstance(actions, (list, tuple)) else ()
+
+
 def _usable_action_codes(
     phase: str,
     *,
@@ -376,16 +696,27 @@ def _usable_action_codes(
 ) -> set[int]:
     codes: set[int] = set()
     for ability in active_abilities:
-        usage_limit = getattr(ability, "usage_limit", None)
-        max_uses = None if usage_limit is None else usage_limit.max_uses
-        if max_uses is not None and ability.uses_consumed >= max_uses:
+        usage_limit = _field(ability, "usage_limit")
+        max_uses = _field(usage_limit, "max_uses") if usage_limit is not None else None
+        uses_consumed = _field(ability, "uses_consumed", 0)
+        if type(max_uses) is int and type(uses_consumed) is int and uses_consumed >= max_uses:
             continue
-        resource = getattr(ability, "resource", None)
-        if resource is not None and resources.get(resource.resource_id, 0) < resource.cost_per_use:
+        resource = _field(ability, "resource")
+        resource_id = _field(resource, "resource_id") if resource is not None else None
+        cost = _field(resource, "cost_per_use") if resource is not None else None
+        if (
+            isinstance(resource_id, str)
+            and type(cost) is int
+            and resources.get(resource_id, 0) < cost
+        ):
             continue
-        phases = getattr(ability, "allowed_phases", ())
-        if phase in {getattr(item, "value", item) for item in phases}:
-            codes.add(int(ability.action_code))
+        phases = _field(ability, "allowed_phases", ())
+        if isinstance(phases, (list, tuple)) and phase in {
+            getattr(item, "value", item) for item in phases
+        }:
+            action_code = _field(ability, "action_code")
+            if type(action_code) is int and action_code > 0:
+                codes.add(action_code)
     return codes
 
 
@@ -410,7 +741,10 @@ def _bound_trigger_ability(
     if pending_resolution.get("status") != "TRIGGER_ACTION_REQUIRED":
         return None
     pending_seat = pending_resolution.get("seat")
-    ability_id = pending_resolution.get("ability_id")
+    ability_id = pending_resolution.get(
+        "ability_instance_id",
+        pending_resolution.get("ability_id", pending_resolution.get("skill_id")),
+    )
     action_code = pending_resolution.get("action_code")
     trigger_event = pending_resolution.get("trigger_event")
     resolution_id = pending_resolution.get("resolution_id")
@@ -429,16 +763,24 @@ def _bound_trigger_ability(
     ):
         return None
 
-    matches = [
-        ability
-        for ability in trigger_abilities
+    matches: list[Any] = []
+    for ability in trigger_abilities:
+        trigger = _field(ability, "trigger", {})
+        event = _field(trigger, "event")
+        if getattr(event, "value", event) != trigger_event:
+            continue
+        ids = {
+            _field(ability, "ability_id"),
+            _field(ability, "ability_instance_id"),
+            _field(ability, "skill_id"),
+        }
         if (
-            not bool(getattr(ability, "consumed", False))
-            and getattr(ability, "ability_id", None) == ability_id
-            and getattr(ability, "action_code", None) == action_code
-            and getattr(getattr(ability, "trigger", None), "event", None) == trigger_event
-        )
-    ]
+            _field(ability, "consumed", False)
+            or _field(ability, "action_code") != action_code
+            or ability_id not in ids
+        ):
+            continue
+        matches.append(ability)
     if len(matches) != 1:
         return None
     ability = matches[0]
@@ -463,6 +805,8 @@ def _bound_trigger_ability(
         for field, expected in (
             ("resolution_id", resolution_id),
             ("ability_id", ability_id),
+            ("ability_instance_id", ability_id),
+            ("skill_id", ability_id),
             ("action_code", action_code),
             ("trigger_event", trigger_event),
         ):

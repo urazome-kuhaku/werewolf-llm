@@ -179,6 +179,8 @@ class PlayerSessionService:
                 receipt_sink=capture_receipt,
                 token_ttl=self._token_ttl or timedelta(hours=1),
                 state_provider=self._state_provider,
+                execution_package=getattr(bundle.package, "execution", None),
+                action_registry=getattr(bundle.package, "action_registry", None),
             )
             issued_tokens: dict[int, str] = {}
             started: list[PlayerSessionRecord] = []

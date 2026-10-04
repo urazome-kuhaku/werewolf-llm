@@ -82,7 +82,12 @@ class ActionWindowView(_StrictRuntimeModel):
     min_actions: int = Field(default=1, ge=1)
     max_actions: int = Field(default=1, ge=1)
     allow_pass: bool = False
+    allow_duplicate_action_codes: bool = False
     candidate_seats: list[int] = Field(default_factory=list)
+    # Context is projected by the coordinator from the installed window. It
+    # contains board-authored facts for this seat (for example a selector or
+    # parameter choice set), never the coordinator's live mutable state.
+    visible_context: dict[str, JsonValue] = Field(default_factory=dict)
 
     @field_validator("allowed_action_codes")
     @classmethod

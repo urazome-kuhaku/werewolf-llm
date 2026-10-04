@@ -33,7 +33,7 @@ def test_builds_isolated_scripted_preview_and_config(tmp_path: Path) -> None:
     assert report["status"] == "EXPERIMENTAL_CANDIDATE"
     assert report["candidate_status"] == "CANDIDATE_PENDING_HUMAN_REVIEW"
     assert report["source_files_verified"] == 13
-    assert report["action_contract"] == "validated"
+    assert report["action_contract"] == "compiled"
     assert (output / "preview" / "compiled").is_dir()
     after_compiled = {
         path.relative_to(compiled_root): hashlib.sha256(path.read_bytes()).hexdigest()
@@ -120,7 +120,8 @@ async def test_candidate_runtime_bundle_requires_explicit_preview_scope(tmp_path
         project_root=PROJECT_ROOT,
     )
     shell = ModeratorShell(output / "game.yaml")
-    await shell.new()
+    with experimental_preview():
+        await shell.new()
     assert shell.ruleset_snapshot is not None
 
     with pytest.raises(ValueError, match="awaiting human review"):

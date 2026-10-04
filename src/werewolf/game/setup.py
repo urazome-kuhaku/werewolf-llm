@@ -21,17 +21,20 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date
 from types import MappingProxyType
-from typing import Final
+from typing import Final, Literal
 
 from pydantic import ValidationError
 
+from werewolf.domain.enums import Channel
 from werewolf.knowledge.board import BoardDefinition
 from werewolf.knowledge.compiler import CompiledKnowledgePackage
 from werewolf.knowledge.preview import experimental_preview_enabled
 from werewolf.knowledge.refs import VersionedRef
-from werewolf.knowledge.role import Faction, RoleDefinition, TriggerType
+from werewolf.knowledge.role import Faction, RoleDefinition, TriggerMode, TriggerType
+from werewolf.rules.models import ExecutionPackage, PlayerObservation, RuleObservation
+from werewolf.rules.selectors import select_seats
 
-from .state import GrantedAbility, GrantedTriggerAbility, PlayerState
+from .state import AbilityInstanceState, GrantedAbility, GrantedTriggerAbility, PlayerState
 
 _REVIEWER_PLACEHOLDERS: Final[frozenset[str]] = frozenset(
     {
@@ -262,6 +265,7 @@ def build_role_assignment_plan(
         ]
     ] = []
     faction_counts: dict[str, int] = {faction_id: 0 for faction_id in board.factions}
+    chat_groups_by_role: dict[str, tuple[str, ...]] = {}
 
     for binding in bindings:
         role_id = binding.role_ref.id
@@ -290,6 +294,14 @@ def build_role_assignment_plan(
             raise RoleAssignmentError(f"role {role_id!r} declares duplicate ability IDs")
 
         faction_counts[role.team] += binding.count
+        team_visibility = getattr(role, "team_visibility", None)
+        chat_groups_by_role[role_id] = (
+            (role.team,)
+            if role.faction is Faction.WEREWOLF
+            and team_visibility is not None
+            and team_visibility.channel is Channel.TEAM
+            else ()
+        )
         resources = _initial_resources(role)
         active_abilities = _initial_active_abilities(role)
         trigger_abilities = _initial_trigger_abilities(role)
@@ -311,6 +323,8 @@ def build_role_assignment_plan(
             seat=seat,
             role_id=role_id,
             faction_id=faction_id,
+            victory_group_id=faction_id,
+            chat_group_ids=chat_groups_by_role.get(role_id, ()),
             skill_resources=resources,
             granted_abilities=active_abilities,
             granted_trigger_abilities=trigger_abilities,
@@ -327,6 +341,102 @@ def build_role_assignment_plan(
     )
 
 
+def build_ability_instances(
+    players: Mapping[int, PlayerState],
+    execution_package: ExecutionPackage,
+) -> tuple[AbilityInstanceState, ...]:
+    """Bind immutable player grants to skill instances in a frozen package.
+
+    ``execution_package`` must come from the game's compiled snapshot. This
+    function does not perform a repository or latest-version lookup. A grant
+    is instantiated only when the frozen package declares the same grant ID
+    and action code, so package rules cannot silently invent player powers.
+    """
+
+    observation = RuleObservation(
+        board_id=execution_package.board_id,
+        board_version=execution_package.board_version,
+        revision=0,
+        round_number=0,
+        players=tuple(
+            PlayerObservation(
+                seat=seat,
+                alive=player.alive,
+                role_id=player.role_id,
+                faction_id=player.faction_id,
+                resources=dict(player.skill_resources),
+            )
+            for seat, player in sorted(players.items())
+        ),
+    )
+    GrantKind = Literal["ACTIVE", "TRIGGER"]
+    legacy_grants: dict[tuple[int, int], tuple[str, int, bool, GrantKind]] = {}
+    for seat, player in players.items():
+        for grant in player.granted_abilities:
+            legacy_grants[(seat, grant.action_code)] = (
+                grant.ability_id,
+                grant.uses_consumed,
+                False,
+                "ACTIVE",
+            )
+        for trigger_grant in player.granted_trigger_abilities:
+            # Automatic triggers never open player request windows. Keep them
+            # in GrantedTriggerAbility state for the authoritative lifecycle
+            # reducer, but only materialize player-choice triggers as
+            # requestable execution instances.
+            if trigger_grant.trigger.mode is TriggerMode.PLAYER_CHOICE:
+                legacy_grants[(seat, trigger_grant.action_code)] = (
+                    trigger_grant.ability_id,
+                    int(trigger_grant.consumed),
+                    trigger_grant.consumed,
+                    "TRIGGER",
+                )
+
+    instances: list[AbilityInstanceState] = []
+    for skill in execution_package.skills:
+        for ability_grant in skill.grants:
+            try:
+                eligible_seats = select_seats(
+                    ability_grant.actor_selector,
+                    {"observation": observation},
+                )
+            except (TypeError, ValueError) as exc:
+                raise RoleAssignmentError(
+                    f"execution grant {ability_grant.grant_id!r} could not be "
+                    "resolved against setup"
+                ) from exc
+            for seat in eligible_seats:
+                legacy = legacy_grants.get((seat, skill.action_code))
+                uses_consumed = legacy[1] if legacy is not None else 0
+                consumed = legacy[2] if legacy is not None else False
+                grant_kind = legacy[3] if legacy is not None else "ACTIVE"
+                instances.append(
+                    AbilityInstanceState(
+                        ability_instance_id=f"seat-{seat}-{ability_grant.grant_id}",
+                        skill_id=skill.skill_id,
+                        grant_id=ability_grant.grant_id,
+                        action_code=skill.action_code,
+                        actor_seat=seat,
+                        grant_kind=grant_kind,
+                        uses_consumed=uses_consumed,
+                        consumed=consumed,
+                        enabled=not consumed,
+                    )
+                )
+    instance_codes = {(item.actor_seat, item.action_code) for item in instances}
+    missing_legacy = set(legacy_grants) - instance_codes
+    if missing_legacy:
+        missing = sorted(f"{seat}:{code}" for seat, code in missing_legacy)
+        raise RoleAssignmentError(
+            "execution package does not define skills for assigned ability codes: "
+            + ", ".join(missing)
+        )
+    ids = tuple(item.ability_instance_id for item in instances)
+    if len(ids) != len(set(ids)):
+        raise RoleAssignmentError("execution package produced duplicate ability instances")
+    return tuple(instances)
+
+
 # Short aliases keep the pure setup boundary discoverable to callers without
 # creating alternate implementations or accepting a caller-provided roster.
 build_assignment_plan = build_role_assignment_plan
@@ -337,6 +447,7 @@ __all__ = [
     "PlayerAssignmentPlan",
     "RoleAssignmentError",
     "build_assignment_plan",
+    "build_ability_instances",
     "build_role_assignment_plan",
     "create_role_assignment_plan",
 ]

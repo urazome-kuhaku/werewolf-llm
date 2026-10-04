@@ -330,6 +330,33 @@ class _WindowsExtendedLimitInformation(ctypes.Structure):
     ]
 
 
+class _WindowsLibraryLoader(Protocol):
+    def __call__(self, name: str, *, use_last_error: bool) -> ctypes.CDLL: ...
+
+
+def _load_windows_library(name: str) -> ctypes.CDLL:
+    """Load a Windows calling-convention DLL through ctypes' OS-only API."""
+
+    # typeshed only exposes WinDLL on Windows. Keep this module type-checkable
+    # on other hosts while the caller's os.name guard controls runtime access.
+    loader = getattr(ctypes, "WinDLL", None)
+    if not callable(loader):
+        raise PiProcessSpawnError("ctypes Windows DLL loader is unavailable")
+    windows_loader = cast(_WindowsLibraryLoader, loader)
+    return windows_loader(name, use_last_error=True)
+
+
+def _windows_last_error() -> int:
+    """Read the thread-local Win32 error captured by ``use_last_error``."""
+
+    # As with WinDLL, this API is conditionally present in ctypes' stubs.
+    reader = getattr(ctypes, "get_last_error", None)
+    if not callable(reader):
+        raise PiProcessSpawnError("ctypes Windows last-error API is unavailable")
+    last_error_reader = cast(Callable[[], int], reader)
+    return last_error_reader()
+
+
 class _WindowsJob:
     """Small ctypes wrapper for a kill-on-close Windows Job Object."""
 
@@ -341,7 +368,7 @@ class _WindowsJob:
     def __init__(self, process: _Process) -> None:
         if os.name != "nt":
             raise PiProcessSpawnError("Windows Job Object requested on a non-Windows host")
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32 = _load_windows_library("kernel32")
         self._kernel32 = kernel32
         kernel32.CreateJobObjectW.argtypes = [ctypes.wintypes.HANDLE, ctypes.wintypes.LPCWSTR]
         kernel32.CreateJobObjectW.restype = ctypes.wintypes.HANDLE
@@ -371,7 +398,7 @@ class _WindowsJob:
         if not handle:
             raise PiProcessSpawnError(
                 "could not create Windows Job Object "
-                f"(CreateJobObjectW Win32 error {ctypes.get_last_error()})"
+                f"(CreateJobObjectW Win32 error {_windows_last_error()})"
             )
         self._handle = handle
         info = _WindowsExtendedLimitInformation()
@@ -382,7 +409,7 @@ class _WindowsJob:
             ctypes.byref(info),
             ctypes.sizeof(info),
         ):
-            error = ctypes.get_last_error()
+            error = _windows_last_error()
             self.close()
             raise PiProcessSpawnError(
                 "could not configure Windows Job Object "
@@ -392,7 +419,7 @@ class _WindowsJob:
         access = self._PROCESS_SET_QUOTA | self._PROCESS_TERMINATE
         process_handle = kernel32.OpenProcess(access, False, process.pid)
         if not process_handle:
-            error = ctypes.get_last_error()
+            error = _windows_last_error()
             self.close()
             raise PiProcessSpawnError(
                 "could not open Pi process for Job Object binding "
@@ -400,7 +427,7 @@ class _WindowsJob:
             )
         try:
             if not kernel32.AssignProcessToJobObject(handle, process_handle):
-                error = ctypes.get_last_error()
+                error = _windows_last_error()
                 self.close()
                 raise PiProcessSpawnError(
                     "could not bind Pi process to Job Object "

@@ -16,9 +16,15 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from types import MappingProxyType
-from typing import Any, Final, cast
+from typing import TYPE_CHECKING, Any, Final, cast
 
 from pydantic import BaseModel
+
+from werewolf.rules.compiler import (
+    compile_execution_definition,
+    execution_artifact,
+)
+from werewolf.rules.models import ExecutionPackage
 
 from .board import BoardDefinition
 from .indexes import KnowledgeIndex, KnowledgeIndexDocument, KnowledgeKind
@@ -29,6 +35,9 @@ from .package_loader import KnowledgePackage, PublishedKnowledgeDocument
 from .refs import VersionedRef
 from .role import RoleDefinition
 from .sections import MarkdownDocument, MarkdownSection, extract_sections
+
+if TYPE_CHECKING:
+    from werewolf.game.actions import ActionRegistry
 
 JSON_DUMPS_KWARGS: Final[dict[str, object]] = {
     "ensure_ascii": False,
@@ -215,6 +224,10 @@ class CompiledKnowledgePackage:
     canonical_manifest_json: str
     package_identity: str
     manifest_sha256: str
+    execution: ExecutionPackage | None = None
+    action_registry: ActionRegistry | None = None
+    execution_source: str | None = None
+    execution_source_sha256: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "sections", MappingProxyType(dict(self.sections)))
@@ -261,11 +274,16 @@ class KnowledgePackageCompiler:
         records = self._build_index_documents(package, parsed_sections)
         index = KnowledgeIndex.build(records)
         document_digests = self._document_digests(package, parsed_sections)
+        compiled_execution = compile_execution_definition(package)
+        executable_payload = (
+            execution_artifact(compiled_execution) if compiled_execution is not None else None
+        )
         board_definition = cast(dict[str, object], _model_payload(package.board.model))
         manifest_payload = self._manifest_payload(
             package,
             document_digests,
             board_definition=board_definition,
+            executable_payload=executable_payload,
         )
         package_payload = self._package_payload(
             package,
@@ -275,6 +293,7 @@ class KnowledgePackageCompiler:
             index,
             manifest_payload,
             board_definition=board_definition,
+            executable_payload=executable_payload,
         )
         canonical_manifest_json = _canonical_json(manifest_payload)
         canonical_package_json = _canonical_json(package_payload)
@@ -292,6 +311,14 @@ class KnowledgePackageCompiler:
             canonical_manifest_json=canonical_manifest_json,
             package_identity=hashlib.sha256(canonical_package_json.encode("utf-8")).hexdigest(),
             manifest_sha256=hashlib.sha256(canonical_manifest_json.encode("utf-8")).hexdigest(),
+            execution=compiled_execution.execution if compiled_execution is not None else None,
+            action_registry=(
+                compiled_execution.action_registry if compiled_execution is not None else None
+            ),
+            execution_source=compiled_execution.source if compiled_execution is not None else None,
+            execution_source_sha256=(
+                compiled_execution.source_sha256 if compiled_execution is not None else None
+            ),
         )
 
     def _parse_sections(self, package: KnowledgePackage) -> dict[str, MarkdownDocument]:
@@ -461,9 +488,10 @@ class KnowledgePackageCompiler:
         document_digests: Mapping[str, str],
         *,
         board_definition: Mapping[str, object],
+        executable_payload: Mapping[str, object] | None,
     ) -> dict[str, object]:
-        return {
-            "schema_version": 1,
+        payload: dict[str, object] = {
+            "schema_version": 2 if executable_payload is not None else 1,
             "package_id": package.board_ref.format(),
             "board_ref": package.board_ref.format(),
             "board_definition_sha256": _sha256_json(board_definition),
@@ -475,6 +503,9 @@ class KnowledgePackageCompiler:
                 for path, digest in sorted(document_digests.items())
             ],
         }
+        if executable_payload is not None:
+            payload["execution_sha256"] = _sha256_json(executable_payload)
+        return payload
 
     def _package_payload(
         self,
@@ -486,6 +517,7 @@ class KnowledgePackageCompiler:
         manifest_payload: Mapping[str, object],
         *,
         board_definition: Mapping[str, object],
+        executable_payload: Mapping[str, object] | None,
     ) -> dict[str, object]:
         record_payload = [
             {
@@ -507,8 +539,8 @@ class KnowledgePackageCompiler:
             "relation": {key: list(value) for key, value in sorted(index.relation_index.items())},
             "text": {key: list(value) for key, value in sorted(index.text_index.items())},
         }
-        return {
-            "schema_version": 1,
+        payload: dict[str, object] = {
+            "schema_version": 2 if executable_payload is not None else 1,
             "package_id": package.board_ref.format(),
             "board_ref": package.board_ref.format(),
             "board_definition": board_definition,
@@ -522,6 +554,9 @@ class KnowledgePackageCompiler:
             "reading_plan": _model_payload(package.reading_plan),
             "indexes": index_payload,
         }
+        if executable_payload is not None:
+            payload["executable"] = _canonicalize(executable_payload)
+        return payload
 
 
 def compile_knowledge_package(package: KnowledgePackage) -> CompiledKnowledgePackage:

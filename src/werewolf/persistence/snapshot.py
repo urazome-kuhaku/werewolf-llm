@@ -26,7 +26,12 @@ from typing import Any, Final, Literal, cast
 
 from werewolf.domain.enums import Channel, GamePhase
 from werewolf.game.actions import ActionWindow
-from werewolf.game.events import GameEvent
+from werewolf.game.events import (
+    GameEvent,
+    PublicAnnouncementPayload,
+    PublicSpeechPayload,
+    PublicVoteResultPayload,
+)
 from werewolf.game.state import GameState, RulesetRef
 
 from .atomic import atomic_write_bytes, resolve_contained_path
@@ -58,7 +63,11 @@ _SECRETS = frozenset(
         "token",
     }
 )
-_PUBLIC_EVENT_TYPES = frozenset({"announcement", "speech", "vote_result"})
+_PUBLIC_PAYLOAD_TYPES = (
+    PublicAnnouncementPayload,
+    PublicSpeechPayload,
+    PublicVoteResultPayload,
+)
 _RESOLVED_ACTION_REQUEST_STATUSES = frozenset({"CONFIRMED", "OVERRIDDEN", "CANCELLED"})
 _MATERIALIZE_LOCKS: dict[Path, asyncio.Lock] = {}
 
@@ -431,16 +440,72 @@ def _render_event_line(event: GameEvent, *, public: bool) -> str:
     )
 
 
-def _render_public(events: Sequence[GameEvent]) -> bytes:
+def _validated_public_event(
+    event: GameEvent,
+    *,
+    game_id: str,
+    player_seats: set[int],
+) -> GameEvent:
+    """Revalidate public authorization data at the persistence boundary.
+
+    ``GameEvent.model_copy`` and ``model_construct`` intentionally allow
+    callers to bypass Pydantic validation.  Snapshotting is a security
+    boundary, so serialize and re-parse each public event before trusting its
+    channel, audience, or payload type.
+    """
+
+    event_id = getattr(event, "event_id", "?")
+    try:
+        validated = GameEvent.model_validate(event.model_dump(mode="python"))
+    except Exception as exc:
+        raise SnapshotSecurityError(
+            f"public event {event_id!r} failed authorization validation"
+        ) from exc
+    if validated.channel is not Channel.PUBLIC:
+        raise SnapshotSecurityError(
+            f"event {validated.event_id!r} is not authorized for public projection"
+        )
+    if not isinstance(validated.payload, _PUBLIC_PAYLOAD_TYPES):
+        raise SnapshotSecurityError(
+            f"event {validated.event_id!r} does not contain a public-safe payload"
+        )
+    if validated.public_projection is not None and not isinstance(
+        validated.public_projection, _PUBLIC_PAYLOAD_TYPES
+    ):
+        raise SnapshotSecurityError(
+            f"event {validated.event_id!r} does not contain a public-safe projection"
+        )
+    if validated.game_id != game_id:
+        raise SnapshotSecurityError(
+            f"public event {validated.event_id!r} belongs to a different game"
+        )
+    if any(seat not in player_seats for seat in validated.audience):
+        raise SnapshotSecurityError(
+            f"public event {validated.event_id!r} has an unauthorized audience"
+        )
+    return validated
+
+
+def _render_public(
+    events: Sequence[GameEvent],
+    *,
+    game_id: str,
+    player_seats: set[int],
+) -> bytes:
     lines = ["# Public record", "", "Events below are the authorized PUBLIC projection.", ""]
     for event in events:
-        if event.channel is not Channel.PUBLIC:
+        channel = getattr(event, "channel", None)
+        if not isinstance(channel, Channel):
+            event_id = getattr(event, "event_id", "?")
+            raise SnapshotSecurityError(f"event {event_id!r} has an invalid visibility channel")
+        if channel is not Channel.PUBLIC:
             continue
-        if event.event_type.value not in _PUBLIC_EVENT_TYPES:
-            raise SnapshotSecurityError(
-                f"event type {event.event_type.value!r} is not allowed in public projection"
-            )
-        lines.append(_render_event_line(event, public=True))
+        authorized_event = _validated_public_event(
+            event,
+            game_id=game_id,
+            player_seats=player_seats,
+        )
+        lines.append(_render_event_line(authorized_event, public=True))
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
@@ -535,7 +600,11 @@ def _build_snapshot_files(
     events = _typed_events(state)
     files: dict[str, bytes] = {
         "state.json": _canonical_json_bytes(_state_payload(state)),
-        "public.md": _render_public(events),
+        "public.md": _render_public(
+            events,
+            game_id=state.game_id,
+            player_seats=set(state.players),
+        ),
         "private/gm.md": _render_gm(state, events),
         "private/channels/wolves.md": _render_team(events),
         "private/runtime_refs.json": _runtime_refs(state),

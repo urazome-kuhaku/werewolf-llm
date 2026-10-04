@@ -12,6 +12,7 @@ death triggers discovered after a daytime exile and after a night resolution.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -27,7 +28,12 @@ from werewolf.game.action_turn import (
 from werewolf.game.actions import ActionRequest, ActionValidationContext, ActionWindow
 from werewolf.game.day_resolution import build_trigger_action_window
 from werewolf.game.manager import EventCommitError, GameManager, ResolutionError
-from werewolf.game.resolution import ActionResolution
+from werewolf.game.resolution import (
+    ActionDisposition,
+    ActionResolution,
+    ActionResolutionEntry,
+    ResolutionStatus,
+)
 from werewolf.game.state import GameState
 from werewolf.knowledge.board import BoardDefinition
 from werewolf.knowledge.role import TargetKind
@@ -308,6 +314,94 @@ class ModeratorTriggerFlow:
                 records.append(cast(dict[str, object], payload))
         return tuple(records)
 
+    def _stored_request(
+        self,
+        request_id: str,
+        payload: object,
+        window: ActionWindow,
+    ) -> ActionRequest:
+        """Validate a trigger acknowledgement against its exact stored request."""
+
+        if not isinstance(payload, Mapping):
+            raise ModeratorTriggerError("TRIGGER_REQUEST_INVALID: stored request is malformed")
+        if (
+            payload.get("request_id") != request_id
+            or payload.get("status") != "PENDING"
+            or payload.get("window_id") != window.window_id
+            or payload.get("seat") != window.allowed_seats[0]
+        ):
+            raise ModeratorTriggerError(
+                "TRIGGER_REQUEST_INVALID: stored request is outside the bound trigger window"
+            )
+        data = {key: payload[key] for key in ActionRequest.model_fields if key in payload}
+        request_data = json.loads(json.dumps(data))
+        if isinstance(request_data.get("phase"), str):
+            request_data["phase"] = GamePhase(request_data["phase"])
+        try:
+            request = ActionRequest.model_validate(request_data)
+        except (TypeError, ValueError) as exc:
+            raise ModeratorTriggerError(
+                "TRIGGER_REQUEST_INVALID: stored request is malformed"
+            ) from exc
+        actor = self.state.players.get(request.seat)
+        if (
+            actor is None
+            or request.game_id != self.state.game_id
+            or request.window_id != window.window_id
+            or request.phase is not GamePhase.TRIGGER_ACTION
+            or request.session_epoch != window.session_epoch
+            or request.session_epoch != actor.session_epoch
+            or actor.current_request_id != request.request_id
+            or request.seat != window.allowed_seats[0]
+            or len(request.actions) != 1
+        ):
+            raise ModeratorTriggerError(
+                "TRIGGER_REQUEST_INVALID: request does not match its actor, session, and window"
+            )
+        action = request.actions[0]
+        if action.action_code not in window.allowed_action_codes:
+            raise ModeratorTriggerError(
+                "TRIGGER_REQUEST_INVALID: action is outside the frozen trigger window"
+            )
+        return request
+
+    def _rule_acknowledgement(
+        self,
+        window: ActionWindow,
+        request_id: str,
+        payload: object,
+    ) -> ActionResolution:
+        """Build a neutral receipt; only the pinned interpreter decides effects."""
+
+        request = self._stored_request(request_id, payload, window)
+        digest = hashlib.sha256(
+            f"{self.state.game_id}:{window.window_id}:{request.request_id}".encode()
+        ).hexdigest()[:32]
+        return ActionResolution(
+            resolution_id=f"rule-ack-{digest}",
+            bundle_id=f"rule-bundle-{digest}",
+            game_id=request.game_id,
+            window_id=window.window_id,
+            request_id=request.request_id,
+            session_epoch=request.session_epoch,
+            base_revision=self.state.state_revision,
+            status=ResolutionStatus.CONFIRMED,
+            actions=tuple(
+                ActionResolutionEntry(
+                    action_index=index,
+                    requested_action=action,
+                    disposition=ActionDisposition.CONFIRMED,
+                )
+                for index, action in enumerate(request.actions)
+            ),
+            moderator_id="rule-interpreter",
+            reason="neutral trigger receipt; frozen package interpreter decides effects",
+            # The accepted request updated the authoritative state timestamp.
+            # Rebuilding an acknowledgement after a transport retry therefore
+            # produces the same immutable receipt.
+            created_at=self.state.updated_at,
+        )
+
     @staticmethod
     def _turn_payload(result: ActionTurnResult, seat: int, operation: str) -> dict[str, object]:
         return {
@@ -449,16 +543,28 @@ class ModeratorTriggerFlow:
             raise ModeratorTriggerError(str(exc)) from exc
 
     async def auto_resolve(self) -> dict[str, object]:
-        """Run the actor's real trigger turn, then propose its classic ruling.
+        """Run the trigger actor and commit through the frozen execution package."""
 
-        ``auto-resolve`` is a bounded convenience for the published classic
-        board.  It still opens the frozen window and calls ``next`` before a
-        resolution is built; it never fabricates a hunter action from role
-        state alone.
-        """
+        if self._manager.execution_package is None:
+            state = self.state
+            if (
+                state.execution_identity is not None
+                or state.ability_instances
+                or state.rule_state
+                or state.rule_ledger
+                or state.rule_receipts
+            ):
+                raise ModeratorTriggerError(
+                    "TRIGGER_AUTO_RESOLVE_UNAVAILABLE: executable history requires "
+                    "its pinned package"
+                )
+            from werewolf.moderator.classic_resolution import CLASSIC_BOARD_ID
 
-        if self._board.board_id != "classic_12_seer_witch_hunter_idiot":
-            raise ModeratorTriggerError("TRIGGER_AUTO_RESOLVE_UNAVAILABLE: board is unsupported")
+            if self._board.board_id != CLASSIC_BOARD_ID:
+                raise ModeratorTriggerError(
+                    "TRIGGER_AUTO_RESOLVE_UNAVAILABLE: board is unsupported"
+                )
+
         progress = await self.open()
         pending = self.pending()
         requests = pending.get("pending_requests")
@@ -470,29 +576,47 @@ class ModeratorTriggerFlow:
             raise ModeratorTriggerError(
                 "TRIGGER_REQUEST_INVALID: exactly one actor request is required"
             )
-        from werewolf.moderator.classic_resolution import build_classic_trigger_resolution
+        request_envelope = requests[0]
+        if not isinstance(request_envelope, Mapping):
+            raise ModeratorTriggerError("TRIGGER_REQUEST_INVALID: request envelope is malformed")
+        request_id = request_envelope.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            raise ModeratorTriggerError("TRIGGER_REQUEST_INVALID: request ID is missing")
 
-        try:
-            # ``pending()`` returns a moderator envelope with provenance
-            # fields (bundle_id/base_revision) in addition to the stored
-            # ActionRequest wire shape.  Strip only those envelope fields
-            # before the strict request model validates the intent.
-            request_data = json.loads(json.dumps(requests[0]))
-            if not isinstance(request_data, dict):
-                raise TypeError("trigger request envelope must be an object")
-            request_data.pop("bundle_id", None)
-            request_data.pop("base_revision", None)
-            request = ActionRequest.model_validate(request_data)
-            resolution = build_classic_trigger_resolution(self.state, request)
-        except (TypeError, ValueError) as exc:
-            raise ModeratorTriggerError(str(exc)) from exc
-        await self.resolve(resolution)
+        if self._manager.execution_package is not None:
+            raw = self.state.action_requests.get(request_id)
+            receipt = self._rule_acknowledgement(
+                progress.action_window,
+                request_id,
+                raw,
+            )
+            try:
+                await self._manager.commit_action_resolutions(
+                    (receipt,),
+                    use_rules_engine=True,
+                    expected_revision=self.state.state_revision,
+                    now=self._clock(),
+                )
+            except (EventCommitError, ResolutionError, TypeError, ValueError) as exc:
+                raise ModeratorTriggerError(str(exc)) from exc
+            resolution_id = receipt.resolution_id
+        else:
+            from werewolf.moderator.classic_resolution import build_classic_trigger_resolution
+
+            try:
+                stored = self.state.action_requests.get(request_id)
+                request = self._stored_request(request_id, stored, progress.action_window)
+                resolution = build_classic_trigger_resolution(self.state, request)
+            except (TypeError, ValueError) as exc:
+                raise ModeratorTriggerError(str(exc)) from exc
+            await self.resolve(resolution)
+            resolution_id = resolution.resolution_id
         return {
             "status": "resolved",
             "operation": progress.operation,
             "window_id": progress.action_window.window_id,
-            "request_id": resolution.request_id,
-            "resolution_id": resolution.resolution_id,
+            "request_id": request_id,
+            "resolution_id": resolution_id,
             "phase": self.state.phase.value,
         }
 

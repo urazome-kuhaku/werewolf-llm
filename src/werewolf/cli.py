@@ -112,13 +112,30 @@ def play_init(
     output: Annotated[
         Path, typer.Option("--output", help="New directory for the generated playable setup.")
     ],
+    board_ref: Annotated[
+        str,
+        typer.Option(
+            "--board-ref",
+            help="Exact version-pinned board reference such as board_id@1.0.0.",
+        ),
+    ] = "classic_12_seer_witch_hunter_idiot@1.0.0",
+    workbench: Annotated[
+        Path | None,
+        typer.Option("--workbench", help="Candidate workbench directory; requires preview mode."),
+    ] = None,
+    published_root: Annotated[
+        Path | None,
+        typer.Option("--published-root", help="Root of the immutable published knowledge tree."),
+    ] = None,
+    compiled_root: Annotated[
+        Path | None,
+        typer.Option("--compiled-root", help="Root of a verified compiled package store."),
+    ] = None,
     pi_seats: Annotated[
         str,
         typer.Option(
             "--pi-seats",
-            help=(
-                "Comma-separated Pi seats (1-12), for example 1,2,3. Use --all-scripted for no Pi."
-            ),
+            help=("Comma-separated Pi seats. Use --all-scripted for no Pi."),
         ),
     ] = "",
     provider: Annotated[str, typer.Option(help="Pi provider identifier.")] = "github-copilot",
@@ -136,7 +153,7 @@ def play_init(
         ),
     ] = False,
 ) -> None:
-    """Compile the classic candidate into an isolated experimental setup."""
+    """Compile one pinned board package into an isolated preview setup."""
 
     try:
         values = tuple(int(item.strip()) for item in pi_seats.split(",") if item.strip())
@@ -153,6 +170,10 @@ def play_init(
             game_id=game_id,
             seed=seed,
             all_scripted=all_scripted,
+            board_ref=board_ref,
+            workbench=workbench,
+            published_root=published_root,
+            compiled_root=compiled_root,
         )
     except (PlaySetupError, OSError, ValueError) as exc:
         typer.echo(f"play init failed: {str(exc)[:500]}", err=True)

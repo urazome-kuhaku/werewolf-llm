@@ -15,8 +15,8 @@ from typing import Any
 
 import aiohttp
 
+from .deterministic_actions import build_deterministic_action_response
 from .player_runtime import (
-    Action,
     ActionResponse,
     InitialContext,
     PlayerRuntime,
@@ -225,166 +225,10 @@ class DemoRuntime(PlayerRuntime):
         return f"Demo seat observes the public {phase} information and states a deterministic view."
 
     def _action_for(self, request: TurnRequest, status: Mapping[str, Any]) -> ActionResponse:
-        window = request.action_window
-        if window is None:
-            raise RuntimeProtocolError("action request did not include an action window")
-        abilities = status.get("abilities", ())
-        if not isinstance(abilities, list):
-            abilities = []
-        by_code = {
-            value.get("action_code"): value
-            for value in abilities
-            if isinstance(value, Mapping) and isinstance(value.get("action_code"), int)
-        }
-        action_code = self._select_action_code(
-            window.allowed_action_codes, by_code, window.allow_pass
-        )
-        targets = self._targets_for(action_code, window.candidate_seats, by_code, request)
-        if action_code == 104:
-            # WITCH_HEAL is legal only for the exact private knife notice
-            # delivered with this request.  The shared candidate union may
-            # contain every visible living seat and is never a substitute for
-            # that private observation.
-            heal_target = self._witch_heal_target(request, window.candidate_seats)
-            if heal_target is None:
-                action_code = self._fallback_action_code(
-                    window.allowed_action_codes,
-                    by_code,
-                    window.allow_pass,
-                    excluded={104},
-                )
-                targets = self._targets_for(action_code, window.candidate_seats, by_code, request)
-            else:
-                targets = [heal_target]
-        ability = by_code.get(action_code)
-        target_rule = ability.get("target_rule") if isinstance(ability, Mapping) else None
-        target_kind = target_rule.get("kind") if isinstance(target_rule, Mapping) else None
-        needs_target = action_code not in {202, 299} and target_kind not in {"NONE", "none"}
-        if needs_target and not targets:
-            if window.allow_pass and 299 in window.allowed_action_codes:
-                action_code = 299
-            elif 202 in window.allowed_action_codes:
-                action_code = 202
-            else:
-                raise RuntimeProtocolError("no visible legal target for the demo action")
-        return ActionResponse(
-            request_id=request.request_id,
-            actions=[Action(action_code=action_code, targets=targets)],
-        )
-
-    @staticmethod
-    def _fallback_action_code(
-        allowed: list[int],
-        abilities: Mapping[object, object],
-        allow_pass: bool,
-        *,
-        excluded: set[int],
-    ) -> int:
-        """Choose the next visible action after a context-specific rejection."""
-
-        for code in allowed:
-            if code not in excluded and code != 299 and code in abilities:
-                return code
-        for code in allowed:
-            if code not in excluded and code in {201, 202}:
-                return code
-        if allow_pass and 299 in allowed:
-            return 299
-        for code in allowed:
-            if code not in excluded:
-                return code
-        raise RuntimeProtocolError("no fallback action is available")
-
-    @staticmethod
-    def _witch_heal_target(request: TurnRequest, candidates: list[int]) -> int | None:
-        """Extract the one board-authorized knife target from private events."""
-
-        candidate_set = set(candidates)
-        window = request.action_window
-        request_window_id = window.window_id if window is not None else None
-        request_round = request.observation.payload.get("night_round")
-        if request_round is None:
-            request_round = request.observation.payload.get("round_no")
-        for event in request.observation.events:
-            if event.event_type != "witch_target":
-                continue
-            event_window_id = event.payload.get("window_id")
-            if event_window_id is not None and event_window_id != request_window_id:
-                continue
-            event_round = event.payload.get("night_round")
-            if event_round is None:
-                event_round = event.payload.get("round_no")
-            if (
-                isinstance(request_round, int)
-                and not isinstance(request_round, bool)
-                and isinstance(event_round, int)
-                and not isinstance(event_round, bool)
-                and event_round != request_round
-            ):
-                continue
-            target = event.payload.get("target_seat")
-            if isinstance(target, bool) or not isinstance(target, int):
-                continue
-            if target in candidate_set:
-                return target
-        return None
-
-    @staticmethod
-    def _select_action_code(
-        allowed: list[int], abilities: Mapping[object, object], allow_pass: bool
-    ) -> int:
-        # Prefer an available role ability, then ordinary vote/abstain, and
-        # finally PASS.  All choices come from the visible action window.
-        for code in allowed:
-            if code != 299 and code in abilities:
-                return code
-        for code in allowed:
-            if code in {201, 202}:
-                return code
-        if allow_pass and 299 in allowed:
-            return 299
-        return allowed[0]
-
-    @staticmethod
-    def _targets_for(
-        action_code: int,
-        candidates: list[int],
-        abilities: Mapping[object, object],
-        request: TurnRequest,
-    ) -> list[int]:
-        if action_code in {202, 299}:
-            return []
-        ability = abilities.get(action_code)
-        target_rule = ability.get("target_rule") if isinstance(ability, Mapping) else None
-        kind = target_rule.get("kind") if isinstance(target_rule, Mapping) else None
-        allow_self = (
-            bool(target_rule.get("allow_self", False))
-            if isinstance(target_rule, Mapping)
-            else False
-        )
-        # The vote window owns its candidate set.  A board may explicitly
-        # include the voter's own seat (for example in a self-vote test or a
-        # custom board), and vote code 201 must respect that frozen window
-        # instead of inheriting an unrelated ability default.
-        if action_code == 201:
-            allow_self = True
-        visible = list(candidates)
-        if not allow_self:
-            visible = [seat for seat in visible if seat != request.observation.payload.get("seat")]
-        elif action_code == 201:
-            # Keep the deterministic demo choice pointed at another seat when
-            # one exists, while still honoring a window whose only candidate
-            # is the voter's own seat.
-            self_seat = request.observation.payload.get("seat")
-            if isinstance(self_seat, int) and not isinstance(self_seat, bool):
-                visible = [seat for seat in visible if seat != self_seat] + [
-                    seat for seat in visible if seat == self_seat
-                ]
-        if kind in {"NONE", "none"}:
-            return []
-        if not visible:
-            return []
-        return visible[:1]
+        try:
+            return build_deterministic_action_response(request, status)
+        except ValueError as exc:
+            raise RuntimeProtocolError(str(exc)) from exc
 
     @staticmethod
     def _validate_response(request: TurnRequest, response: TurnResponse) -> None:

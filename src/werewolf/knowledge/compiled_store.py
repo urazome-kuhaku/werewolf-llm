@@ -34,7 +34,7 @@ _JSON_KWARGS: Final[dict[str, object]] = {
     "sort_keys": True,
 }
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
-_PACKAGE_FILES: Final[tuple[str, ...]] = (
+_PACKAGE_FILES_V1: Final[tuple[str, ...]] = (
     "alias-index.json",
     "documents.jsonl",
     "exact-index.json",
@@ -43,6 +43,10 @@ _PACKAGE_FILES: Final[tuple[str, ...]] = (
     "text-index.json",
     "topic-index.json",
 )
+_PACKAGE_FILES_V2: Final[tuple[str, ...]] = tuple(sorted((*_PACKAGE_FILES_V1, "execution.json")))
+# Kept as the schema-1 name for downstream compatibility. New code should
+# select the exact set from the package payload schema.
+_PACKAGE_FILES: Final[tuple[str, ...]] = _PACKAGE_FILES_V1
 _INDEX_FILES: Final[tuple[tuple[str, str], ...]] = (
     ("exact", "exact-index.json"),
     ("alias", "alias-index.json"),
@@ -206,10 +210,15 @@ def _read_file_set_sync(package_dir: Path) -> dict[str, bytes]:
         children = {child.name for child in package_dir.iterdir()}
     except OSError as exc:
         raise CorruptCompiledPackageError("compiled package directory could not be listed") from exc
-    expected = set(_PACKAGE_FILES) | {"manifest.json"}
-    if children != expected:
-        missing = sorted(expected - children)
-        extra = sorted(children - expected)
+    expected_sets = (
+        set(_PACKAGE_FILES_V1) | {"manifest.json"},
+        set(_PACKAGE_FILES_V2) | {"manifest.json"},
+    )
+    expected = next((value for value in expected_sets if children == value), None)
+    if expected is None:
+        allowed = set(_PACKAGE_FILES_V2) | {"manifest.json"}
+        missing = sorted(min(expected_sets, key=lambda value: len(value - children)) - children)
+        extra = sorted(children - allowed)
         details = []
         if missing:
             details.append(f"missing {', '.join(missing)}")
@@ -244,9 +253,23 @@ def _verify_manifest_and_payload(
 ) -> CompiledKnowledgePackageLoad:
     """Verify a complete package and return its detached in-memory view."""
 
+    package_value = _decode_json(files["package.json"], filename="package.json")
+    package_payload = _plain_mapping(package_value, field_name="package")
+    package_schema_version = package_payload.get("schema_version")
+    if type(package_schema_version) is int and package_schema_version == 1:
+        package_files = _PACKAGE_FILES_V1
+    elif type(package_schema_version) is int and package_schema_version == 2:
+        package_files = _PACKAGE_FILES_V2
+    else:
+        raise CorruptCompiledPackageError("package has an unsupported schema_version")
+    if set(files) != set(package_files) | {"manifest.json"}:
+        raise CorruptCompiledPackageError(
+            "compiled package file set disagrees with package schema_version"
+        )
+
     manifest_value = _decode_json(files["manifest.json"], filename="manifest.json")
     manifest = _plain_mapping(manifest_value, field_name="manifest")
-    if manifest.get("schema_version") != 1:
+    if type(manifest.get("schema_version")) is not int or manifest.get("schema_version") != 1:
         raise CorruptCompiledPackageError("manifest has an unsupported schema_version")
     manifest_package_id = _string_field(manifest, "package_id", field_name="manifest")
     manifest_board_ref = _string_field(manifest, "board_ref", field_name="manifest")
@@ -271,7 +294,7 @@ def _verify_manifest_and_payload(
             raise CorruptCompiledPackageError("manifest file entry must be an object")
         path = entry.get("path")
         sha256 = entry.get("sha256")
-        if not isinstance(path, str) or path not in _PACKAGE_FILES:
+        if not isinstance(path, str) or path not in package_files:
             raise CorruptCompiledPackageError("manifest contains an invalid file path")
         if path in seen_paths:
             raise CorruptCompiledPackageError("manifest contains duplicate file paths")
@@ -281,15 +304,13 @@ def _verify_manifest_and_payload(
         expected_entries.append({"path": path, "sha256": sha256})
     if expected_entries != sorted(expected_entries, key=lambda item: item["path"]):
         raise CorruptCompiledPackageError("manifest files are not sorted")
-    if seen_paths != set(_PACKAGE_FILES):
+    if seen_paths != set(package_files):
         raise CorruptCompiledPackageError("manifest does not cover every compiled package file")
     for entry in expected_entries:
         actual = _digest(files[entry["path"]])
         if actual != entry["sha256"]:
             raise CorruptCompiledPackageError(f"compiled package hash mismatch: {entry['path']}")
 
-    package_value = _decode_json(files["package.json"], filename="package.json")
-    package_payload = _plain_mapping(package_value, field_name="package")
     package_id = _string_field(package_payload, "package_id", field_name="package")
     board_ref = _string_field(package_payload, "board_ref", field_name="package")
     if package_id != expected_package_id or board_ref != expected_package_id:
@@ -301,6 +322,14 @@ def _verify_manifest_and_payload(
         raise CorruptCompiledPackageError("package manifest is missing")
     if _digest(_canonical_json(logical_manifest).encode("utf-8")) != logical_manifest_sha:
         raise CorruptCompiledPackageError("logical manifest digest mismatch")
+
+    if package_schema_version == 2:
+        executable = _plain_mapping(
+            package_payload.get("executable"), field_name="package.executable"
+        )
+        execution_file = _decode_json(files["execution.json"], filename="execution.json")
+        if execution_file != executable:
+            raise CorruptCompiledPackageError("execution.json does not match package.json")
 
     documents_value = package_payload.get("documents")
     if not isinstance(documents_value, list) or any(
@@ -368,7 +397,7 @@ def _materialize_and_verify_sync(staging_dir: Path, files: Mapping[str, bytes]) 
 
     if not staging_dir.is_dir() or staging_dir.is_symlink():
         raise CorruptCompiledPackageError("staging directory is not available")
-    for filename in (*_PACKAGE_FILES, "manifest.json"):
+    for filename in sorted((*files.keys(),)):
         _write_one_sync(staging_dir / filename, files[filename])
     _verify_directory_sync(
         staging_dir,
@@ -456,9 +485,20 @@ def _serialized_files(package: CompiledKnowledgePackage) -> dict[str, bytes]:
             )
         files[filename] = _canonical_json_bytes(index_value)
 
+    package_schema_version = payload.get("schema_version")
+    if type(package_schema_version) is int and package_schema_version == 1:
+        package_files = _PACKAGE_FILES_V1
+    elif type(package_schema_version) is int and package_schema_version == 2:
+        executable = payload.get("executable")
+        if not isinstance(executable, dict):
+            raise CompiledKnowledgeStoreError("compiled package execution plan is missing")
+        files["execution.json"] = _canonical_json_bytes(executable)
+        package_files = _PACKAGE_FILES_V2
+    else:
+        raise CompiledKnowledgeStoreError("compiled package schema_version is unsupported")
+
     file_entries = [
-        {"path": filename, "sha256": _digest(files[filename])}
-        for filename in sorted(_PACKAGE_FILES)
+        {"path": filename, "sha256": _digest(files[filename])} for filename in sorted(package_files)
     ]
     manifest = {
         "board_ref": package_name,

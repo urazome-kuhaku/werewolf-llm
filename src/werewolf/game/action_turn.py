@@ -11,12 +11,17 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import cast
 
-from werewolf.domain.enums import GamePhase
+from pydantic import JsonValue
+
+from werewolf.domain.enums import Channel, GamePhase
 from werewolf.knowledge.role import TargetKind
+from werewolf.rules.models import SkillSpec
 from werewolf.runtime.player_runtime import (
     ActionResponse,
     ActionWindowView,
@@ -38,11 +43,107 @@ from .actions import (
     ActionValidationContext,
     ActionValidationError,
     ActionWindow,
-    load_action_registry,
 )
-from .events import GameEvent
+from .events import EventType, GameEvent, TeamNoticePayload
 from .manager import EventCommitError, GameManager
 from .state import GameState, GrantedAbility, GrantedTriggerAbility, PlayerState
+
+_PRIVATE_WINDOW_CONTEXT_KEYS = frozenset(
+    {"resolution_id", "origin_resolution_id", "snapshot_revision", "operation"}
+)
+
+
+def _runtime_visible_context(
+    context: Mapping[str, JsonValue],
+    *,
+    candidates: list[int],
+) -> dict[str, JsonValue]:
+    """Copy board-authored context after removing host provenance fields.
+
+    ``visible_context`` is the explicit disclosure boundary on an installed
+    window. The request narrows its candidate list to the set the scheduler
+    has independently authorized, then preserves other frozen board context
+    so a generic runtime can satisfy parameter and selector contracts.
+    """
+
+    projected = {
+        key: value for key, value in context.items() if key not in _PRIVATE_WINDOW_CONTEXT_KEYS
+    }
+    if "candidate_seats" in context:
+        projected["candidate_seats"] = [cast(JsonValue, seat) for seat in candidates]
+    return projected
+
+
+def _disclosed_team_seats(
+    events: tuple[GameEvent, ...],
+    *,
+    state: GameState,
+    seat: int,
+    session_epoch: int,
+    request_id: str,
+) -> set[int] | None:
+    """Read a roster only from an acknowledged or currently delivered notice.
+
+    Team membership stays private in ``PlayerState``.  A runtime may use only
+    seats carried by a roster notice that this session has actually received.
+    Current events must be part of this request's frozen delivery batch;
+    historical events must be behind the same session's acknowledged cursor.
+    The notice content is a small JSON contract so this projection does not
+    infer teams from player roles or chat groups.
+    """
+
+    player = state.players.get(seat)
+    cursor = state.delivery_cursors.get(seat)
+    if (
+        player is None
+        or player.session_epoch != session_epoch
+        or cursor is None
+        or cursor.session_epoch != session_epoch
+    ):
+        return None
+
+    current_event_ids = (
+        set(cursor.in_flight_event_ids) if cursor.in_flight_request_id == request_id else set()
+    )
+    candidate_events: dict[int, GameEvent] = {
+        event.event_id: event
+        for event in state.events
+        if isinstance(event, GameEvent) and event.event_id <= cursor.committed_event_id
+    }
+    candidate_events.update(
+        (event.event_id, event) for event in events if event.event_id in current_event_ids
+    )
+
+    disclosed: set[int] = set()
+    found_roster = False
+    for event in candidate_events.values():
+        if (
+            event.game_id != state.game_id
+            or event.round_no != state.round_no
+            or event.phase is not GamePhase.NIGHT_TEAM_CHAT
+            or event.event_type is not EventType.TEAM_NOTICE
+            or event.channel is not Channel.TEAM
+            or seat not in event.audience
+            or not isinstance(event.payload, TeamNoticePayload)
+        ):
+            continue
+        try:
+            payload = json.loads(event.payload.content)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict) or payload.get("kind") != "chat_group_roster":
+            continue
+        raw_seats = payload.get("member_seats")
+        if not isinstance(raw_seats, list):
+            continue
+        if any(type(item) is not int or not 1 <= item <= 64 for item in raw_seats):
+            continue
+        members = set(raw_seats)
+        if len(members) != len(raw_seats) or seat not in members:
+            continue
+        disclosed.update(members)
+        found_roster = True
+    return disclosed if found_roster else None
 
 
 class ActionTurnError(RuntimeError):
@@ -94,7 +195,7 @@ class ActionTurnScheduler:
         self._runtimes = dict(runtimes)
         self._timeout_seconds = timeout_seconds
         self._bindings: dict[str, _ActionBinding] = {}
-        self._registry = load_action_registry()
+        self._registry = manager.registry
 
     async def run_turn(
         self,
@@ -173,7 +274,7 @@ class ActionTurnScheduler:
                 ) from exc
 
         try:
-            await self._manager.begin_action_turn(
+            delivery_state = await self._manager.begin_action_turn(
                 seat,
                 player.session_epoch,
                 window_id=authoritative.window_id,
@@ -197,6 +298,7 @@ class ActionTurnScheduler:
             attempt_no=attempt_no,
             context=context,
             events=visible,
+            delivery_state=delivery_state,
         )
         self._bindings[request_id] = _ActionBinding(
             seat=seat,
@@ -294,6 +396,7 @@ class ActionTurnScheduler:
         attempt_no: int,
         context: ActionValidationContext,
         events: tuple[GameEvent, ...],
+        delivery_state: GameState,
     ) -> TurnRequest:
         now = datetime.now(UTC)
         timeout = self._timeout_seconds or 120.0
@@ -318,15 +421,61 @@ class ActionTurnScheduler:
                 )
                 for event in events
             ],
-            payload={"seat": seat, "phase": state.phase.value},
+            payload={
+                "seat": seat,
+                "phase": state.phase.value,
+                "round_no": state.round_no,
+                "day_no": state.day_no,
+            },
         )
+        visible_context = _runtime_visible_context(
+            window.visible_context,
+            candidates=candidate_seats,
+        )
+        if window.phase is GamePhase.NIGHT_ACTION:
+            skills_by_code: dict[int, list[SkillSpec]] = {}
+            execution = self._manager.execution_package
+            if execution is not None:
+                for skill in execution.skills:
+                    skills_by_code.setdefault(skill.action_code, []).append(skill)
+            action_targets: dict[str, list[JsonValue]] = {}
+            disclosed_team = _disclosed_team_seats(
+                events,
+                state=delivery_state,
+                seat=seat,
+                session_epoch=session_epoch,
+                request_id=request_id,
+            )
+            for action_code in allowed_action_codes:
+                try:
+                    target_policy = self._registry.get(action_code).target_policy
+                except KeyError:
+                    continue
+                matching = skills_by_code.get(action_code, ())
+                is_chat_group_skill = any(
+                    skill.coordination_scope == "CHAT_GROUP" for skill in matching
+                )
+                if target_policy != "alive_non_authorized_wolf" or (
+                    execution is not None and not is_chat_group_skill
+                ):
+                    continue
+                action_targets[str(action_code)] = [
+                    cast(JsonValue, candidate)
+                    for candidate in candidate_seats
+                    if candidate != seat
+                    and (disclosed_team is None or candidate not in disclosed_team)
+                ]
+            if action_targets:
+                visible_context["targets_by_action"] = cast(JsonValue, action_targets)
         action_window_view = ActionWindowView(
             window_id=window.window_id,
             allowed_action_codes=list(allowed_action_codes),
             min_actions=max(1, window.min_actions),
             max_actions=max(1, window.max_actions),
             allow_pass=window.allow_pass,
+            allow_duplicate_action_codes=window.allow_duplicate_action_codes,
             candidate_seats=candidate_seats,
+            visible_context=visible_context,
         )
         return TurnRequest(
             request_id=request_id,
@@ -375,10 +524,10 @@ class ActionTurnScheduler:
         # may be installed in any of the three daytime boundary phases, so it
         # must be recognized before the phase-specific role branches below.
         if window.visible_context.get("kind") == "sheriff_badge":
-            return self._visible_badge_window(window, context)
+            return self._visible_badge_window(state, window, context)
 
         if window.phase is GamePhase.TRIGGER_ACTION:
-            return self._visible_trigger_window(state, window, player, context)
+            return self._visible_trigger_window(state, window, player)
         if window.phase is GamePhase.NIGHT_ACTION:
             return self._visible_night_window(state, window, player, context)
 
@@ -391,10 +540,11 @@ class ActionTurnScheduler:
         )
         if window.allow_pass and 299 in window.allowed_action_codes and 299 not in codes:
             codes = (*codes, 299)
-        return codes, self._candidate_seats(state, window, context), ""
+        return codes, self._candidate_seats(state, window), ""
 
     @staticmethod
     def _visible_badge_window(
+        state: GameState,
         window: ActionWindow,
         context: ActionValidationContext,
     ) -> tuple[tuple[int, ...], list[int], str]:
@@ -412,15 +562,14 @@ class ActionTurnScheduler:
             if code in window.allowed_action_codes and code in context.authorized_action_codes
         )
         raw_candidates = window.visible_context.get("candidate_seats")
-        supplied = context.eligible_targets_by_action.get(201, ())
-        supplied_set = {
-            seat for seat in supplied if isinstance(seat, int) and not isinstance(seat, bool)
-        }
         candidates = sorted(
             {
                 seat
                 for seat in raw_candidates
-                if isinstance(seat, int) and not isinstance(seat, bool) and seat in supplied_set
+                if isinstance(seat, int)
+                and not isinstance(seat, bool)
+                and seat in state.players
+                and state.players[seat].alive
             }
             if isinstance(raw_candidates, (list, tuple))
             else set()
@@ -438,17 +587,39 @@ class ActionTurnScheduler:
         player: PlayerState,
         context: ActionValidationContext,
     ) -> tuple[tuple[int, ...], list[int], str]:
-        usable: list[tuple[GrantedAbility, tuple[int, ...]]] = []
+        if self._manager.execution_package is not None:
+            active = self._manager._rule_skill_instances(
+                state,
+                player.seat,
+                window.phase.value,
+                allowed_codes=set(window.allowed_action_codes),
+            )
+            authorized = set(context.authorized_action_codes)
+            executable_usable = [
+                skill.action_code for _instance, skill in active if skill.action_code in authorized
+            ]
+            codes = tuple(dict.fromkeys(executable_usable))
+            if 299 in authorized and 299 in window.allowed_action_codes:
+                codes = (*codes, 299)
+            # A skill selector can inspect hidden role/faction fields. Its
+            # evaluated result is authoritative for manager validation but
+            # must not become a side channel through the runtime schema.
+            # The installed window's candidate set is the public projection;
+            # the manager independently reapplies each frozen selector after
+            # the runtime submits its choice.
+            candidates = self._candidate_seats(state, window)
+            return tuple(dict.fromkeys(codes)), candidates, ""
+
+        legacy_usable: list[GrantedAbility] = []
         for ability in player.granted_abilities:
             if not self._usable_night_ability(player, window, ability):
                 continue
-            legal_targets = self._active_target_seats(state, player, ability, context)
-            usable.append((ability, legal_targets))
+            legacy_usable.append(ability)
 
-        codes = tuple(ability.action_code for ability, _targets in usable)
+        codes = tuple(ability.action_code for ability in legacy_usable)
         if window.allow_pass and 299 in window.allowed_action_codes:
             codes = (*codes, 299)
-        candidates = sorted({seat for _ability, targets in usable for seat in targets})
+        candidates = self._candidate_seats(state, window)
         return tuple(dict.fromkeys(codes)), candidates, ""
 
     def _visible_trigger_window(
@@ -456,7 +627,6 @@ class ActionTurnScheduler:
         state: GameState,
         window: ActionWindow,
         player: PlayerState,
-        context: ActionValidationContext,
     ) -> tuple[tuple[int, ...], list[int], str]:
         raw_ability_id = window.visible_context.get("ability_id")
         raw_action_code = window.visible_context.get("action_code")
@@ -476,7 +646,7 @@ class ActionTurnScheduler:
         codes = [ability.action_code]
         if ability.trigger.allow_pass and window.allow_pass and 299 in window.allowed_action_codes:
             codes.append(299)
-        candidates = self._trigger_target_seats(state, window, player, ability, context)
+        candidates = self._trigger_target_seats(state, window, player, ability)
         target_text = ", ".join(str(item) for item in candidates) if candidates else "无"
         if 299 in codes:
             summary = (
@@ -521,46 +691,12 @@ class ActionTurnScheduler:
             >= ability.resource.cost_per_use
         )
 
-    def _active_target_seats(
-        self,
-        state: GameState,
-        player: PlayerState,
-        ability: GrantedAbility,
-        context: ActionValidationContext,
-    ) -> tuple[int, ...]:
-        rule = ability.target_rule
-        if rule.kind is TargetKind.NONE:
-            return ()
-        try:
-            definition = self._registry.get(ability.action_code)
-        except KeyError:
-            return ()
-        candidate_seats = (
-            (player.seat,) if rule.kind is TargetKind.SELF else tuple(sorted(state.players))
-        )
-        derived = {
-            seat
-            for seat in candidate_seats
-            if seat in state.players
-            and (state.players[seat].alive or rule.allow_dead)
-            and (rule.allow_self or seat != player.seat)
-            and not (
-                definition.target_policy == "alive_non_authorized_wolf"
-                and state.players[seat].faction_id == player.faction_id
-            )
-        }
-        supplied = context.eligible_targets_by_action.get(ability.action_code)
-        if supplied is not None:
-            derived.intersection_update(supplied)
-        return tuple(sorted(derived))
-
     @staticmethod
     def _trigger_target_seats(
         state: GameState,
         window: ActionWindow,
         player: PlayerState,
         ability: GrantedTriggerAbility,
-        context: ActionValidationContext,
     ) -> list[int]:
         if ability.target_rule.kind is TargetKind.NONE:
             return []
@@ -568,11 +704,10 @@ class ActionTurnScheduler:
         candidates = (
             {item for item in raw if isinstance(item, int) and not isinstance(item, bool)}
             if isinstance(raw, (list, tuple))
-            else set()
+            else {seat for seat, candidate in state.players.items() if candidate.alive}
         )
-        supplied = context.eligible_targets_by_action.get(ability.action_code)
-        if supplied is not None:
-            candidates.intersection_update(supplied)
+        if ability.target_rule.kind is TargetKind.SELF:
+            candidates.intersection_update({player.seat})
         return sorted(
             seat
             for seat in candidates
@@ -585,7 +720,6 @@ class ActionTurnScheduler:
     def _candidate_seats(
         state: GameState,
         window: ActionWindow,
-        context: ActionValidationContext,
     ) -> list[int]:
         raw = window.visible_context.get("candidate_seats")
         candidates: set[int] = set()
@@ -593,9 +727,12 @@ class ActionTurnScheduler:
             candidates.update(
                 item for item in raw if isinstance(item, int) and not isinstance(item, bool)
             )
-        if not candidates:
-            for targets in context.eligible_targets_by_action.values():
-                candidates.update(targets)
+        else:
+            # Selector results can depend on hidden role or faction fields.
+            # When a frozen window does not state public candidates explicitly,
+            # the runtime sees the public alive-seat set and the manager keeps
+            # the selector result private for authoritative validation.
+            candidates.update(seat for seat, player in state.players.items() if player.alive)
         alive = {seat for seat, player in state.players.items() if player.alive}
         return sorted(seat for seat in candidates if seat in alive)
 

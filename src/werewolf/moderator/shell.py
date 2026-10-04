@@ -25,8 +25,8 @@ from werewolf.game import (
     GameState,
     RandomStateRef,
     RulesetRef,
-    load_action_registry,
 )
+from werewolf.game.actions import load_action_registry
 from werewolf.game.setup import build_role_assignment_plan
 from werewolf.game.victory import evaluate_victory
 from werewolf.knowledge.board import BoardDefinition
@@ -310,6 +310,7 @@ class ModeratorShell:
         self._sheriff_flow: ModeratorSheriffFlow | None = None
         self._badge_flow: ModeratorSheriffBadgeFlow | None = None
         self._trigger_flow: ModeratorTriggerFlow | None = None
+        self._schema_one_manual_compat = False
         self._closed = False
 
     @property
@@ -349,7 +350,7 @@ class ModeratorShell:
         # closure before the immutable per-game snapshot is materialized.
         compiled_store = CompiledKnowledgeStore(compiled)
         try:
-            package = await compiled_store.load(board_ref, expected_board_ref=board_ref)
+            package_load = await compiled_store.load(board_ref, expected_board_ref=board_ref)
         except Exception as exc:
             raise ModeratorError(
                 f"published compiled ruleset is unavailable or invalid: {board_ref.format()}"
@@ -361,9 +362,21 @@ class ModeratorShell:
             builder = KnowledgeSnapshotBuilder.from_game_root(compiled_store, active)
             snapshot = await builder.create(
                 game_id,
-                package,
+                package_load,
                 expected_board_ref=board_ref,
                 created_at=self.clock(),
+            )
+            runtime_bundle = await load_runtime_knowledge_bundle_from_snapshot(snapshot)
+            package = runtime_bundle.package
+            package_schema = package_load.package_payload.get("schema_version")
+            if (
+                package.execution is None or package.action_registry is None
+            ) and package_schema != 1:
+                raise ModeratorError("published package has no frozen executable ruleset")
+            schema_one_manual_compat = (
+                package_schema == 1
+                and package.execution is None
+                and package.action_registry is None
             )
         except Exception as exc:
             # No partially initialized game is left when snapshot creation
@@ -421,9 +434,22 @@ class ModeratorShell:
         self.games_root = games
         self.active_root = active
         self.ruleset_snapshot = snapshot
+        self.runtime_bundle = runtime_bundle
+        self._schema_one_manual_compat = schema_one_manual_compat
         self.snapshot_store = GameSnapshotStore(active)
         self.archive_store = GameArchiveStore(games)
-        self.manager = GameManager(state, registry=load_action_registry())
+        self.manager = GameManager(
+            state,
+            # Schema-one packages have no executable payload by definition.
+            # Preserve their explicit moderator-resolution compatibility path
+            # with the pinned legacy registry; schema two must be executable.
+            registry=package.action_registry or load_action_registry(),
+            execution_package=package.execution,
+            legacy_compatibility=(
+                package.execution_source is not None
+                and package.execution_source.startswith("compat:")
+            ),
+        )
         return self._status_payload(private=False)
 
     async def start(self) -> dict[str, object]:
@@ -458,6 +484,24 @@ class ModeratorShell:
 
         try:
             bundle = await load_runtime_knowledge_bundle_from_snapshot(snapshot)
+            if self.manager.execution_package is None:
+                # Frozen schema-one packages predate executable rulesets and
+                # remain supported for manual moderator resolutions. Schema
+                # two is rejected in `new`, so this cannot enable automatic
+                # execution without a pinned package.
+                if not self._schema_one_manual_compat or bundle.package.execution is not None:
+                    raise ModeratorError(
+                        "frozen snapshot execution identity changed since game construction"
+                    )
+            elif (
+                bundle.package.execution is None
+                or bundle.package.action_registry is None
+                or bundle.package.execution.package_id != self.manager.execution_package.package_id
+                or bundle.package.action_registry != self.manager.registry
+            ):
+                raise ModeratorError(
+                    "frozen snapshot execution identity changed since game construction"
+                )
             configuration = parse_player_configuration(
                 self.config,
                 board=bundle.board,

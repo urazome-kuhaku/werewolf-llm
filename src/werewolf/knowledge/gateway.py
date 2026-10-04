@@ -86,6 +86,8 @@ class KnowledgeGateway:
         clock: Callable[[], datetime] | None = None,
         max_request_bytes: int = MAX_REQUEST_BYTES,
         state_provider: SkillStatusProvider | None = None,
+        execution_package: object | None = None,
+        action_registry: object | None = None,
     ) -> None:
         if not isinstance(service, KnowledgeService):
             raise TypeError("service must be a KnowledgeService")
@@ -99,6 +101,8 @@ class KnowledgeGateway:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._max_request_bytes = max_request_bytes
         self._state_provider = state_provider
+        self._execution_package = execution_package
+        self._action_registry = action_registry
         self._tokens: dict[str, KnowledgeTokenBinding] = {}
         self._runner: web.AppRunner | None = None
         self.app = self.create_app()
@@ -251,6 +255,8 @@ class KnowledgeGateway:
                 snapshot_id=context.snapshot_id,
                 seat=context.seat,
                 session_epoch=context.session_epoch,
+                execution_package=self._execution_package,
+                action_registry=self._action_registry,
             )
         except SkillStatusSessionMismatch as exc:
             raise _HTTPGatewayError(
