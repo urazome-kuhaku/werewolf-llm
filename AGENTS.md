@@ -39,4 +39,5 @@ Never commit API keys, `.env`, `.runtime/`, game data, identity prompts, private
 
 - Never execute any terminal or command-line operation inside Codex's restricted sandbox on this device, including read-only commands. Sandbox terminal attempts repeatedly fail with `setup refresh had errors`.
 - Run all terminal commands, including `uv`, `git`, and `pytest`, only in an approved host/non-sandbox execution context (for example, `exec_command` with `require_escalated`). Do not retry a failed command in the restricted sandbox.
-- Every concrete code-writing step must be assigned to a new `luna-worker` sub-agent using `gpt-5.6-luna` with `xhigh` reasoning. The main agent owns implementation design against the technical plan and reviews the sub-agent's changes.
+- Every concrete code-writing step must be assigned to a new `luna-worker` sub-agent using `gpt-6-luna` with `xhigh` reasoning. The main agent owns implementation design against the technical plan and reviews the sub-agent's changes.
+- Run at most three sub-agents at the same time. Count running tasks before spawning or resuming an agent; pause or complete an existing task before taking another slot. Sub-agents must not spawn nested agents. Check the explicit model and reasoning settings before starting work; do not substitute a more expensive model.
