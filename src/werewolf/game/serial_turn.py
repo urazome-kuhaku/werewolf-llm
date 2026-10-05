@@ -95,6 +95,7 @@ class SerialTurnScheduler:
         timeout_seconds: float | None = None,
         phase: GamePhase = GamePhase.DAY_SPEECH,
         logical_label: str | None = None,
+        rule_boundary_id: str | None = None,
     ) -> None:
         if timeout_seconds is not None and timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
@@ -119,6 +120,9 @@ class SerialTurnScheduler:
         self._queue = self._coerce_queue(queue) if queue is not None else None
         self._timeout_seconds = timeout_seconds
         self._phase = phase
+        if rule_boundary_id is not None and not rule_boundary_id:
+            raise ValueError("rule_boundary_id must be non-empty when supplied")
+        self._rule_boundary_id = rule_boundary_id
         if logical_label is not None and (
             not logical_label
             or len(logical_label) > 32
@@ -139,6 +143,25 @@ class SerialTurnScheduler:
 
     async def start(self, queue: TurnQueue | Sequence[int] | None = None) -> None:
         """Install the immutable queue before the first runtime call."""
+
+        if self._rule_boundary_id is not None:
+            if queue is not None or self._queue is not None:
+                raise SerialTurnError(
+                    "BOUNDARY_QUEUE_INVALID: rule-bound speech reads its pending seats "
+                    "from the boundary"
+                )
+            state = await self._manager.snapshot()
+            boundary = next(
+                (
+                    item
+                    for item in state.rule_boundaries
+                    if item.boundary_id == self._rule_boundary_id
+                ),
+                None,
+            )
+            if boundary is None or not boundary.is_pending:
+                raise SerialTurnError("BOUNDARY_NOT_PENDING: no pending speech boundary exists")
+            return
 
         requested = self._coerce_queue(queue) if queue is not None else self._queue
         if requested is None and self._phase is GamePhase.NIGHT_TEAM_CHAT:
@@ -171,11 +194,31 @@ class SerialTurnScheduler:
 
     async def _run(self, *, retry: bool) -> SerialSpeechResult:
         state = await self._manager.snapshot()
-        if state.current_queue is None or not state.current_queue:
+        if self._rule_boundary_id is not None:
+            boundary = next(
+                (
+                    item
+                    for item in state.rule_boundaries
+                    if item.boundary_id == self._rule_boundary_id
+                ),
+                None,
+            )
+            if boundary is None:
+                raise SerialTurnError("BOUNDARY_NOT_PENDING: speech boundary is missing")
+            pending = tuple(
+                seat
+                for seat in boundary.last_words_seats
+                if seat not in boundary.last_words_completed_seats
+            )
+            if not pending:
+                raise SerialTurnError("BOUNDARY_COMPLETE: no serial speech remains")
+        else:
+            pending = state.current_queue or ()
+        if not pending:
             raise SerialTurnError("TURN_QUEUE_EMPTY: no serial speech turn is pending")
         if not retry and state.serial_turn is not None:
             raise SerialTurnBusyError("TURN_IN_PROGRESS: use retry for the active queue head")
-        seat = state.current_queue[0]
+        seat = pending[0]
         runtime = self._runtimes.get(seat)
         if runtime is None:
             raise SerialTurnError(f"RUNTIME_MISSING: no runtime is registered for seat {seat}")
@@ -239,6 +282,7 @@ class SerialTurnScheduler:
             attempt_no=attempt_no,
             retry=retry,
             phase=self._phase,
+            rule_boundary_id=self._rule_boundary_id,
         )
         visible = await self._manager.peek_delivery(seat, player.session_epoch)
         request = self._make_request(
@@ -310,6 +354,7 @@ class SerialTurnScheduler:
                 attempt_no=request.attempt_no,
                 text=result.response.speech.text,
                 phase=self._phase,
+                rule_boundary_id=self._rule_boundary_id,
             )
         except EventCommitError as exc:
             if "REQUEST_EXPIRED" in str(exc) or "REQUEST_MISMATCH" in str(exc):

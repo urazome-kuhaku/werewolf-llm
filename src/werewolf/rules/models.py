@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import unicodedata
 from collections.abc import Iterable
 from typing import Annotated, Literal, Never, Self, SupportsIndex, TypeAlias, get_origin
 
@@ -29,6 +30,10 @@ ValueType = Literal[
     "str_list",
     "json",
 ]
+ExpiryPolicy = Literal["NEVER", "ROUND_END", "NEXT_NIGHT_START"]
+PlayerField = Literal["role_id", "faction_id", "victory_group_id", "chat_group_ids"]
+RuleHook = Literal["DAY_SPEECH_BEFORE", "DAY_SPEECH_AFTER"]
+FlowAction = Literal["RESUME_HOOK", "ADVANCE_TO_NIGHT"]
 
 
 class _FrozenDict(dict[object, object]):
@@ -171,7 +176,9 @@ class RefExpr(RuleModel):
     """
 
     op: Literal["ref"] = "ref"
-    source: Literal["actor", "target", "request", "observation", "skill_state", "item"]
+    source: Literal[
+        "actor", "target", "request", "observation", "skill_state", "source_fact", "item"
+    ]
     name: Identifier
 
 
@@ -205,8 +212,19 @@ class MapExpr(RuleModel):
     value: Expr
 
 
-Expr: TypeAlias = LiteralExpr | RefExpr | CompareExpr | BooleanExpr | CountExpr | MapExpr
-for _expr_model in (CompareExpr, BooleanExpr, MapExpr):
+class RelationExistsExpr(RuleModel):
+    """Test one declared directed relation in the bounded observation set."""
+
+    op: Literal["relation_exists"] = "relation_exists"
+    relation_type: Identifier
+    source_seat: Expr | None = None
+    target_seat: Expr | None = None
+
+
+Expr: TypeAlias = (
+    LiteralExpr | RefExpr | CompareExpr | BooleanExpr | CountExpr | MapExpr | RelationExistsExpr
+)
+for _expr_model in (CompareExpr, BooleanExpr, MapExpr, RelationExistsExpr):
     _expr_model.model_rebuild(_types_namespace={"Expr": Expr})
 
 
@@ -221,6 +239,61 @@ class StateDeclaration(RuleModel):
     key: Identifier
     value_type: ValueType
     initial: JsonValue | None = None
+    scope: Literal["GAME", "SEAT", "ABILITY"] = "ABILITY"
+    expiry_policy: ExpiryPolicy = "NEVER"
+
+
+class RelationDeclaration(RuleModel):
+    relation_type: Identifier
+
+
+class ExecutionWindow(RuleModel):
+    """Compiler-bound copy of one frozen board window used for scheduling."""
+
+    window_id: Identifier
+    order: Annotated[int, Field(gt=0, le=64, strict=True)]
+    phase: Literal["NIGHT_TEAM_CHAT", "NIGHT_ACTION", "NIGHT_RESOLVE"]
+    depends_on: tuple[Identifier, ...] = ()
+
+
+class BoundaryPolicy(RuleModel):
+    """Compiler-derived death and badge boundary rules from the frozen board."""
+
+    last_words_enabled: bool
+    eligible_death_causes: tuple[Identifier, ...] = ()
+    before_reveal: bool = True
+    night_death_policy: Literal["none", "first_night_only", "every_night"] = "every_night"
+    day_death_policy: Literal["none", "every_day"] = "every_day"
+    sheriff_enabled: bool = False
+    badge_transfer_enabled: bool | None = None
+    badge_transfer_on_death: bool | None = None
+
+
+class ResourceDeclaration(RuleModel):
+    resource_id: Identifier
+    min_value: Annotated[int, Field(ge=0, le=1_000_000, strict=True)] = 0
+    max_value: Annotated[int, Field(ge=0, le=1_000_000, strict=True)] = 1_000_000
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> Self:
+        if self.min_value > self.max_value:
+            raise ValueError("resource min_value cannot exceed max_value")
+        return self
+
+
+class PlayerFieldValues(RuleModel):
+    """Closed identifiers a compiled execution may assign to player fields."""
+
+    role_ids: tuple[Identifier, ...] = ()
+    faction_ids: tuple[Identifier, ...] = ()
+    victory_group_ids: tuple[Identifier, ...] = ()
+    chat_group_ids: tuple[Identifier, ...] = ()
+
+
+class TriggerSpec(RuleModel):
+    fact_types: tuple[Identifier, ...]
+    mode: Literal["AUTOMATIC", "PLAYER_CHOICE"]
+    condition: Expr | None = None
 
 
 class ParameterSpec(RuleModel):
@@ -274,6 +347,13 @@ class EffectSpec(RuleModel):
         "SET_CAN_VOTE",
         "FACT",
         "CONSUME_ABILITY",
+        "PLAYER_FIELD_SET",
+        "RESOURCE_DELTA",
+        "RELATION_ADD",
+        "RELATION_REMOVE",
+        "ABILITY_GRANT",
+        "ABILITY_REVOKE",
+        "FLOW",
     ]
     target: Expr | None = None
     condition: Expr | None = None
@@ -282,6 +362,16 @@ class EffectSpec(RuleModel):
     state_key: Identifier | None = None
     fact_type: Identifier | None = None
     authorized_targets: tuple[Expr, ...] = ()
+    player_field: PlayerField | None = None
+    resource_id: Identifier | None = None
+    delta: Expr | None = None
+    relation_type: Identifier | None = None
+    relation_source: Expr | None = None
+    relation_target: Expr | None = None
+    relation_expiry_policy: ExpiryPolicy | None = None
+    grant_skill_id: Identifier | None = None
+    grant_id: Identifier | None = None
+    flow_action: FlowAction | None = None
 
 
 class DisclosureSpec(RuleModel):
@@ -302,6 +392,9 @@ class SkillSpec(RuleModel):
     grants: tuple[AbilityGrant, ...]
     timing: tuple[Identifier, ...]
     after_skills: tuple[Identifier, ...] = ()
+    window_ids: tuple[Identifier, ...] = ()
+    hook_ids: tuple[RuleHook, ...] = ()
+    trigger: TriggerSpec | None = None
     coordination_scope: Literal["INDIVIDUAL", "CHAT_GROUP"] = "INDIVIDUAL"
     condition: Expr | None = None
     targets: TargetPolicy
@@ -318,6 +411,8 @@ class SkillSpec(RuleModel):
         )
         object.__setattr__(self, "timing", tuple(sorted(self.timing)))
         object.__setattr__(self, "after_skills", tuple(sorted(self.after_skills)))
+        object.__setattr__(self, "window_ids", tuple(sorted(self.window_ids)))
+        object.__setattr__(self, "hook_ids", tuple(sorted(self.hook_ids)))
         object.__setattr__(
             self, "effects", tuple(sorted(self.effects, key=lambda item: item.effect_id))
         )
@@ -376,6 +471,12 @@ class ExecutionPackage(RuleModel):
     actions: tuple[ActionSpec, ...]
     skills: tuple[SkillSpec, ...]
     state_declarations: tuple[StateDeclaration, ...] = ()
+    relation_declarations: tuple[RelationDeclaration, ...] = ()
+    resource_declarations: tuple[ResourceDeclaration, ...] = ()
+    player_field_values: PlayerFieldValues | None = None
+    window_metadata: tuple[ExecutionWindow, ...] = ()
+    window_settlement_groups: dict[str, str] = Field(default_factory=dict)
+    boundary_policy: BoundaryPolicy | None = None
     interactions: tuple[InteractionRule, ...] = ()
 
     def model_post_init(self, __context: object) -> None:
@@ -393,14 +494,55 @@ class ExecutionPackage(RuleModel):
         )
         object.__setattr__(
             self,
+            "relation_declarations",
+            tuple(sorted(self.relation_declarations, key=lambda item: item.relation_type)),
+        )
+        object.__setattr__(
+            self,
+            "resource_declarations",
+            tuple(sorted(self.resource_declarations, key=lambda item: item.resource_id)),
+        )
+        object.__setattr__(
+            self,
+            "window_metadata",
+            tuple(sorted(self.window_metadata, key=lambda item: item.order)),
+        )
+        object.__setattr__(
+            self,
             "interactions",
             tuple(sorted(self.interactions, key=lambda item: (item.priority, item.interaction_id))),
         )
 
-    @field_validator("actions", "skills", "state_declarations", "interactions", mode="before")
+    @field_validator(
+        "actions",
+        "skills",
+        "state_declarations",
+        "relation_declarations",
+        "resource_declarations",
+        "window_metadata",
+        "interactions",
+        mode="before",
+    )
     @classmethod
     def accept_json_arrays(cls, value: object) -> object:
         return tuple(value) if isinstance(value, list) else value
+
+    @model_validator(mode="after")
+    def validate_window_settlement_identifiers(self) -> Self:
+        for window_id, group_id in self.window_settlement_groups.items():
+            for label, identifier in (("window", window_id), ("group", group_id)):
+                if (
+                    not identifier
+                    or len(identifier) > 96
+                    or any(
+                        character.isspace() or unicodedata.category(character).startswith("C")
+                        for character in identifier
+                    )
+                ):
+                    raise ValueError(
+                        f"window settlement {label} IDs must be bounded printable identifiers"
+                    )
+        return self
 
     @property
     def package_id(self) -> str:
@@ -440,6 +582,29 @@ class SkillStateValue(RuleModel):
     value: JsonValue | None
 
 
+class RuleStateValue(RuleModel):
+    """A bounded state cell read from the authoritative observation."""
+
+    scope: Literal["GAME", "SEAT", "ABILITY"]
+    skill_id: Identifier
+    key: Identifier
+    value: JsonValue | None
+    seat: SeatNo | None = None
+    ability_instance_id: Identifier | None = None
+    expires_at_round: NonNegativeInt | None = None
+    expires_at_hook: Identifier | None = None
+
+    @model_validator(mode="after")
+    def validate_scope_owner(self) -> Self:
+        if self.scope == "GAME" and (self.seat is not None or self.ability_instance_id is not None):
+            raise ValueError("GAME state value cannot have an owner")
+        if self.scope == "SEAT" and (self.seat is None or self.ability_instance_id is not None):
+            raise ValueError("SEAT state value requires a seat owner")
+        if self.scope == "ABILITY" and (self.ability_instance_id is None or self.seat is not None):
+            raise ValueError("ABILITY state value requires an ability instance owner")
+        return self
+
+
 class SkillUseRecord(RuleModel):
     record_id: Identifier
     request_id: Identifier
@@ -454,6 +619,19 @@ class SkillUseRecord(RuleModel):
     disposition: Literal["ACCEPTED", "PASSED", "REJECTED"] = "ACCEPTED"
 
 
+class RelationValue(RuleModel):
+    relation_id: Identifier
+    relation_type: Identifier
+    source_seat: SeatNo
+    target_seat: SeatNo
+    source_skill_id: Identifier
+    source_request_id: Identifier
+    source_ability_instance_id: Identifier
+    created_round: NonNegativeInt = 0
+    expires_at_round: NonNegativeInt | None = None
+    expires_at_hook: Identifier | None = None
+
+
 class DomainFact(RuleModel):
     fact_id: Identifier
     fact_type: Identifier
@@ -461,8 +639,23 @@ class DomainFact(RuleModel):
     source_request_id: Identifier | None = None
     actor_seat: SeatNo | None = None
     target_seat: SeatNo | None = None
+    death_cause: Identifier | None = None
     tags: tuple[Identifier, ...] = ()
     data: dict[str, JsonValue] = Field(default_factory=dict)
+
+
+class RuleWindowBinding(RuleModel):
+    """Trusted window context captured for one request in an observation."""
+
+    request_id: Identifier
+    window_id: Identifier
+    logical_window_id: Identifier | None = None
+    hook_id: RuleHook | None = None
+    trigger_occurrence_id: Identifier | None = None
+    source_fact_id: Identifier | None = None
+    # Adapter-authored compatibility authorization for frozen legacy grants.
+    # This is observation state, not part of a package or its stable identity.
+    legacy_trigger: bool = False
 
 
 class RuleObservation(RuleModel):
@@ -472,19 +665,40 @@ class RuleObservation(RuleModel):
     round_number: NonNegativeInt
     players: tuple[PlayerObservation, ...]
     skill_state: tuple[SkillStateValue, ...] = ()
+    state_values: tuple[RuleStateValue, ...] = ()
     ledger: tuple[SkillUseRecord, ...] = ()
     facts: tuple[DomainFact, ...] = ()
+    relations: tuple[RelationValue, ...] = ()
     ability_instances: tuple[AbilityInstance, ...] = ()
     game_id: Identifier = "game"
     group_id: Identifier = "group"
     timing: str = ""
+    current_window_id: Identifier | None = None
+    current_logical_window_id: Identifier | None = None
+    current_hook_id: RuleHook | None = None
+    current_window_bindings: tuple[RuleWindowBinding, ...] = ()
 
     @field_validator(
-        "players", "skill_state", "ledger", "facts", "ability_instances", mode="before"
+        "players",
+        "skill_state",
+        "state_values",
+        "ledger",
+        "facts",
+        "relations",
+        "ability_instances",
+        "current_window_bindings",
+        mode="before",
     )
     @classmethod
     def accept_json_arrays(cls, value: object) -> object:
         return tuple(value) if isinstance(value, list) else value
+
+    @model_validator(mode="after")
+    def validate_current_window_binding_request_ids(self) -> Self:
+        request_ids = tuple(binding.request_id for binding in self.current_window_bindings)
+        if len(request_ids) != len(set(request_ids)):
+            raise ValueError("current window bindings must have unique request ids")
+        return self
 
 
 class SkillRequest(RuleModel):
@@ -496,7 +710,12 @@ class SkillRequest(RuleModel):
     targets: tuple[SeatNo, ...] = ()
     parameters: dict[str, JsonValue] = Field(default_factory=dict)
     passed: bool = False
-    origin: Literal["PLAYER", "HOST"] = "PLAYER"
+    origin: Literal["PLAYER", "HOST", "AUTOMATIC"] = "PLAYER"
+    trigger_occurrence_id: Identifier | None = None
+    source_fact_id: Identifier | None = None
+    window_id: Identifier | None = None
+    logical_window_id: Identifier | None = None
+    hook_id: RuleHook | None = None
 
 
 class RequestDisposition(RuleModel):
@@ -518,6 +737,13 @@ class EffectIntent(RuleModel):
         "SET_CAN_VOTE",
         "FACT",
         "CONSUME_ABILITY",
+        "PLAYER_FIELD_SET",
+        "RESOURCE_DELTA",
+        "RELATION_ADD",
+        "RELATION_REMOVE",
+        "ABILITY_GRANT",
+        "ABILITY_REVOKE",
+        "FLOW",
     ]
     source_rule_id: Identifier
     source_request_id: Identifier
@@ -530,6 +756,26 @@ class EffectIntent(RuleModel):
     state_key: Identifier | None = None
     fact_type: Identifier | None = None
     authorized_targets: tuple[SeatNo, ...] = ()
+    player_field: PlayerField | None = None
+    resource_id: Identifier | None = None
+    delta: Annotated[int, Field(ge=-1_000_000, le=1_000_000, strict=True)] | None = None
+    relation_type: Identifier | None = None
+    relation_id: Identifier | None = None
+    relation_source_seat: SeatNo | None = None
+    relation_target_seat: SeatNo | None = None
+    relation_expiry_policy: ExpiryPolicy | None = None
+    grant_skill_id: Identifier | None = None
+    grant_id: Identifier | None = None
+    granted_ability_instance_id: Identifier | None = None
+    state_scope: Literal["GAME", "SEAT", "ABILITY"] | None = None
+    state_ability_instance_id: Identifier | None = None
+    state_expiry_policy: ExpiryPolicy | None = None
+    flow_action: FlowAction | None = None
+    trigger_occurrence_id: Identifier | None = None
+    source_fact_id: Identifier | None = None
+    window_id: Identifier | None = None
+    logical_window_id: Identifier | None = None
+    hook_id: RuleHook | None = None
 
     @model_validator(mode="after")
     def validate_ability_consumption(self) -> Self:
@@ -551,14 +797,45 @@ class ResolvedEffect(RuleModel):
         "SET_CAN_VOTE",
         "FACT",
         "CONSUME_ABILITY",
+        "PLAYER_FIELD_SET",
+        "RESOURCE_DELTA",
+        "RELATION_ADD",
+        "RELATION_REMOVE",
+        "ABILITY_GRANT",
+        "ABILITY_REVOKE",
+        "FLOW",
     ]
     target_seat: SeatNo | None = None
     applied: bool
     reason: str | None = None
     source_request_id: Identifier
     source_rule_id: Identifier
+    skill_id: Identifier | None = None
+    ability_instance_id: Identifier | None = None
+    actor_seat: SeatNo | None = None
     value: JsonValue | None = None
     tags: tuple[Identifier, ...] = ()
+    authorized_targets: tuple[SeatNo, ...] = ()
+    player_field: PlayerField | None = None
+    resource_id: Identifier | None = None
+    delta: Annotated[int, Field(ge=-1_000_000, le=1_000_000, strict=True)] | None = None
+    relation_type: Identifier | None = None
+    relation_id: Identifier | None = None
+    relation_source_seat: SeatNo | None = None
+    relation_target_seat: SeatNo | None = None
+    relation_expiry_policy: ExpiryPolicy | None = None
+    grant_skill_id: Identifier | None = None
+    grant_id: Identifier | None = None
+    granted_ability_instance_id: Identifier | None = None
+    state_scope: Literal["GAME", "SEAT", "ABILITY"] | None = None
+    state_ability_instance_id: Identifier | None = None
+    state_expiry_policy: ExpiryPolicy | None = None
+    flow_action: FlowAction | None = None
+    trigger_occurrence_id: Identifier | None = None
+    source_fact_id: Identifier | None = None
+    window_id: Identifier | None = None
+    logical_window_id: Identifier | None = None
+    hook_id: RuleHook | None = None
 
     @model_validator(mode="after")
     def validate_ability_consumption(self) -> Self:
@@ -566,15 +843,103 @@ class ResolvedEffect(RuleModel):
             self.target_seat is None or not isinstance(self.value, str) or not self.value
         ):
             raise ValueError("CONSUME_ABILITY requires a target seat and non-empty ability ID")
+        if self.effect_type in {
+            "PLAYER_FIELD_SET",
+            "RESOURCE_DELTA",
+            "RELATION_ADD",
+            "RELATION_REMOVE",
+            "ABILITY_GRANT",
+            "ABILITY_REVOKE",
+            "FLOW",
+        } and (
+            self.skill_id is None or self.ability_instance_id is None or self.actor_seat is None
+        ):
+            raise ValueError("typed effects require complete source provenance")
         return self
 
 
 class StateUpdate(RuleModel):
-    ability_instance_id: Identifier
+    ability_instance_id: Identifier | None = None
+    seat: SeatNo | None = None
+    scope: Literal["GAME", "SEAT", "ABILITY"] = "ABILITY"
     skill_id: Identifier
     key: Identifier
     value: JsonValue | None
     source_request_id: Identifier
+    source_rule_id: Identifier = "state_set"
+    source_ability_instance_id: Identifier | None = None
+    expiry_policy: ExpiryPolicy = "NEVER"
+    authorized_targets: tuple[SeatNo, ...] = ()
+
+    @model_validator(mode="after")
+    def validate_scope_target(self) -> Self:
+        if self.scope == "ABILITY" and (self.ability_instance_id is None or self.seat is not None):
+            raise ValueError("ABILITY state update requires an ability instance id only")
+        if self.scope == "SEAT" and (self.seat is None or self.ability_instance_id is not None):
+            raise ValueError("SEAT state update requires a seat only")
+        if self.scope == "GAME" and (self.seat is not None or self.ability_instance_id is not None):
+            raise ValueError("GAME state update cannot have a seat or ability instance id")
+        return self
+
+
+class PlayerFieldUpdate(RuleModel):
+    seat: SeatNo
+    player_field: PlayerField
+    value: JsonValue
+    source_request_id: Identifier
+    source_rule_id: Identifier
+    source_skill_id: Identifier
+    source_ability_instance_id: Identifier
+    authorized_targets: tuple[SeatNo, ...] = ()
+
+
+class ResourceUpdate(RuleModel):
+    seat: SeatNo
+    resource_id: Identifier
+    delta: Annotated[int, Field(ge=-1_000_000, le=1_000_000, strict=True)]
+    source_request_id: Identifier
+    source_rule_id: Identifier
+    source_skill_id: Identifier
+    source_ability_instance_id: Identifier
+    authorized_targets: tuple[SeatNo, ...] = ()
+
+
+class RelationUpdate(RuleModel):
+    operation: Literal["ADD", "REMOVE"]
+    relation_id: Identifier
+    relation_type: Identifier
+    source_seat: SeatNo
+    target_seat: SeatNo
+    expiry_policy: ExpiryPolicy | None = None
+    source_request_id: Identifier
+    source_rule_id: Identifier
+    source_skill_id: Identifier
+    source_ability_instance_id: Identifier
+    authorized_targets: tuple[SeatNo, ...] = ()
+
+
+class AbilityUpdate(RuleModel):
+    operation: Literal["GRANT", "REVOKE"]
+    target_seat: SeatNo
+    skill_id: Identifier
+    grant_id: Identifier
+    ability_instance_id: Identifier | None = None
+    source_request_id: Identifier
+    source_rule_id: Identifier
+    source_skill_id: Identifier
+    source_ability_instance_id: Identifier
+    authorized_targets: tuple[SeatNo, ...] = ()
+
+
+class FlowUpdate(RuleModel):
+    action: FlowAction
+    window_id: Identifier | None = None
+    logical_window_id: Identifier | None = None
+    hook_id: RuleHook | None = None
+    source_request_id: Identifier
+    source_rule_id: Identifier
+    source_skill_id: Identifier
+    source_ability_instance_id: Identifier
 
 
 class UseUpdate(RuleModel):
@@ -627,6 +992,11 @@ class ResolutionBatch(RuleModel):
     intents: tuple[EffectIntent, ...] = ()
     effects: tuple[ResolvedEffect, ...] = ()
     state_updates: tuple[StateUpdate, ...] = ()
+    player_updates: tuple[PlayerFieldUpdate, ...] = ()
+    resource_updates: tuple[ResourceUpdate, ...] = ()
+    relation_updates: tuple[RelationUpdate, ...] = ()
+    ability_updates: tuple[AbilityUpdate, ...] = ()
+    flow_updates: tuple[FlowUpdate, ...] = ()
     use_updates: tuple[UseUpdate, ...] = ()
     history_updates: tuple[SkillUseRecord, ...] = ()
     cost_updates: tuple[CostUpdate, ...] = ()
@@ -637,9 +1007,11 @@ class ResolutionBatch(RuleModel):
 
 
 __all__ = [
+    "AbilityUpdate",
     "AbilityGrant",
     "AbilityInstance",
     "ActionSpec",
+    "BoundaryPolicy",
     "BooleanExpr",
     "CompareExpr",
     "CostSpec",
@@ -650,26 +1022,43 @@ __all__ = [
     "DomainFact",
     "EffectIntent",
     "EffectSpec",
+    "ExpiryPolicy",
+    "ExecutionWindow",
     "ExecutionPackage",
     "Expr",
     "InteractionRule",
     "LiteralExpr",
     "MapExpr",
     "MortalityOutcome",
+    "PlayerFieldUpdate",
+    "PlayerFieldValues",
+    "PlayerField",
     "ParameterSpec",
     "PlayerObservation",
     "RefExpr",
     "RequestDisposition",
+    "RelationDeclaration",
+    "RelationExistsExpr",
+    "RelationUpdate",
+    "RelationValue",
+    "ResourceDeclaration",
+    "ResourceUpdate",
     "ResolutionBatch",
     "ResolvedEffect",
     "RuleObservation",
+    "RuleWindowBinding",
     "SelectorExpr",
     "SkillRequest",
     "SkillSpec",
     "SkillStateValue",
     "SkillUseRecord",
+    "RuleStateValue",
     "StateDeclaration",
     "StateUpdate",
+    "RuleHook",
+    "FlowAction",
+    "FlowUpdate",
+    "TriggerSpec",
     "TargetPolicy",
     "UsagePolicy",
     "UseUpdate",

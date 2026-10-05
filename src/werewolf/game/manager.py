@@ -32,11 +32,15 @@ from werewolf.rules.adapter import (
 )
 from werewolf.rules.models import (
     AbilityInstance,
+    DisclosureProjection,
+    DomainFact,
     ExecutionPackage,
     ResolutionBatch,
+    RuleHook,
     SkillRequest,
     SkillSpec,
 )
+from werewolf.rules.predicates import evaluate_predicate
 from werewolf.rules.selectors import select_seats
 
 from .actions import (
@@ -88,12 +92,19 @@ from .state import (
     GrantedAbility,
     GrantedTriggerAbility,
     PlayerState,
+    RuleBoundary,
     RuleCommitReceipt,
+    RuleDeferredDisclosure,
     RuleExecutionIdentity,
     RuleFactRecord,
     RuleLedgerEntry,
+    RuleRelationValue,
+    RuleReturnPoint,
     RuleStateValue,
+    RuleTriggerOccurrence,
     RuleUseRecord,
+    RuleWorkflowCursor,
+    RuleWorkflowStep,
     SerialTurnBinding,
     utc_now,
 )
@@ -289,6 +300,26 @@ def _revision_check(state: GameState, expected_revision: int) -> None:
         )
 
 
+def _aware_commit_time(now: datetime | None) -> datetime:
+    value = utc_now() if now is None else now
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise EventCommitError("TIMESTAMP: commit timestamp must include a timezone")
+    return value.astimezone(UTC)
+
+
+def _stable_rule_identifier(*components: object) -> str:
+    payload = json.dumps(components, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+
+
+def _frozen_string_tuple(value: object) -> tuple[str, ...] | None:
+    """Narrow frozen JSON arrays before comparing typed fact identities."""
+
+    if not isinstance(value, (list, tuple)) or any(not isinstance(item, str) for item in value):
+        return None
+    return tuple(cast(str, item) for item in value)
+
+
 def _request_payload(request: ValidatedActionRequest) -> dict[str, object]:
     payload = request.model_dump(mode="json")
     payload["status"] = "PENDING"
@@ -440,7 +471,7 @@ def _active_team_chat_window(state: GameState) -> ActionWindow:
             window = _load_action_window(raw)
         except ValueError as exc:
             raise EventCommitError("WINDOW_INVALID: installed action window is malformed") from exc
-        if window.phase is GamePhase.NIGHT_TEAM_CHAT and window.closed_at is None:
+        if window.phase is GamePhase.NIGHT_TEAM_CHAT and window.accepts_submissions:
             if window.game_id != state.game_id:
                 raise EventCommitError("GAME_MISMATCH: team window belongs to another game")
             candidates.append(window)
@@ -635,8 +666,12 @@ def _state_data(state: GameState) -> dict[str, Any]:
     data = state.model_dump(mode="python", exclude={"vote_state"}, warnings=False)
     # ``GameState`` freezes nested JSON arrays as tuples in memory.  The
     # extension fields are persisted JSON and must be converted back to lists
-    # before a replacement model is validated; typed event records stay in
-    # Python form so their protocol models are preserved.
+    # before a replacement model is validated. JSON event records are thawed
+    # the same way while typed protocol records stay in Python form.
+    data["events"] = tuple(
+        event if isinstance(event, GameEvent) else json.loads(json.dumps(event))
+        for event in state.events
+    )
     for field_name in (
         "action_windows",
         "action_requests",
@@ -665,10 +700,14 @@ def _rule_state_payload(value: RuleStateValue) -> dict[str, object]:
         "schema_version": value.schema_version,
         "scope": value.scope,
         "scope_id": value.scope_id,
+        "skill_id": value.skill_id,
         "key": value.key,
         "value_type": value.value_type,
         "value": json.loads(json.dumps(value.value)),
         "source_batch_id": value.source_batch_id,
+        "expiry_policy": value.expiry_policy,
+        "expires_at_round": value.expires_at_round,
+        "expires_at_hook": value.expires_at_hook,
     }
 
 
@@ -698,6 +737,7 @@ def _rule_ledger_payload(value: RuleLedgerEntry) -> dict[str, object]:
                 "source_request_id": item.source_request_id,
                 "actor_seat": item.actor_seat,
                 "target_seat": item.target_seat,
+                "death_cause": item.death_cause,
                 "tags": item.tags,
                 "data": json.loads(json.dumps(item.data)),
             }
@@ -988,6 +1028,10 @@ def _reduce_action_request(
             "IDEMPOTENCY_CONFLICT",
             "request_id was already committed with a different request payload",
         )
+
+    raw_window = state.action_windows.get(request.window_id)
+    if raw_window is not None and not _load_action_window(raw_window).accepts_submissions:
+        raise ActionValidationError("WINDOW_CLOSED", "action window no longer accepts new requests")
 
     data = _state_data(state)
     action_requests = dict(data["action_requests"])
@@ -2135,7 +2179,9 @@ class GameManager:
                 migrated_data["ability_instances"] = instances
                 migrated_data["rule_state"] = tuple(
                     _rule_state_payload(item)
-                    for item in build_initial_rule_state(execution_package, instances)
+                    for item in build_initial_rule_state(
+                        execution_package, instances, seats=tuple(state.players)
+                    )
                 )
                 state = GameState.model_validate(migrated_data)
         self._state = state
@@ -2146,6 +2192,7 @@ class GameManager:
             RuleExecutionAdapter(
                 execution_package,
                 action_registry_digest=_action_registry_digest(registry),
+                legacy_compatibility=legacy_compatibility,
             )
             if execution_package is not None
             else None
@@ -2182,6 +2229,7 @@ class GameManager:
         request_ids: Iterable[str],
         *,
         timing: str,
+        group_id_override: str | None = None,
     ) -> tuple[tuple[SkillRequest, ...], tuple[_RuleRequestBinding, ...], str]:
         """Bind stored, window-authorized intents to frozen skill instances."""
 
@@ -2200,7 +2248,7 @@ class GameManager:
             separators=(",", ":"),
         )
         group_digest = hashlib.sha256(group_identity.encode("utf-8")).hexdigest()
-        group_id = f"{timing.lower()}:{state.round_no}:{group_digest}"
+        group_id = group_id_override or f"{timing.lower()}:{state.round_no}:{group_digest}"
         for request_id in sorted_request_ids:
             request = _stored_action_request(state, request_id)
             raw = state.action_requests.get(request_id)
@@ -2230,7 +2278,11 @@ class GameManager:
                 raise ResolutionError(
                     "ROLE_NOT_ALLOWED", "request actor role is outside its frozen window"
                 )
-            trigger_action = _is_trigger_window_state(state, window, require_bound=True)
+            rule_occurrence = self._rule_occurrence_for_window(state, window)
+            trigger_action = (
+                _is_trigger_window_state(state, window, require_bound=True)
+                or rule_occurrence is not None
+            )
             if window.phase is GamePhase.TRIGGER_ACTION and not trigger_action:
                 raise ResolutionError("TRIGGER_ACTION_INVALID", "trigger window is no longer bound")
             if not player.alive and not trigger_action:
@@ -2266,6 +2318,7 @@ class GameManager:
                         timing,
                         allowed_codes=set(window.allowed_action_codes),
                         trigger_only=trigger_action,
+                        logical_window_id=window.logical_window_id,
                     )
                     completed = self._rule_completed_skill_ids(state, window)
                     pass_skills = tuple(
@@ -2327,7 +2380,11 @@ class GameManager:
                         raise ResolutionError(
                             "TRIGGER_ACTION_INVALID", "trigger skill outside its bound window"
                         )
-                    if instance.grant_kind == "ACTIVE" and trigger_action:
+                    if (
+                        instance.grant_kind == "ACTIVE"
+                        and trigger_action
+                        and rule_occurrence is None
+                    ):
                         raise ResolutionError(
                             "ABILITY_NOT_GRANTED", "active skill cannot replace a trigger grant"
                         )
@@ -2339,6 +2396,16 @@ class GameManager:
                         raise ResolutionError(
                             "ABILITY_NOT_GRANTED",
                             "skill instance does not match the frozen package",
+                        )
+                    if rule_occurrence is not None and (
+                        rule_occurrence.actor_seat != request.seat
+                        or rule_occurrence.ability_instance_id != instance.ability_instance_id
+                        or rule_occurrence.skill_id != skill.skill_id
+                        or action.action_code not in {skill.action_code, 299}
+                    ):
+                        raise ResolutionError(
+                            "RULE_OCCURRENCE_INVALID",
+                            "trigger request does not match its durable occurrence binding",
                         )
                     if action.action_code != 299:
                         completed = self._rule_completed_skill_ids(state, window)
@@ -2369,6 +2436,13 @@ class GameManager:
                         raise ResolutionError(
                             "TARGET_NOT_ALLOWED", "target is outside the frozen candidate list"
                         )
+                    if rule_occurrence is not None:
+                        authorized = set(self._trigger_target_seats(state, rule_occurrence, skill))
+                        if any(target not in authorized for target in action.targets):
+                            raise ResolutionError(
+                                "TARGET_NOT_ALLOWED",
+                                "trigger target is outside the frozen selector result",
+                            )
                 for bound_instance, bound_skill in pass_binding_values:
                     request_key = (
                         "rule-"
@@ -2387,6 +2461,29 @@ class GameManager:
                         parameters={} if action.action_code == 299 else action.parameters,
                         passed=action.action_code == 299,
                         origin="PLAYER",
+                        trigger_occurrence_id=(
+                            rule_occurrence.occurrence_id if rule_occurrence is not None else None
+                        ),
+                        source_fact_id=(
+                            rule_occurrence.source_fact_id if rule_occurrence is not None else None
+                        ),
+                        window_id=(
+                            window.window_id
+                            if rule_occurrence is not None
+                            or bound_skill.trigger is not None
+                            or bound_skill.window_ids
+                            or bound_skill.hook_ids
+                            else None
+                        ),
+                        logical_window_id=(
+                            window.logical_window_id
+                            if rule_occurrence is not None
+                            or bound_skill.trigger is not None
+                            or bound_skill.window_ids
+                            or bound_skill.hook_ids
+                            else None
+                        ),
+                        hook_id=window.hook_id,
                     )
                     bindings.append(
                         _RuleRequestBinding(
@@ -2533,31 +2630,191 @@ class GameManager:
                 "RULE_BATCH_INVALID", "batch mortality has duplicate or unknown seats"
             )
         declarations = {(item.skill_id, item.key): item for item in package.state_declarations}
-        seen_updates: set[tuple[str, str]] = set()
+        seen_updates: set[tuple[str, str | None, str, str]] = set()
+        applied_effect_sources = {
+            (item.source_request_id, item.source_rule_id, item.effect_type)
+            for item in batch.effects
+            if item.applied
+        }
         for update in batch.state_updates:
             state_request = request_by_id.get(update.source_request_id)
             instance = next(
                 (
                     item
                     for item in state.ability_instances
-                    if item.ability_instance_id == update.ability_instance_id
+                    if item.ability_instance_id == update.source_ability_instance_id
                 ),
                 None,
+            )
+            declaration = declarations.get((update.skill_id, update.key))
+            owner = (
+                update.ability_instance_id
+                if update.scope == "ABILITY"
+                else f"seat-{update.seat}"
+                if update.scope == "SEAT"
+                else None
             )
             if (
                 state_request is None
                 or instance is None
-                or state_request.ability_instance_id != update.ability_instance_id
+                or state_request.ability_instance_id != update.source_ability_instance_id
+                or state_request.actor_seat != instance.actor_seat
+                or state_request.skill_id != update.skill_id
                 or instance.skill_id != update.skill_id
-                or (update.skill_id, update.key) not in declarations
+                or declaration is None
+                or declaration.scope != update.scope
+                or declaration.expiry_policy != update.expiry_policy
+                or (update.scope == "ABILITY" and owner != instance.ability_instance_id)
+                or (
+                    update.scope == "SEAT"
+                    and update.seat != instance.actor_seat
+                    and update.seat not in update.authorized_targets
+                )
+                or (update.scope == "GAME" and update.seat is not None)
+                or (
+                    update.source_request_id,
+                    update.source_rule_id,
+                    "STATE_SET",
+                )
+                not in applied_effect_sources
             ):
                 raise ResolutionError(
                     "RULE_STATE_INVALID", "state update is outside declared skill state"
                 )
-            signature = (update.ability_instance_id, update.key)
+            signature = (update.scope, owner, update.skill_id, update.key)
             if signature in seen_updates:
                 raise ResolutionError("RULE_STATE_INVALID", "duplicate state update")
             seen_updates.add(signature)
+
+        def validate_typed_source(
+            source_request_id: str,
+            source_rule_id: str,
+            source_skill_id: str,
+            source_ability_instance_id: str,
+            effect_type: str,
+        ) -> tuple[SkillRequest, AbilityInstanceState]:
+            source_request = request_by_id.get(source_request_id)
+            source_instance = next(
+                (
+                    item
+                    for item in state.ability_instances
+                    if item.ability_instance_id == source_ability_instance_id
+                ),
+                None,
+            )
+            if (
+                source_request is None
+                or source_instance is None
+                or source_request.ability_instance_id != source_ability_instance_id
+                or source_request.skill_id != source_skill_id
+                or source_instance.skill_id != source_skill_id
+                or (source_request_id, source_rule_id, effect_type) not in applied_effect_sources
+            ):
+                raise ResolutionError(
+                    "RULE_PROVENANCE_INVALID", "typed update source is not an applied frozen effect"
+                )
+            return source_request, source_instance
+
+        for player_update in batch.player_updates:
+            player_request, player_source = validate_typed_source(
+                player_update.source_request_id,
+                player_update.source_rule_id,
+                player_update.source_skill_id,
+                player_update.source_ability_instance_id,
+                "PLAYER_FIELD_SET",
+            )
+            if (
+                player_update.seat not in state.players
+                or player_request.actor_seat != player_source.actor_seat
+                or player_update.seat != player_source.actor_seat
+                and player_update.seat not in player_update.authorized_targets
+            ):
+                raise ResolutionError(
+                    "RULE_TARGET_INVALID", "player field update target is not authorized"
+                )
+        for resource_update in batch.resource_updates:
+            resource_request, resource_source = validate_typed_source(
+                resource_update.source_request_id,
+                resource_update.source_rule_id,
+                resource_update.source_skill_id,
+                resource_update.source_ability_instance_id,
+                "RESOURCE_DELTA",
+            )
+            if (
+                resource_update.seat not in state.players
+                or resource_request.actor_seat != resource_source.actor_seat
+                or resource_update.seat != resource_source.actor_seat
+                and resource_update.seat not in resource_update.authorized_targets
+                or resource_update.resource_id
+                not in {item.resource_id for item in package.resource_declarations}
+            ):
+                raise ResolutionError(
+                    "RULE_TARGET_INVALID", "resource update target or declaration is invalid"
+                )
+        for relation_update in batch.relation_updates:
+            relation_request, relation_source = validate_typed_source(
+                relation_update.source_request_id,
+                relation_update.source_rule_id,
+                relation_update.source_skill_id,
+                relation_update.source_ability_instance_id,
+                "RELATION_ADD" if relation_update.operation == "ADD" else "RELATION_REMOVE",
+            )
+            if (
+                relation_update.relation_type
+                not in {item.relation_type for item in package.relation_declarations}
+                or any(
+                    seat not in state.players
+                    for seat in (relation_update.source_seat, relation_update.target_seat)
+                )
+                or relation_request.actor_seat != relation_source.actor_seat
+                or any(
+                    seat != relation_source.actor_seat
+                    and seat not in relation_update.authorized_targets
+                    for seat in (relation_update.source_seat, relation_update.target_seat)
+                )
+            ):
+                raise ResolutionError(
+                    "RULE_TARGET_INVALID", "relation update target or declaration is invalid"
+                )
+        for ability_update in batch.ability_updates:
+            ability_request, ability_source = validate_typed_source(
+                ability_update.source_request_id,
+                ability_update.source_rule_id,
+                ability_update.source_skill_id,
+                ability_update.source_ability_instance_id,
+                "ABILITY_GRANT" if ability_update.operation == "GRANT" else "ABILITY_REVOKE",
+            )
+            target_skill = skills.get(ability_update.skill_id)
+            if (
+                target_skill is None
+                or ability_update.grant_id not in {item.grant_id for item in target_skill.grants}
+                or ability_update.target_seat not in state.players
+                or ability_request.actor_seat != ability_source.actor_seat
+                or ability_update.target_seat != ability_source.actor_seat
+                and ability_update.target_seat not in ability_update.authorized_targets
+                or ability_update.operation == "GRANT"
+                and not ability_update.ability_instance_id
+                or ability_update.operation == "REVOKE"
+                and ability_update.ability_instance_id is not None
+            ):
+                raise ResolutionError(
+                    "ABILITY_UPDATE_INVALID", "ability update is outside frozen authorization"
+                )
+        for flow_update in batch.flow_updates:
+            flow_request, _flow_source = validate_typed_source(
+                flow_update.source_request_id,
+                flow_update.source_rule_id,
+                flow_update.source_skill_id,
+                flow_update.source_ability_instance_id,
+                "FLOW",
+            )
+            if (
+                flow_request.hook_id != flow_update.hook_id
+                or flow_request.logical_window_id != flow_update.logical_window_id
+            ):
+                raise ResolutionError(
+                    "RULE_FLOW_INVALID", "flow update is detached from its bound request hook"
+                )
         for cost in batch.cost_updates:
             cost_request = request_by_id.get(cost.source_request_id)
             instance = next(
@@ -2587,10 +2844,30 @@ class GameManager:
                 raise ResolutionError(
                     "RULE_COST_INVALID", "cost update is outside declared skill usage"
                 )
-        if timing not in {timing for skill in package.skills for timing in skill.timing}:
+        declared_timings = {
+            skill_timing for skill in package.skills for skill_timing in skill.timing
+        }
+        trusted_speech_hook_timing = (
+            timing == GamePhase.TRIGGER_ACTION.value
+            and bool(requests)
+            and all(self._is_trusted_speech_hook_request(state, request) for request in requests)
+        )
+        if requests and timing not in declared_timings and not trusted_speech_hook_timing:
             raise ResolutionError(
                 "RULE_TIMING_INVALID", "batch timing is not declared by the package"
             )
+        if not requests and not any(row.phase == timing for row in package.window_metadata):
+            legacy_window_proof = not package.window_metadata and any(
+                isinstance(raw_window, Mapping)
+                and (raw_window.get("settlement_group_id") or raw_window.get("window_id"))
+                == group_id
+                and raw_window.get("phase") == timing
+                for raw_window in state.action_windows.values()
+            )
+            if not legacy_window_proof:
+                raise ResolutionError(
+                    "RULE_TIMING_INVALID", "empty batch timing has no frozen action window"
+                )
 
     def _rule_projection_events(
         self,
@@ -2600,6 +2877,10 @@ class GameManager:
         *,
         timestamp: datetime,
         next_revision: int,
+        hook_id: str | None = None,
+        logical_window_id: str | None = None,
+        validate_only: bool = False,
+        frozen_team_audiences: Mapping[str, tuple[int, ...]] | None = None,
     ) -> tuple[GameEvent, ...]:
         """Render only package-authorized, independently checked disclosure projections."""
 
@@ -2661,14 +2942,20 @@ class GameManager:
                     "RULE_DISCLOSURE_INVALID", "ALL disclosure recipient mismatch"
                 )
             if projection.audience == "TEAM":
-                actor_groups = set(state.players[request.actor_seat].chat_group_ids)
-                expected = tuple(
-                    sorted(
-                        seat
-                        for seat, player in state.players.items()
-                        if actor_groups.intersection(player.chat_group_ids)
-                    )
-                ) or (request.actor_seat,)
+                expected = (
+                    frozen_team_audiences.get(request.request_id)
+                    if frozen_team_audiences is not None
+                    else None
+                )
+                if expected is None:
+                    actor_groups = set(state.players[request.actor_seat].chat_group_ids)
+                    expected = tuple(
+                        sorted(
+                            seat
+                            for seat, player in state.players.items()
+                            if actor_groups.intersection(player.chat_group_ids)
+                        )
+                    ) or (request.actor_seat,)
                 if seats != expected:
                     raise ResolutionError(
                         "RULE_DISCLOSURE_INVALID", "TEAM disclosure exceeds authorized chat seats"
@@ -2680,6 +2967,17 @@ class GameManager:
                 if projection.audience == "TEAM"
                 else Channel.PRIVATE
             )
+            is_due = (
+                projection.hook == "immediate"
+                or hook_id is None
+                or projection.hook == hook_id
+                or projection.hook == logical_window_id
+                or projection.hook == request.logical_window_id
+                or projection.hook == request.hook_id
+                or projection.hook == state.phase.value
+            )
+            if validate_only or not is_due:
+                continue
             event_type = EventType(projection.event_type or projection.disclosure_id)
             encoded = json.dumps(projection.fields, sort_keys=True, separators=(",", ":"))
             for seat in seats if channel is Channel.PRIVATE else (None,):
@@ -2764,6 +3062,83 @@ class GameManager:
                 next_id += 1
         return tuple(output)
 
+    def _deferred_rule_disclosures(
+        self,
+        state: GameState,
+        batch: ResolutionBatch,
+        requests: tuple[SkillRequest, ...],
+        *,
+        timing: str,
+    ) -> tuple[RuleDeferredDisclosure, ...]:
+        """Freeze valid projections whose declared hook is later than this commit."""
+
+        request_by_id = {item.request_id: item for item in requests}
+        # Validate every projection before it can enter persistent deferred state.
+        self._rule_projection_events(
+            state,
+            batch,
+            requests,
+            timestamp=state.updated_at,
+            next_revision=state.state_revision + 1,
+            hook_id=timing,
+            validate_only=True,
+        )
+        existing_ids = {item.delivery_id for item in state.rule_deferred_disclosures}
+        output: list[RuleDeferredDisclosure] = []
+        for projection in batch.disclosures:
+            request = request_by_id.get(projection.source_request_id)
+            if request is None:
+                raise ResolutionError(
+                    "RULE_DISCLOSURE_INVALID", "disclosure has unknown request provenance"
+                )
+            if projection.hook in {
+                "immediate",
+                timing,
+                request.logical_window_id,
+                request.hook_id,
+                state.phase.value,
+            }:
+                continue
+            delivery_id = _stable_rule_identifier(
+                "disclosure",
+                batch.package_id,
+                batch.batch_id,
+                projection.source_request_id,
+                projection.disclosure_id,
+            )
+            if delivery_id in existing_ids:
+                continue
+            output.append(
+                RuleDeferredDisclosure(
+                    delivery_id=delivery_id,
+                    package_id=batch.package_id,
+                    source_batch_id=batch.batch_id,
+                    source_request_id=request.request_id,
+                    source_revision=state.state_revision,
+                    source_round_no=state.round_no,
+                    source_phase=state.phase,
+                    source_window_id=request.window_id,
+                    source_logical_window_id=request.logical_window_id,
+                    actor_seat=request.actor_seat,
+                    ability_instance_id=request.ability_instance_id,
+                    action_code=request.action_code,
+                    skill_id=projection.skill_id,
+                    disclosure_id=projection.disclosure_id,
+                    audience=projection.audience,
+                    recipients=tuple(sorted(set(projection.recipients))),
+                    source_team_roster=(
+                        tuple(sorted(set(projection.recipients)))
+                        if projection.audience == "TEAM"
+                        else ()
+                    ),
+                    fields=json.loads(json.dumps(projection.fields)),
+                    hook=projection.hook,
+                    event_type=projection.event_type,
+                )
+            )
+            existing_ids.add(delivery_id)
+        return tuple(output)
+
     async def publish_rule_dependency_disclosures(
         self,
         seat: int,
@@ -2808,6 +3183,7 @@ class GameManager:
                 seat,
                 GamePhase.NIGHT_ACTION.value,
                 allowed_codes=set(window.allowed_action_codes),
+                logical_window_id=window.logical_window_id,
             )
             needed = {
                 predecessor for _instance, skill in active for predecessor in skill.after_skills
@@ -2869,6 +3245,984 @@ class GameManager:
             self._state = committed
             return committed
 
+    def _release_due_rule_disclosures(
+        self,
+        state: GameState,
+        hook_id: str,
+        logical_window_id: str | None,
+        *,
+        timestamp: datetime,
+        next_revision: int,
+    ) -> GameState:
+        """Append one exact-hook disclosure batch and remove it atomically."""
+
+        due = tuple(
+            item
+            for item in state.rule_deferred_disclosures
+            if item.hook == hook_id or item.hook == logical_window_id
+        )
+        if not due:
+            return state
+        package = self._execution_package
+        if package is None or state.execution_identity is None:
+            raise ResolutionError(
+                "RULE_PACKAGE_MISSING", "deferred disclosure has no pinned execution package"
+            )
+        if any(item.package_id != package.package_id for item in due):
+            raise ResolutionError(
+                "RULE_DISCLOSURE_INVALID", "deferred disclosure package identity changed"
+            )
+        projections = tuple(
+            DisclosureProjection(
+                disclosure_id=item.disclosure_id,
+                source_request_id=item.source_request_id,
+                skill_id=item.skill_id,
+                audience=item.audience,
+                recipients=item.recipients,
+                fields=json.loads(json.dumps(item.fields)),
+                hook=item.hook,
+                event_type=item.event_type,
+            )
+            for item in due
+        )
+        requests = tuple(
+            SkillRequest(
+                request_id=item.source_request_id,
+                ability_instance_id=item.ability_instance_id,
+                skill_id=item.skill_id,
+                action_code=item.action_code,
+                actor_seat=item.actor_seat,
+                origin="PLAYER",
+                window_id=item.source_window_id,
+                logical_window_id=item.source_logical_window_id,
+                hook_id=(
+                    cast(RuleHook, item.hook)
+                    if item.hook in {"DAY_SPEECH_BEFORE", "DAY_SPEECH_AFTER"}
+                    else None
+                ),
+            )
+            for item in due
+        )
+        synthetic_batch = ResolutionBatch(
+            batch_id=due[0].source_batch_id,
+            package_id=due[0].package_id,
+            board_id=state.execution_identity.board_id,
+            board_version=state.execution_identity.board_version,
+            read_revision=due[0].source_revision,
+            round_number=due[0].source_round_no,
+            group_id=due[0].source_batch_id,
+            dispositions=(),
+            disclosures=projections,
+        )
+        events = self._rule_projection_events(
+            state,
+            synthetic_batch,
+            requests,
+            timestamp=timestamp,
+            next_revision=next_revision,
+            hook_id=hook_id,
+            logical_window_id=logical_window_id,
+            frozen_team_audiences={
+                item.source_request_id: item.source_team_roster
+                for item in due
+                if item.audience == "TEAM"
+            },
+        )
+        if events:
+            _validate_new_events(state, events, next_revision=next_revision)
+        due_ids = {item.delivery_id for item in due}
+        data = _state_data(state)
+        data["rule_deferred_disclosures"] = tuple(
+            item.model_dump(mode="python")
+            for item in state.rule_deferred_disclosures
+            if item.delivery_id not in due_ids
+        )
+        data["events"] = (*_typed_events(state), *events)
+        data["state_revision"] = next_revision
+        data["updated_at"] = timestamp
+        return GameState.model_validate(data)
+
+    async def publish_due_rule_disclosures(
+        self,
+        hook_id: str,
+        logical_window_id: str | None = None,
+        *,
+        expected_revision: int | None = None,
+        now: datetime | None = None,
+    ) -> GameState:
+        """Publish fixed rule projections at their exact declared hook once.
+
+        ``hook_id`` is a frozen phase value, logical window ID, or day-speech
+        hook. A logical-window caller supplies the same ID in both positional
+        fields so a projection cannot be released by a neighboring window.
+        Queue removal and event append share one state revision, making restore
+        and retry idempotent.
+        """
+
+        if not isinstance(hook_id, str) or not hook_id:
+            raise TypeError("hook_id must be a non-empty string")
+        if logical_window_id is not None and (
+            not isinstance(logical_window_id, str) or not logical_window_id
+        ):
+            raise TypeError("logical_window_id must be a non-empty string")
+        timestamp = _aware_commit_time(now)
+        async with self._lock:
+            state = self._state
+            revision = state.state_revision if expected_revision is None else expected_revision
+            _revision_check(state, revision)
+            due = tuple(
+                item
+                for item in state.rule_deferred_disclosures
+                if item.hook == hook_id or item.hook == logical_window_id
+            )
+            if not due:
+                return state
+            package = self._execution_package
+            if package is None or state.execution_identity is None:
+                raise ResolutionError(
+                    "RULE_PACKAGE_MISSING", "deferred disclosure has no pinned execution package"
+                )
+            if any(item.package_id != package.package_id for item in due):
+                raise ResolutionError(
+                    "RULE_DISCLOSURE_INVALID", "deferred disclosure package identity changed"
+                )
+            declared_hooks = (
+                {item.window_id for item in package.window_metadata}
+                | {phase.value for phase in GamePhase}
+                | {
+                    "DAY_SPEECH_BEFORE",
+                    "DAY_SPEECH_AFTER",
+                }
+            )
+            if hook_id not in declared_hooks:
+                raise ResolutionError(
+                    "RULE_DISCLOSURE_INVALID", "publication hook is not frozen by the package"
+                )
+            if hook_id in {"DAY_SPEECH_BEFORE", "DAY_SPEECH_AFTER"}:
+                if (
+                    state.phase is not GamePhase.DAY_SPEECH
+                    or state.pending_resolution is not None
+                    or state.serial_turn is not None
+                    or any(item.is_pending for item in state.rule_boundaries)
+                    or (
+                        isinstance(state.sheriff_badge, Mapping)
+                        and state.sheriff_badge.get("status") == "OPEN"
+                    )
+                ):
+                    raise ResolutionError(
+                        "RULE_HOOK_NOT_ALLOWED", "day-speech disclosure hook is not active"
+                    )
+                if hook_id == "DAY_SPEECH_BEFORE" and not state.current_queue:
+                    raise ResolutionError(
+                        "RULE_HOOK_NOT_ALLOWED", "BEFORE hook requires an ordinary queue head"
+                    )
+                if hook_id == "DAY_SPEECH_AFTER":
+                    last_turn = state.last_serial_turn
+                    if last_turn is None or not any(
+                        event.event_id in last_turn.event_ids
+                        and event.event_type is EventType.SPEECH
+                        and event.phase is GamePhase.DAY_SPEECH
+                        and event.actor_seat == last_turn.seat
+                        for event in _typed_events(state)
+                    ):
+                        raise ResolutionError(
+                            "RULE_HOOK_NOT_ALLOWED",
+                            "AFTER hook requires the exact committed ordinary speech turn",
+                        )
+            elif logical_window_id is not None:
+                if hook_id != logical_window_id:
+                    raise ResolutionError(
+                        "RULE_HOOK_NOT_ALLOWED", "logical-window hook ID must match its window"
+                    )
+                row = next(
+                    (item for item in package.window_metadata if item.window_id == hook_id),
+                    None,
+                )
+                if row is None or state.phase.value != row.phase:
+                    raise ResolutionError(
+                        "RULE_HOOK_NOT_ALLOWED", "logical-window disclosure is outside its phase"
+                    )
+                installed = tuple(
+                    _load_action_window(raw)
+                    for raw in state.action_windows.values()
+                    if isinstance(raw, Mapping) and raw.get("logical_window_id") == hook_id
+                )
+                if not installed or not any(
+                    item.phase.value == row.phase and item.closed_at is None for item in installed
+                ):
+                    raise ResolutionError(
+                        "RULE_HOOK_NOT_ALLOWED", "logical-window disclosure has no active window"
+                    )
+            else:
+                try:
+                    expected_phase = GamePhase(hook_id)
+                except ValueError as exc:
+                    raise ResolutionError(
+                        "RULE_HOOK_NOT_ALLOWED", "publication hook is not an active phase"
+                    ) from exc
+                if state.phase is not expected_phase:
+                    raise ResolutionError(
+                        "RULE_HOOK_NOT_ALLOWED", "phase disclosure hook is not the active phase"
+                    )
+            committed = self._release_due_rule_disclosures(
+                state,
+                hook_id,
+                logical_window_id,
+                timestamp=timestamp,
+                next_revision=revision + 1,
+            )
+            self._state = committed
+            return committed
+
+    def _rule_return_point(
+        self,
+        state: GameState,
+        requests: tuple[SkillRequest, ...],
+        bindings: tuple[_RuleRequestBinding, ...],
+    ) -> RuleReturnPoint:
+        """Bind workflow resumption to the active speech turn or next frozen window."""
+
+        cursor = state.rule_workflow_cursor
+        if (
+            cursor is not None
+            and cursor.status in {"DRAINING", "WAITING_CHOICE", "WAITING_BOUNDARY"}
+            and cursor.return_point is not None
+        ):
+            return cursor.return_point
+        if (
+            cursor is not None
+            and cursor.status == "COLLECTING"
+            and state.phase is GamePhase.TRIGGER_ACTION
+            and cursor.return_point is not None
+            and cursor.active_occurrence_id is not None
+            and all(
+                request.trigger_occurrence_id == cursor.active_occurrence_id
+                and request.source_fact_id is not None
+                for request in requests
+            )
+            and bool(requests)
+            and all(
+                (
+                    window := self._window_for_request(
+                        state, _stored_action_request(state, binding.request_id)
+                    )
+                ).window_id
+                in cursor.active_window_ids
+                and (occurrence := self._rule_occurrence_for_window(state, window)) is not None
+                and occurrence.occurrence_id == cursor.active_occurrence_id
+                for binding in bindings
+            )
+        ):
+            # Completing an installed rule choice temporarily changes the
+            # cursor to COLLECTING. Preserve its original source return point
+            # only when the active occurrence and physical window prove that
+            # this collection is the same trigger workflow.
+            return cursor.return_point
+        if state.serial_turn is not None:
+            turn = state.serial_turn
+            request_hook = next((item.hook_id for item in requests if item.hook_id), None)
+            return RuleReturnPoint(
+                phase=GamePhase.DAY_SPEECH,
+                hook_id=request_hook,
+                speaker_seat=turn.seat,
+                serial_turn_id=turn.request_id,
+                event_ids=turn.event_ids,
+                day_no=state.day_no,
+            )
+
+        current_windows = tuple(
+            self._window_for_request(state, _stored_action_request(state, binding.request_id))
+            for binding in bindings
+        )
+        settlement_group_id = cursor.settlement_group_id if cursor is not None else None
+        if (
+            cursor is not None
+            and cursor.status == "COLLECTING"
+            and settlement_group_id is not None
+            and current_windows
+            and all(
+                (window.settlement_group_id or window.window_id) == settlement_group_id
+                for window in current_windows
+            )
+        ):
+            grouped = tuple(
+                _load_action_window(raw)
+                for raw in state.action_windows.values()
+                if isinstance(raw, Mapping)
+                and (raw.get("settlement_group_id") or raw.get("window_id")) == settlement_group_id
+            )
+            if grouped:
+                current_windows = grouped
+        elif (
+            not current_windows
+            and cursor is not None
+            and cursor.status == "COLLECTING"
+            and settlement_group_id is not None
+            and cursor.active_window_ids
+        ):
+            # Empty frozen windows have no request bindings from which to
+            # derive their successor. Use only the physical windows recorded
+            # by the live collecting cursor, and require the full set to
+            # still belong to its settlement group. An IDLE cursor may retain
+            # an older group's fields and is deliberately not a source here.
+            active_windows = tuple(
+                _load_action_window(state.action_windows[window_id])
+                for window_id in cursor.active_window_ids
+                if window_id in state.action_windows
+            )
+            if len(active_windows) == len(cursor.active_window_ids) and all(
+                (window.settlement_group_id or window.window_id) == settlement_group_id
+                for window in active_windows
+            ):
+                current_windows = active_windows
+        if not current_windows:
+            return RuleReturnPoint(phase=state.phase, day_no=state.day_no)
+        window = current_windows[0]
+        if window.phase in {
+            GamePhase.NIGHT_TEAM_CHAT,
+            GamePhase.NIGHT_ACTION,
+            GamePhase.NIGHT_RESOLVE,
+        }:
+            metadata = (
+                self._execution_package.window_metadata
+                if self._execution_package is not None
+                else ()
+            )
+            rows = {item.window_id: item for item in metadata}
+            window = max(
+                current_windows,
+                key=lambda item: (
+                    rows[item.logical_window_id].order if item.logical_window_id in rows else 0
+                ),
+            )
+            next_id = window.next_window_id
+            next_row = next((item for item in metadata if item.window_id == next_id), None)
+            return RuleReturnPoint(
+                phase=GamePhase(next_row.phase) if next_row is not None else GamePhase.DAY_ANNOUNCE,
+                window_id=window.window_id,
+                logical_window_id=next_id,
+                day_no=state.day_no,
+            )
+        return RuleReturnPoint(
+            phase=state.phase,
+            hook_id=window.hook_id,
+            window_id=window.window_id,
+            logical_window_id=window.logical_window_id,
+            day_no=state.day_no,
+        )
+
+    def _ordinary_speech_hook_source(
+        self,
+        state: GameState,
+        hook_id: RuleHook,
+    ) -> tuple[str, RuleReturnPoint]:
+        """Prove a BEFORE queue head or completed ordinary AFTER speech source."""
+
+        if state.phase is not GamePhase.DAY_SPEECH:
+            raise EventCommitError("RULE_HOOK_NOT_ALLOWED: speech hook requires DAY_SPEECH")
+        election_status = (
+            state.sheriff_election.get("status")
+            if isinstance(state.sheriff_election, Mapping)
+            else None
+        )
+        if (
+            state.pending_resolution is not None
+            or any(item.is_pending for item in state.rule_boundaries)
+            or (
+                isinstance(state.sheriff_badge, Mapping)
+                and state.sheriff_badge.get("status") == "OPEN"
+            )
+            or election_status in {"SPEECH", "VOTING", "WAITING_GM"}
+        ):
+            raise EventCommitError(
+                "RULE_HOOK_NOT_ALLOWED: speech hooks are closed during a special boundary"
+            )
+        if hook_id == "DAY_SPEECH_BEFORE":
+            if state.serial_turn is not None or not state.current_queue:
+                raise EventCommitError(
+                    "RULE_HOOK_NOT_ALLOWED: BEFORE requires an unstarted ordinary queue head"
+                )
+            speaker = state.current_queue[0]
+            source_id = _stable_rule_identifier(
+                "speech-before",
+                state.game_id,
+                state.day_no,
+                speaker,
+                ",".join(str(item) for item in state.current_queue),
+            )
+            return source_id, RuleReturnPoint(
+                phase=GamePhase.DAY_SPEECH,
+                hook_id=hook_id,
+                speaker_seat=speaker,
+                serial_turn_id=f"before-{source_id}",
+                day_no=state.day_no,
+            )
+
+        if hook_id != "DAY_SPEECH_AFTER" or state.serial_turn is not None:
+            raise EventCommitError(
+                "RULE_HOOK_NOT_ALLOWED: AFTER requires a completed ordinary speech turn"
+            )
+        last_turn = state.last_serial_turn
+        if last_turn is None:
+            raise EventCommitError(
+                "RULE_HOOK_NOT_ALLOWED: AFTER has no completed ordinary speech reference"
+            )
+        speech = next(
+            (
+                event
+                for event in _typed_events(state)
+                if event.event_id in last_turn.event_ids
+                and event.event_type is EventType.SPEECH
+                and event.phase is GamePhase.DAY_SPEECH
+                and event.actor_seat == last_turn.seat
+            ),
+            None,
+        )
+        if speech is None:
+            raise EventCommitError(
+                "RULE_HOOK_NOT_ALLOWED: AFTER source is not an ordinary speech event"
+            )
+        source_id = _stable_rule_identifier(
+            "speech-after",
+            state.game_id,
+            state.day_no,
+            last_turn.request_id,
+            ",".join(str(item) for item in last_turn.event_ids),
+        )
+        return source_id, RuleReturnPoint(
+            phase=GamePhase.DAY_SPEECH,
+            hook_id=hook_id,
+            speaker_seat=last_turn.seat,
+            serial_turn_id=last_turn.request_id,
+            event_ids=last_turn.event_ids,
+            day_no=state.day_no,
+        )
+
+    def _speech_hook_occurrences(
+        self,
+        state: GameState,
+        hook_id: RuleHook,
+        *,
+        source_id: str,
+    ) -> tuple[RuleTriggerOccurrence, ...]:
+        """Build only frozen PLAYER hook choices bound to one speech source."""
+
+        package = self._execution_package
+        if package is None:
+            return ()
+        skills = {item.skill_id: item for item in package.skills}
+        start_order = max((item.order for item in state.rule_trigger_queue), default=-1) + 1
+        eligible_instances = {
+            instance.ability_instance_id: (instance, skill)
+            for seat in sorted(state.players)
+            for instance, skill in self._rule_skill_instances(
+                state,
+                seat,
+                GamePhase.DAY_SPEECH.value,
+            )
+        }
+        if self._rules is None:
+            return ()
+        try:
+            observation = self._rules.observation(
+                state,
+                group_id=f"speech-hook:{state.game_id}:{state.day_no}:{hook_id}:{source_id}",
+                timing=GamePhase.DAY_SPEECH.value,
+            )
+        except (RuleAdapterError, TypeError, ValueError):
+            return ()
+        observed_players = {item.seat: item for item in observation.players}
+        candidates: list[tuple[int, str, RuleTriggerOccurrence]] = []
+        for instance in state.ability_instances:
+            skill = skills.get(instance.skill_id)
+            player = state.players.get(instance.actor_seat)
+            if eligible_instances.get(instance.ability_instance_id) != (instance, skill):
+                continue
+            if (
+                skill is None
+                or player is None
+                or not player.alive
+                or not instance.enabled
+                or instance.consumed
+                or instance.grant_kind != "ACTIVE"
+                or skill.mode != "PLAYER"
+                or skill.trigger is not None
+                or instance.grant_id not in {item.grant_id for item in skill.grants}
+                or hook_id not in skill.hook_ids
+                or GamePhase.DAY_SPEECH.value not in skill.timing
+            ):
+                continue
+            occurrence_id = _stable_rule_identifier(
+                "hook-occurrence",
+                state.game_id,
+                state.day_no,
+                hook_id,
+                source_id,
+                instance.ability_instance_id,
+            )
+            if not self._rule_skill_condition_is_eligible(
+                observation,
+                skill,
+                instance,
+                actor=observed_players.get(instance.actor_seat),
+                request={
+                    "request_id": f"hook-{occurrence_id}",
+                    "action_code": skill.action_code,
+                    "passed": False,
+                    "actor_seat": instance.actor_seat,
+                    "target_count": 0,
+                    "parameters": {},
+                    "window_id": f"rule-trigger-{occurrence_id}",
+                    "logical_window_id": skill.window_ids[0] if skill.window_ids else None,
+                    "hook_id": hook_id,
+                },
+            ):
+                continue
+            source_batch_id = _stable_rule_identifier(
+                "hook-batch", state.game_id, state.day_no, hook_id, source_id
+            )
+            candidates.append(
+                (
+                    instance.actor_seat,
+                    instance.ability_instance_id,
+                    RuleTriggerOccurrence(
+                        occurrence_id=occurrence_id,
+                        kind="HOOK",
+                        source_fact_id=source_id,
+                        source_batch_id=source_batch_id,
+                        ability_instance_id=instance.ability_instance_id,
+                        skill_id=skill.skill_id,
+                        actor_seat=instance.actor_seat,
+                        mode="PLAYER_CHOICE",
+                        order=start_order,
+                        hook_id=hook_id,
+                        logical_window_id=None,
+                    ),
+                )
+            )
+        candidates.sort(key=lambda item: (item[0], item[1]))
+        return tuple(
+            occurrence.model_copy(update={"order": start_order + index})
+            for index, (_seat, _instance, occurrence) in enumerate(candidates)
+        )
+
+    @staticmethod
+    def _rule_skill_condition_is_eligible(
+        observation: object,
+        skill: SkillSpec,
+        instance: AbilityInstanceState,
+        *,
+        actor: object | None,
+        request: Mapping[str, object],
+        source_fact: DomainFact | None = None,
+        target: object | None = None,
+    ) -> bool:
+        """Check the stable portion of a frozen skill condition at offer time.
+
+        Player-selected target, request-shape, and item references remain for
+        the interpreter to evaluate after an actual choice. Actor, observation,
+        and per-instance state references are already authoritative here.
+        """
+
+        condition = skill.condition
+        if condition is None:
+            return True
+
+        def has_deferred_reference(value: object) -> bool:
+            if isinstance(value, Mapping):
+                if value.get("op") == "ref" and value.get("source") in {
+                    "target",
+                    "request",
+                    "item",
+                }:
+                    return True
+                return any(has_deferred_reference(item) for item in value.values())
+            if isinstance(value, (tuple, list)):
+                return any(has_deferred_reference(item) for item in value)
+            return False
+
+        if has_deferred_reference(condition.model_dump(mode="python")):
+            return True
+        observed_skill_state = getattr(observation, "skill_state", ())
+        skill_state = {
+            item.key: item.value
+            for item in observed_skill_state
+            if item.ability_instance_id == instance.ability_instance_id
+            and item.skill_id == skill.skill_id
+        }
+        try:
+            return evaluate_predicate(
+                condition,
+                {
+                    "actor": actor,
+                    "target": target,
+                    "request": request,
+                    "request_targets": (),
+                    "source_fact": source_fact,
+                    "observation": observation,
+                    "skill_state": skill_state,
+                    "skill": skill,
+                    "item": None,
+                },
+            )
+        except (TypeError, ValueError):
+            return False
+
+    def _confirmed_death_facts(
+        self,
+        state: GameState,
+        batch: ResolutionBatch,
+    ) -> tuple[RuleFactRecord, ...]:
+        """Create one canonical durable fact for each newly confirmed death."""
+
+        source_facts = tuple(
+            item for item in batch.outcomes if item.fact_type.upper() == "DEATH_CONFIRMED"
+        )
+        result: list[RuleFactRecord] = []
+        for outcome in sorted(batch.mortality, key=lambda item: item.seat):
+            player = state.players.get(outcome.seat)
+            if not outcome.deceased or player is None or not player.alive:
+                continue
+            source_fact = next(
+                (
+                    fact
+                    for fact in source_facts
+                    if fact.target_seat == outcome.seat and fact.death_cause == outcome.death_cause
+                ),
+                None,
+            )
+            cause_effects = tuple(
+                sorted(
+                    (
+                        effect
+                        for effect in batch.effects
+                        if effect.effect_id in outcome.cause_effect_ids and effect.applied
+                    ),
+                    key=lambda effect: effect.effect_id,
+                )
+            )
+            primary_source = cause_effects[0] if cause_effects else None
+            fact_data = json.loads(json.dumps(source_fact.data)) if source_fact is not None else {}
+            if not isinstance(fact_data, dict):
+                fact_data = {}
+            fact_data["cause_effect_ids"] = list(outcome.cause_effect_ids)
+            fact_data["source_request_ids"] = list(outcome.source_request_ids)
+            fact_data["sources"] = [
+                {
+                    "effect_id": effect.effect_id,
+                    "source_rule_id": effect.source_rule_id,
+                    "source_request_id": effect.source_request_id,
+                    "actor_seat": effect.actor_seat,
+                }
+                for effect in cause_effects
+            ]
+            result.append(
+                RuleFactRecord(
+                    fact_id=(
+                        source_fact.fact_id
+                        if source_fact is not None
+                        else _stable_rule_identifier(
+                            "death-confirmed",
+                            state.game_id,
+                            batch.batch_id,
+                            outcome.seat,
+                            outcome.death_cause or "unknown",
+                        )
+                    ),
+                    fact_type=(
+                        "death_confirmed" if self._legacy_compatibility else "DEATH_CONFIRMED"
+                    ),
+                    source_rule_id=(
+                        primary_source.source_rule_id if primary_source is not None else None
+                    ),
+                    source_request_id=(
+                        primary_source.source_request_id if primary_source is not None else None
+                    ),
+                    actor_seat=primary_source.actor_seat if primary_source is not None else None,
+                    target_seat=outcome.seat,
+                    death_cause=outcome.death_cause,
+                    tags=(
+                        source_fact.tags
+                        if source_fact is not None and source_fact.tags
+                        else (outcome.death_cause,)
+                        if outcome.death_cause
+                        else ()
+                    ),
+                    data={**fact_data, "round_number": state.round_no},
+                )
+            )
+        return tuple(result)
+
+    def _rule_boundaries_for_deaths(
+        self,
+        state: GameState,
+        batch: ResolutionBatch,
+        death_facts: tuple[RuleFactRecord, ...],
+        return_point: RuleReturnPoint,
+        *,
+        timing: str,
+        timestamp: datetime,
+    ) -> tuple[RuleBoundary, ...]:
+        if not death_facts:
+            return ()
+        package = self._execution_package
+        policy = package.boundary_policy if package is not None else None
+        night_death = timing in {
+            GamePhase.NIGHT_TEAM_CHAT.value,
+            GamePhase.NIGHT_ACTION.value,
+            GamePhase.NIGHT_RESOLVE.value,
+        }
+        phase_policy_applies = (
+            policy is not None
+            and policy.last_words_enabled
+            and (
+                (
+                    night_death
+                    and policy.night_death_policy == "every_night"
+                    or night_death
+                    and policy.night_death_policy == "first_night_only"
+                    and state.round_no == 0
+                )
+                or (not night_death and policy.day_death_policy == "every_day")
+            )
+        )
+        eligible_causes = set(policy.eligible_death_causes if policy is not None else ())
+        last_words_seats = tuple(
+            fact.target_seat
+            for fact in death_facts
+            if phase_policy_applies
+            and fact.target_seat is not None
+            and fact.death_cause in eligible_causes
+        )
+        sheriff_required = bool(
+            policy is not None
+            and policy.sheriff_enabled
+            and policy.badge_transfer_enabled is True
+            and policy.badge_transfer_on_death is True
+            and state.sheriff_seat in {item.target_seat for item in death_facts}
+        )
+        boundary = RuleBoundary(
+            boundary_id=_stable_rule_identifier(
+                "boundary",
+                state.game_id,
+                batch.batch_id,
+                *(fact.fact_id for fact in death_facts),
+            ),
+            source_group_id=batch.group_id,
+            source_batch_id=batch.batch_id,
+            death_fact_ids=tuple(fact.fact_id for fact in death_facts),
+            death_seats=tuple(
+                fact.target_seat for fact in death_facts if fact.target_seat is not None
+            ),
+            return_point=return_point,
+            last_words_required=bool(last_words_seats),
+            last_words_seats=last_words_seats,
+            sheriff_badge_required=sheriff_required,
+            created_at=timestamp,
+            completed_at=None if last_words_seats or sheriff_required else timestamp,
+        )
+        return (boundary,)
+
+    def _queue_confirmed_rule_facts(
+        self,
+        state: GameState,
+        facts: tuple[RuleFactRecord, ...],
+        *,
+        source_batch_id: str,
+    ) -> tuple[RuleTriggerOccurrence, ...]:
+        """Synthesize only frozen automatic/choice triggers from persisted facts."""
+
+        package = self._execution_package
+        if package is None or not facts or self._rules is None:
+            return ()
+        source_facts_list: list[RuleFactRecord] = []
+        seen_deaths: set[tuple[int | None, str | None]] = set()
+        for fact in facts:
+            if fact.fact_type.upper() == "DEATH_CONFIRMED":
+                death_identity = (fact.target_seat, fact.death_cause)
+                if death_identity in seen_deaths:
+                    continue
+                seen_deaths.add(death_identity)
+            source_facts_list.append(fact)
+        source_facts = tuple(source_facts_list)
+        occupied = {item.occurrence_id for item in state.rule_trigger_queue}
+        candidates: list[tuple[str, str, RuleTriggerOccurrence]] = []
+        for fact in source_facts:
+            domain_fact = DomainFact(
+                fact_id=fact.fact_id,
+                fact_type=fact.fact_type,
+                source_rule_id=fact.source_rule_id,
+                source_request_id=fact.source_request_id,
+                actor_seat=fact.actor_seat,
+                target_seat=fact.target_seat,
+                death_cause=fact.death_cause,
+                tags=fact.tags,
+                data=json.loads(json.dumps(fact.data)),
+            )
+            for instance in state.ability_instances:
+                if not instance.enabled or instance.consumed:
+                    continue
+                skill = next(
+                    (item for item in package.skills if item.skill_id == instance.skill_id),
+                    None,
+                )
+                trigger = skill.trigger if skill is not None else None
+                legacy_grant = self._legacy_trigger_grant(state, instance, skill)
+                if (
+                    skill is None
+                    or instance.grant_id not in {item.grant_id for item in skill.grants}
+                    or self._rule_instance_capacity_reason(state, instance, skill) is not None
+                ):
+                    continue
+                if trigger is not None:
+                    if fact.fact_type not in trigger.fact_types:
+                        continue
+                    mode = trigger.mode
+                elif (
+                    legacy_grant is not None
+                    and legacy_grant.trigger.event is TriggerEvent.DEATH_CONFIRMED
+                    and legacy_grant.trigger.mode is TriggerMode.PLAYER_CHOICE
+                    and fact.fact_type.lower() == TriggerEvent.DEATH_CONFIRMED.value.lower()
+                    and fact.target_seat == instance.actor_seat
+                    and fact.death_cause in legacy_grant.trigger.allowed_death_causes
+                    and state.players.get(instance.actor_seat) is not None
+                    and not state.players[instance.actor_seat].alive
+                    and state.players[instance.actor_seat].death_cause == fact.death_cause
+                ):
+                    mode = "PLAYER_CHOICE"
+                else:
+                    continue
+                occurrence_id = _stable_rule_identifier(
+                    "occurrence", state.game_id, fact.fact_id, instance.ability_instance_id
+                )
+                if occurrence_id in occupied:
+                    continue
+                if trigger is not None and trigger.condition is not None:
+                    try:
+                        observation = self._rules.observation(
+                            state,
+                            group_id=f"trigger-match:{occurrence_id}",
+                            timing=GamePhase.TRIGGER_ACTION.value,
+                        )
+                        observed_players = {item.seat: item for item in observation.players}
+                        actor = observed_players.get(instance.actor_seat)
+                        target = observed_players.get(fact.target_seat or 0)
+                        if actor is None or not evaluate_predicate(
+                            trigger.condition,
+                            {
+                                "actor": actor,
+                                "target": target,
+                                "source_fact": domain_fact,
+                                "observation": observation,
+                                "skill_state": {
+                                    item.key: item.value
+                                    for item in observation.skill_state
+                                    if item.ability_instance_id == instance.ability_instance_id
+                                },
+                                "item": None,
+                            },
+                        ):
+                            continue
+                    except (RuleAdapterError, TypeError, ValueError):
+                        continue
+                if skill.condition is not None:
+                    try:
+                        condition_observation = self._rules.observation(
+                            state,
+                            group_id=f"trigger-skill-condition:{occurrence_id}",
+                            timing=GamePhase.TRIGGER_ACTION.value,
+                        )
+                        observed_players = {
+                            item.seat: item for item in condition_observation.players
+                        }
+                        source_domain_fact = DomainFact(
+                            fact_id=fact.fact_id,
+                            fact_type=fact.fact_type,
+                            source_rule_id=fact.source_rule_id,
+                            source_request_id=fact.source_request_id,
+                            actor_seat=fact.actor_seat,
+                            target_seat=fact.target_seat,
+                            death_cause=fact.death_cause,
+                            tags=fact.tags,
+                            data=json.loads(json.dumps(fact.data)),
+                        )
+                        if not self._rule_skill_condition_is_eligible(
+                            condition_observation,
+                            skill,
+                            instance,
+                            actor=observed_players.get(instance.actor_seat),
+                            target=(
+                                observed_players.get(fact.target_seat)
+                                if fact.target_seat is not None
+                                else None
+                            ),
+                            source_fact=source_domain_fact,
+                            request={
+                                "request_id": f"trigger-{occurrence_id}",
+                                "action_code": skill.action_code,
+                                "passed": False,
+                                "actor_seat": instance.actor_seat,
+                                "target_count": 0,
+                                "parameters": {},
+                                "window_id": f"trigger-{occurrence_id}",
+                                "logical_window_id": (
+                                    skill.window_ids[0] if skill.window_ids else None
+                                ),
+                                "hook_id": None,
+                            },
+                        ):
+                            continue
+                    except (RuleAdapterError, TypeError, ValueError):
+                        continue
+                occurrence = RuleTriggerOccurrence(
+                    occurrence_id=occurrence_id,
+                    kind="TRIGGER",
+                    source_fact_id=fact.fact_id,
+                    source_batch_id=source_batch_id,
+                    ability_instance_id=instance.ability_instance_id,
+                    skill_id=skill.skill_id,
+                    actor_seat=instance.actor_seat,
+                    mode=mode,
+                    order=0,
+                    hook_id=None,
+                    logical_window_id=skill.window_ids[0] if skill.window_ids else None,
+                )
+                candidates.append((fact.fact_id, instance.ability_instance_id, occurrence))
+        candidates.sort(key=lambda item: (item[0], item[1], item[2].occurrence_id))
+        start_order = max((item.order for item in state.rule_trigger_queue), default=-1) + 1
+        return tuple(
+            occurrence.model_copy(update={"order": start_order + index})
+            for index, (_fact_id, _instance_id, occurrence) in enumerate(candidates)
+        )
+
+    def _legacy_trigger_grant(
+        self,
+        state: GameState,
+        instance: AbilityInstanceState | None,
+        skill: SkillSpec | None,
+    ) -> GrantedTriggerAbility | None:
+        """Resolve a schema-1 trigger only inside the pinned compat path."""
+
+        if (
+            not self._legacy_compatibility
+            or instance is None
+            or skill is None
+            or skill.trigger is not None
+            or instance.grant_kind != "TRIGGER"
+            or instance.action_code != skill.action_code
+            or instance.grant_id not in {item.grant_id for item in skill.grants}
+        ):
+            return None
+        player = state.players.get(instance.actor_seat)
+        if player is None:
+            return None
+        matches = tuple(
+            ability
+            for ability in player.granted_trigger_abilities
+            if ability.action_code == skill.action_code and not ability.consumed
+        )
+        return matches[0] if len(matches) == 1 else None
+
     def _apply_rule_batch(
         self,
         state: GameState,
@@ -2908,9 +4262,16 @@ class GameManager:
             external = _stored_action_request(state, binding.request_id)
             payload = request_payloads[binding.request_id]
             window = self._window_for_request(state, external)
+            # New queue-backed rule occurrences own their ability instance,
+            # request binding, and completion receipt. The legacy trigger
+            # grant compatibility path only applies to its verified old
+            # resolution shape and must not consume a similarly coded grant.
+            is_rule_occurrence_window = window.phase is GamePhase.TRIGGER_ACTION and isinstance(
+                window.visible_context.get("rule_occurrence_id"), str
+            )
             trigger_binding = (
                 _pending_trigger_ability(state, window, require_bound=True)
-                if window.phase is GamePhase.TRIGGER_ACTION
+                if window.phase is GamePhase.TRIGGER_ACTION and not is_rule_occurrence_window
                 else None
             )
             if trigger_binding is not None:
@@ -2920,6 +4281,51 @@ class GameManager:
                     binding.request_id,
                     binding.skill_request.ability_instance_id,
                 )
+            elif is_rule_occurrence_window and self._legacy_compatibility:
+                occurrence = next(
+                    (
+                        item
+                        for item in state.rule_trigger_queue
+                        if item.occurrence_id == window.visible_context.get("rule_occurrence_id")
+                        and item.status == "WAITING_CHOICE"
+                        and item.kind == "TRIGGER"
+                    ),
+                    None,
+                )
+                legacy_instance = next(
+                    (
+                        item
+                        for item in state.ability_instances
+                        if occurrence is not None
+                        and item.ability_instance_id == occurrence.ability_instance_id
+                        and item.actor_seat == external.seat
+                        and item.grant_kind == "TRIGGER"
+                    ),
+                    None,
+                )
+                legacy_skill = (
+                    next(
+                        (
+                            item
+                            for item in self._execution_package.skills
+                            if occurrence is not None and item.skill_id == occurrence.skill_id
+                        ),
+                        None,
+                    )
+                    if occurrence is not None and self._execution_package is not None
+                    else None
+                )
+                legacy_grant = self._legacy_trigger_grant(
+                    state,
+                    legacy_instance,
+                    legacy_skill,
+                )
+                if legacy_grant is not None:
+                    trigger_window_bindings[external.seat] = (
+                        legacy_grant.ability_id,
+                        binding.request_id,
+                        binding.skill_request.ability_instance_id,
+                    )
             disp = disposition_by_id[binding.skill_request.request_id]
             resolution = resolution_by_external.get(binding.request_id)
             payload = dict(payload)
@@ -2954,20 +4360,6 @@ class GameManager:
             if actor.get("current_request_id") == binding.request_id:
                 actor["current_request_id"] = None
 
-        costs: dict[tuple[int, str], int] = {}
-        for cost in batch.cost_updates:
-            key = (cost.actor_seat, cost.resource_id)
-            costs[key] = costs.get(key, 0) + cost.amount
-        for (seat, resource_id), amount in costs.items():
-            balances = dict(players_data[seat].get("skill_resources", {}))
-            current = balances.get(resource_id, 0)
-            if type(current) is not int or current < amount:
-                raise ResolutionError(
-                    "RESOURCE_UNAVAILABLE", "rule batch cost exceeds its current balance"
-                )
-            balances[resource_id] = current - amount
-            players_data[seat]["skill_resources"] = balances
-
         for use_update in batch.use_updates:
             if not use_update.accepted:
                 continue
@@ -2985,10 +4377,22 @@ class GameManager:
             instance["uses_consumed"] = int(instance.get("uses_consumed", 0)) + 1
             seat = use_update.actor_seat
             actor = players_data[seat]
+            authority_instance = next(
+                (
+                    item
+                    for item in state.ability_instances
+                    if item.ability_instance_id == use_update.ability_instance_id
+                ),
+                None,
+            )
             granted = []
             for raw in actor.get("granted_abilities", ()):
                 item = dict(raw)
-                if item.get("action_code") == use_update.action_code:
+                if (
+                    authority_instance is not None
+                    and item.get("ability_id") == authority_instance.grant_id
+                    and item.get("action_code") == use_update.action_code
+                ):
                     item["uses_consumed"] = int(item.get("uses_consumed", 0)) + 1
                 granted.append(item)
             actor["granted_abilities"] = tuple(granted)
@@ -3000,25 +4404,258 @@ class GameManager:
                 for item in cast(ExecutionPackage, self._execution_package).state_declarations
                 if item.skill_id == state_update.skill_id and item.key == state_update.key
             )
+            scope_id = (
+                f"seat-{state_update.seat}"
+                if state_update.scope == "SEAT"
+                else state_update.ability_instance_id
+                if state_update.scope == "ABILITY"
+                else None
+            )
+            expires_at_round = None
+            expires_at_hook = None
+            if state_update.expiry_policy in {"ROUND_END", "NEXT_NIGHT_START"}:
+                # Rounds advance only at the ordinary victory boundary. This
+                # makes expiry discrete and recoverable from the frozen game
+                # phase; no wall-clock timer is involved.
+                expires_at_round = state.round_no + 1
+            if state_update.expiry_policy == "NEXT_NIGHT_START":
+                expires_at_hook = GamePhase.NIGHT_TEAM_CHAT.value
             value_data = {
-                "scope": "ABILITY",
-                "scope_id": state_update.ability_instance_id,
+                "scope": state_update.scope,
+                "scope_id": scope_id,
                 "key": state_update.key,
                 "value_type": declaration.value_type,
                 "value": json.loads(json.dumps(state_update.value)),
                 "source_batch_id": batch.batch_id,
+                "skill_id": state_update.skill_id,
+                "source_request_id": state_update.source_request_id,
+                "source_rule_id": state_update.source_rule_id,
+                "source_ability_instance_id": state_update.source_ability_instance_id,
+                "expiry_policy": state_update.expiry_policy,
+                "expires_at_round": expires_at_round,
+                "expires_at_hook": expires_at_hook,
             }
             rule_state_values = [
                 item
                 for item in rule_state_values
                 if not (
-                    item.scope == "ABILITY"
-                    and item.scope_id == state_update.ability_instance_id
+                    item.scope == state_update.scope
+                    and item.scope_id == scope_id
+                    and item.skill_id == state_update.skill_id
                     and item.key == state_update.key
                 )
             ]
             rule_state_values.append(RuleStateValue.model_validate(value_data))
         data["rule_state"] = tuple(_rule_state_payload(item) for item in rule_state_values)
+
+        # RESOURCE_DELTA effects and ordinary skill costs share the same
+        # resource balance, so apply both in this one reducer before checking
+        # the frozen package bounds.
+        resource_deltas: dict[tuple[int, str], int] = {}
+        for cost in batch.cost_updates:
+            key = (cost.actor_seat, cost.resource_id)
+            resource_deltas[key] = resource_deltas.get(key, 0) - cost.amount
+        for resource_update in batch.resource_updates:
+            source_instance = next(
+                (
+                    item
+                    for item in state.ability_instances
+                    if item.ability_instance_id == resource_update.source_ability_instance_id
+                ),
+                None,
+            )
+            if source_instance is None or (
+                resource_update.seat != source_instance.actor_seat
+                and resource_update.seat not in resource_update.authorized_targets
+            ):
+                raise ResolutionError(
+                    "RULE_TARGET_INVALID", "resource update target is not authorized"
+                )
+            key = (resource_update.seat, resource_update.resource_id)
+            resource_deltas[key] = resource_deltas.get(key, 0) + resource_update.delta
+        execution_package = cast(ExecutionPackage, self._execution_package)
+        resource_bounds: dict[str, tuple[int, int | None]] = {
+            item.resource_id: (item.min_value, item.max_value)
+            for item in execution_package.resource_declarations
+        }
+        # Schema-1 skill costs predate RESOURCE_DELTA declarations. Their
+        # exact resource and amount are frozen on SkillSpec and validated in
+        # _validate_rule_batch; allow those controlled deductions to use a
+        # zero lower bound without granting the skill arbitrary deltas.
+        for cost_skill in execution_package.skills:
+            for cost_spec in cost_skill.usage.costs:
+                resource_bounds.setdefault(cost_spec.resource_id, (0, None))
+        for (seat, resource_id), delta in resource_deltas.items():
+            bounds = resource_bounds.get(resource_id)
+            if bounds is None:
+                raise ResolutionError(
+                    "RESOURCE_INVALID", "resource update is outside the frozen declaration"
+                )
+            balances = dict(players_data[seat].get("skill_resources", {}))
+            current = balances.get(resource_id, 0)
+            low, high = bounds
+            updated = current + delta
+            if type(current) is not int or updated < low or (high is not None and updated > high):
+                raise ResolutionError(
+                    "RESOURCE_UNAVAILABLE", "rule batch resource balance is outside its bounds"
+                )
+            balances[resource_id] = updated
+            players_data[seat]["skill_resources"] = balances
+
+        player_field_values = {"role_id", "faction_id", "victory_group_id", "chat_group_ids"}
+        for player_update in batch.player_updates:
+            if player_update.player_field not in player_field_values:
+                raise ResolutionError(
+                    "PLAYER_FIELD_INVALID", "rule update names an unsupported player field"
+                )
+            source_instance = next(
+                (
+                    item
+                    for item in state.ability_instances
+                    if item.ability_instance_id == player_update.source_ability_instance_id
+                ),
+                None,
+            )
+            if source_instance is None or (
+                player_update.seat not in player_update.authorized_targets
+                and player_update.seat != source_instance.actor_seat
+            ):
+                raise ResolutionError(
+                    "RULE_TARGET_INVALID", "player field update target is not authorized"
+                )
+            value: object = player_update.value
+            if player_update.player_field == "chat_group_ids" and isinstance(value, list):
+                value = tuple(value)
+            players_data[player_update.seat][player_update.player_field] = value
+
+        relation_values = list(state.rule_relations)
+        for relation_update in batch.relation_updates:
+            source_instance = next(
+                (
+                    item
+                    for item in state.ability_instances
+                    if item.ability_instance_id == relation_update.source_ability_instance_id
+                ),
+                None,
+            )
+            if source_instance is None or any(
+                seat not in relation_update.authorized_targets
+                and seat != source_instance.actor_seat
+                for seat in (relation_update.source_seat, relation_update.target_seat)
+            ):
+                raise ResolutionError("RULE_TARGET_INVALID", "relation endpoint is not authorized")
+            relation_values = [
+                item for item in relation_values if item.relation_id != relation_update.relation_id
+            ]
+            if relation_update.operation == "ADD":
+                expires_at_round = None
+                expires_at_hook = None
+                if relation_update.expiry_policy == "ROUND_END":
+                    expires_at_round = state.round_no + 1
+                elif relation_update.expiry_policy == "NEXT_NIGHT_START":
+                    expires_at_round = state.round_no + 1
+                    expires_at_hook = GamePhase.NIGHT_TEAM_CHAT.value
+                relation_values.append(
+                    RuleRelationValue(
+                        relation_id=relation_update.relation_id,
+                        relation_type=relation_update.relation_type,
+                        source_seat=relation_update.source_seat,
+                        target_seat=relation_update.target_seat,
+                        source_skill_id=relation_update.source_skill_id,
+                        source_rule_id=relation_update.source_rule_id,
+                        source_request_id=relation_update.source_request_id,
+                        created_round=state.round_no,
+                        source_ability_instance_id=relation_update.source_ability_instance_id,
+                        expiry_policy=relation_update.expiry_policy or "NEVER",
+                        expires_at_round=expires_at_round,
+                        expires_at_hook=expires_at_hook,
+                    )
+                )
+        data["rule_relations"] = tuple(item.model_dump(mode="python") for item in relation_values)
+
+        for ability_update in batch.ability_updates:
+            target_skill = next(
+                (
+                    skill
+                    for skill in cast(ExecutionPackage, self._execution_package).skills
+                    if skill.skill_id == ability_update.skill_id
+                ),
+                None,
+            )
+            source_instance = next(
+                (
+                    item
+                    for item in state.ability_instances
+                    if item.ability_instance_id == ability_update.source_ability_instance_id
+                ),
+                None,
+            )
+            if (
+                target_skill is None
+                or ability_update.grant_id not in {grant.grant_id for grant in target_skill.grants}
+                or source_instance is None
+                or ability_update.target_seat not in ability_update.authorized_targets
+                and ability_update.target_seat != source_instance.actor_seat
+            ):
+                raise ResolutionError(
+                    "ABILITY_UPDATE_INVALID", "ability update is outside frozen authorization"
+                )
+            active = [
+                index
+                for index, item in enumerate(instances.values())
+                if item.get("actor_seat") == ability_update.target_seat
+                and item.get("skill_id") == ability_update.skill_id
+                and item.get("grant_id") == ability_update.grant_id
+                and item.get("enabled") is True
+                and item.get("consumed") is not True
+            ]
+            if ability_update.operation == "REVOKE":
+                if len(active) != 1:
+                    raise ResolutionError(
+                        "ABILITY_REVOKE_INVALID", "revoke must name one active grant instance"
+                    )
+                instance_id = tuple(instances)[active[0]]
+                instance = instances[instance_id]
+                instance["enabled"] = False
+                # Legacy paths consult PlayerState grants. Remove only the
+                # same grant identity; another grant sharing its action code
+                # must retain its own authorization and usage counter.
+                actor = players_data[ability_update.target_seat]
+                actor["granted_abilities"] = tuple(
+                    item
+                    for raw in actor.get("granted_abilities", ())
+                    if (item := dict(raw)).get("ability_id") != ability_update.grant_id
+                )
+                actor["granted_trigger_abilities"] = tuple(
+                    item
+                    for raw in actor.get("granted_trigger_abilities", ())
+                    if (item := dict(raw)).get("ability_id") != ability_update.grant_id
+                )
+                continue
+            new_instance_id = ability_update.ability_instance_id
+            if (
+                not isinstance(new_instance_id, str)
+                or not new_instance_id
+                or new_instance_id in instances
+            ):
+                raise ResolutionError(
+                    "ABILITY_GRANT_INVALID", "grant requires a new stable instance identity"
+                )
+            if active:
+                raise ResolutionError(
+                    "ABILITY_GRANT_INVALID", "grant would duplicate an active ability instance"
+                )
+            instances[new_instance_id] = AbilityInstanceState(
+                ability_instance_id=new_instance_id,
+                skill_id=target_skill.skill_id,
+                grant_id=ability_update.grant_id,
+                action_code=target_skill.action_code,
+                actor_seat=ability_update.target_seat,
+                grant_kind="TRIGGER" if target_skill.trigger is not None else "ACTIVE",
+                uses_consumed=0,
+                consumed=False,
+                enabled=True,
+            ).model_dump(mode="json")
 
         for effect in batch.effects:
             if (
@@ -3160,7 +4797,13 @@ class GameManager:
                 }
             )
             for item in (*batch.outcomes, *batch.facts)
+            if item.fact_type.upper() != "DEATH_CONFIRMED"
         )
+        confirmed_death_facts = self._confirmed_death_facts(state, batch)
+        # Persist exactly one canonical row for each newly confirmed death.
+        # It reuses the interpreter fact ID when available and keeps all
+        # applied causal effect/request provenance in its data payload.
+        facts = (*facts, *confirmed_death_facts)
         digest = hashlib.sha256(
             json.dumps(
                 batch.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
@@ -3218,23 +4861,2574 @@ class GameManager:
             read_revision=state.state_revision,
             committed_revision=state.state_revision + 1,
             request_ids=external_request_ids,
+            occurrence_ids=tuple(
+                sorted(
+                    {
+                        item.trigger_occurrence_id
+                        for item in requests
+                        if item.trigger_occurrence_id is not None
+                    }
+                )
+            ),
             outcome_digest=digest,
         )
         if any(item.batch_id == batch.batch_id for item in state.rule_receipts):
             raise ResolutionError("RULE_BATCH_REPLAY", "rule batch was already committed")
         data["rule_ledger"] = (*data["rule_ledger"], _rule_ledger_payload(ledger))
         data["rule_receipts"] = (*data["rule_receipts"], receipt.model_dump(mode="python"))
+        deferred_disclosures = self._deferred_rule_disclosures(
+            state,
+            batch,
+            requests,
+            timing=timing,
+        )
         events = self._rule_projection_events(
             state,
             batch,
             requests,
             timestamp=timestamp,
             next_revision=state.state_revision + 1,
+            hook_id=timing,
         )
         if events:
             _validate_new_events(state, events, next_revision=state.state_revision + 1)
             data["events"] = (*_typed_events(state), *events)
+        candidate_state = GameState.model_validate(data)
+        return_point = self._rule_return_point(state, requests, bindings)
+        new_occurrences = self._queue_confirmed_rule_facts(
+            candidate_state,
+            tuple(facts),
+            source_batch_id=batch.batch_id,
+        )
+        queued_ids = {item.occurrence_id for item in candidate_state.rule_trigger_queue}
+        queue = (
+            *candidate_state.rule_trigger_queue,
+            *(item for item in new_occurrences if item.occurrence_id not in queued_ids),
+        )
+        new_boundaries = self._rule_boundaries_for_deaths(
+            state,
+            batch,
+            confirmed_death_facts,
+            return_point,
+            timing=timing,
+            timestamp=timestamp,
+        )
+        boundaries = (*candidate_state.rule_boundaries, *new_boundaries)
+        existing_cursor = state.rule_workflow_cursor
+        has_pending_work = any(
+            item.status in {"QUEUED", "READY", "WAITING_CHOICE"}
+            for item in candidate_state.rule_trigger_queue
+        ) or any(item.is_pending for item in candidate_state.rule_boundaries)
+        independent_workflow = existing_cursor is None or (
+            existing_cursor.status in {"IDLE", "RETURN_READY"} and not has_pending_work
+        )
+        cursor = (
+            RuleWorkflowCursor(
+                budget_limit=(existing_cursor.budget_limit if existing_cursor is not None else 512)
+            )
+            if independent_workflow
+            else existing_cursor
+        )
+        assert cursor is not None
+        flow_update = batch.flow_updates[0] if batch.flow_updates else None
+        pending_queue = any(item.status in {"QUEUED", "READY", "WAITING_CHOICE"} for item in queue)
+        pending_boundaries = tuple(item for item in boundaries if item.is_pending)
+        cursor = cursor.model_copy(
+            update={
+                "cursor_id": cursor.cursor_id
+                or _stable_rule_identifier("workflow", state.game_id, state.round_no, group_id),
+                "settlement_group_id": group_id,
+                "return_point": return_point,
+                "next_logical_window_id": return_point.logical_window_id,
+                "pending_flow_action": (
+                    flow_update.action if flow_update is not None else cursor.pending_flow_action
+                ),
+                "pending_boundary_id": (
+                    pending_boundaries[0].boundary_id if pending_boundaries else None
+                ),
+                "status": "DRAINING" if pending_queue or pending_boundaries else "RETURN_READY",
+                "error_code": None,
+            }
+        )
+        data = _state_data(candidate_state)
+        data["rule_deferred_disclosures"] = tuple(
+            item.model_dump(mode="python")
+            for item in (*state.rule_deferred_disclosures, *deferred_disclosures)
+        )
+        data["rule_trigger_queue"] = tuple(item.model_dump(mode="python") for item in queue)
+        data["rule_boundaries"] = tuple(item.model_dump(mode="python") for item in boundaries)
+        data["rule_workflow_cursor"] = cursor.model_dump(mode="python")
         return GameState.model_validate(data)
+
+    def _required_rule_window_submitters(
+        self,
+        state: GameState,
+        window: ActionWindow,
+    ) -> frozenset[int]:
+        """Resolve personal and chat-group collection obligations from the package."""
+
+        rule_occurrence = self._rule_occurrence_for_window(state, window)
+        if rule_occurrence is not None:
+            return frozenset({rule_occurrence.actor_seat})
+        package = self._execution_package
+        if package is None or not package.skills:
+            return frozenset(window.allowed_seats)
+        skills_by_code = {
+            skill.action_code: skill
+            for skill in package.skills
+            if skill.action_code in window.allowed_action_codes
+            and window.phase.value in skill.timing
+            and (not skill.window_ids or window.logical_window_id in skill.window_ids)
+        }
+        individual: set[int] = set()
+        group_candidates: dict[tuple[int, str], list[int]] = {}
+        for seat in window.allowed_seats:
+            player = state.players.get(seat)
+            if player is None or not player.alive:
+                continue
+            active_codes = {
+                instance.action_code
+                for instance in state.ability_instances
+                if instance.actor_seat == seat and instance.enabled and not instance.consumed
+            }
+            eligible = [skill for code, skill in skills_by_code.items() if code in active_codes]
+            for skill in eligible:
+                if skill.coordination_scope == "INDIVIDUAL":
+                    individual.add(seat)
+                    continue
+                groups = player.chat_group_ids or (f"seat-{seat}",)
+                for group in groups:
+                    group_candidates.setdefault((skill.action_code, group), []).append(seat)
+        required = set(individual)
+        required.update(min(seats) for seats in group_candidates.values() if seats)
+        # A window with no matching live executable participant is still a
+        # collector boundary. It has no synthetic PASS obligation.
+        return frozenset(required)
+
+    async def complete_rule_window(
+        self,
+        window_id: str,
+        *,
+        expected_revision: int,
+        now: datetime | None = None,
+    ) -> GameState:
+        """Freeze one rule window's input collection without settling it."""
+
+        timestamp = _aware_commit_time(now)
+        async with self._lock:
+            state = self._state
+            _revision_check(state, expected_revision)
+            raw = state.action_windows.get(window_id)
+            if raw is None:
+                raise EventCommitError("WINDOW_NOT_FOUND: rule window is not installed")
+            try:
+                window = _load_action_window(raw)
+            except (TypeError, ValueError) as exc:
+                raise EventCommitError("WINDOW_INVALID: rule window is malformed") from exc
+            if window.closed_at is not None:
+                raise EventCommitError("WINDOW_CLOSED: rule window is already settled")
+            if window.collection_complete_at is not None:
+                return state
+            pending_inputs = tuple(
+                payload
+                for payload in state.action_requests.values()
+                if isinstance(payload, Mapping)
+                and payload.get("window_id") == window_id
+                and payload.get("status") == "PENDING"
+            )
+            if any(
+                isinstance(payload, Mapping)
+                and payload.get("window_id") == window_id
+                and payload.get("status")
+                in {"OPEN", "REQUESTED", "SUBMITTING", "IN_FLIGHT", "PROCESSING"}
+                for payload in state.action_requests.values()
+            ):
+                raise EventCommitError("WINDOW_INPUT_IN_FLIGHT: an action request is unfinished")
+            if window.phase is GamePhase.NIGHT_TEAM_CHAT:
+                # Team chat is authorized by the persisted serial speech queue,
+                # not by an executable SkillSpec or a synthetic PASS request.
+                # The moderator flow performs the frozen speaker/plan checks;
+                # the manager independently requires that the queue was
+                # started and fully drained before accepting this boundary.
+                if state.current_queue is None:
+                    raise EventCommitError(
+                        "WINDOW_INPUT_MISSING: team speech queue has not started"
+                    )
+                if state.current_queue or state.serial_turn is not None:
+                    raise EventCommitError(
+                        "WINDOW_INPUT_IN_FLIGHT: team speech queue is not complete"
+                    )
+            elif not window.collection_only:
+                submitted_seats = {
+                    seat for payload in pending_inputs if type(seat := payload.get("seat")) is int
+                }
+                expected_seats = self._required_rule_window_submitters(state, window)
+                legacy_empty_resolve = (
+                    self._execution_package is not None
+                    and not self._execution_package.window_metadata
+                    and window.phase is GamePhase.NIGHT_RESOLVE
+                    and window.allowed_action_codes == (299,)
+                    and window.allow_pass
+                    and not expected_seats
+                    and not pending_inputs
+                )
+                if (
+                    self._execution_package is not None
+                    and self._execution_package.skills
+                    and not expected_seats
+                    and not legacy_empty_resolve
+                ):
+                    raise EventCommitError(
+                        "WINDOW_INVALID: interactive window has no frozen eligible ability instance"
+                    )
+                missing = expected_seats.difference(submitted_seats)
+                if missing:
+                    raise EventCommitError(
+                        "WINDOW_INPUT_MISSING: every eligible participant must "
+                        "submit an action or PASS"
+                    )
+            if (
+                self._execution_package is not None
+                and self._execution_package.window_metadata
+                and window.phase is not GamePhase.TRIGGER_ACTION
+            ):
+                logical_id = window.logical_window_id
+                metadata = tuple(self._execution_package.window_metadata)
+                row = next((item for item in metadata if item.window_id == logical_id), None)
+                if row is None:
+                    raise EventCommitError("WINDOW_INVALID: logical window is not frozen")
+                if row.phase != window.phase.value:
+                    raise EventCommitError(
+                        "WINDOW_INVALID: phase differs from frozen window metadata"
+                    )
+                later = next((item for item in metadata if item.order == row.order + 1), None)
+                expected_next = later.window_id if later is not None else None
+                if window.next_window_id != expected_next:
+                    raise EventCommitError(
+                        "WINDOW_INVALID: successor differs from frozen window order"
+                    )
+            # Existing windows are recursively frozen inside GameState; do
+            # not overwrite the thawed `_state_data` JSON with those tuples.
+            windows = json.loads(json.dumps(state.action_windows))
+            windows[window_id] = window.model_copy(
+                update={"collection_complete_at": timestamp}
+            ).model_dump(mode="json")
+            basic_night_window = (
+                self._execution_package is not None
+                and not self._execution_package.window_metadata
+                and window.phase
+                in {
+                    GamePhase.NIGHT_TEAM_CHAT,
+                    GamePhase.NIGHT_ACTION,
+                    GamePhase.NIGHT_RESOLVE,
+                }
+            )
+            group_id = window.settlement_group_id or (
+                f"night:{state.round_no}" if basic_night_window else window.window_id
+            )
+            if basic_night_window and window.settlement_group_id is None:
+                # Upgrade an old preinstalled physical window at this manager
+                # commit boundary. The legacy phase order supplies the only
+                # allowed grouping proof when the frozen A summary is empty.
+                window = window.model_copy(update={"settlement_group_id": group_id})
+                windows[window_id] = window.model_copy(
+                    update={"collection_complete_at": timestamp}
+                ).model_dump(mode="json")
+            group_window_ids = tuple(
+                sorted(
+                    key
+                    for key, raw_window in windows.items()
+                    if isinstance(raw_window, Mapping)
+                    and (raw_window.get("settlement_group_id") or key) == group_id
+                    and raw_window.get("closed_at") is None
+                )
+            )
+            cursor = state.rule_workflow_cursor or RuleWorkflowCursor()
+            pending_occurrences = any(
+                item.status in {"QUEUED", "READY", "WAITING_CHOICE"}
+                for item in state.rule_trigger_queue
+            )
+            pending_boundaries = any(item.is_pending for item in state.rule_boundaries)
+            if (
+                cursor.status in {"IDLE", "RETURN_READY"}
+                and not pending_occurrences
+                and not pending_boundaries
+            ):
+                # A newly opened collection starts a fresh causal budget.
+                # Subsequent windows in the same COLLECTING group retain it.
+                cursor = RuleWorkflowCursor(budget_limit=cursor.budget_limit)
+            cursor = cursor.model_copy(
+                update={
+                    "cursor_id": cursor.cursor_id
+                    or _stable_rule_identifier("workflow", state.game_id, state.round_no, group_id),
+                    "settlement_group_id": group_id,
+                    "active_window_ids": group_window_ids,
+                    "completed_collection_window_ids": tuple(
+                        dict.fromkeys((*cursor.completed_collection_window_ids, window_id))
+                    ),
+                    "status": "COLLECTING",
+                    "error_code": None,
+                }
+            )
+            data = _state_data(state)
+            data["action_windows"] = windows
+            data["rule_workflow_cursor"] = cursor.model_dump(mode="python")
+            data["state_revision"] = state.state_revision + 1
+            data["updated_at"] = timestamp
+            committed = GameState.model_validate(data)
+            self._state = committed
+            return committed
+
+    async def commit_rule_group(
+        self,
+        group_id: str,
+        request_ids: Iterable[str] | None = None,
+        *,
+        occurrence_ids: Iterable[str] = (),
+        candidate_batch: ResolutionBatch | None = None,
+        expected_revision: int,
+        now: datetime | None = None,
+    ) -> GameState:
+        """Re-plan and atomically commit one fully collected frozen rule group."""
+
+        if not isinstance(group_id, str) or not group_id:
+            raise EventCommitError("RULE_GROUP_INVALID: group ID is required")
+        timestamp = _aware_commit_time(now)
+        raw_occurrences = tuple(occurrence_ids)
+        supplied_occurrences = tuple(sorted(set(raw_occurrences)))
+        if len(supplied_occurrences) != len(raw_occurrences):
+            raise EventCommitError("RULE_OCCURRENCE_INVALID: occurrence IDs must be unique")
+        raw_request_ids = None if request_ids is None else tuple(request_ids)
+        supplied_request_ids = (
+            None if raw_request_ids is None else tuple(sorted(set(raw_request_ids)))
+        )
+        if raw_request_ids is not None and len(supplied_request_ids or ()) != len(raw_request_ids):
+            raise EventCommitError("REQUEST_INVALID: request IDs must be unique")
+
+        async with self._lock:
+            state = self._state
+            _revision_check(state, expected_revision)
+            if self._rules is None or self._execution_package is None:
+                raise ResolutionError(
+                    "RULE_PACKAGE_MISSING", "game has no pinned execution package"
+                )
+            prior_receipts = tuple(
+                item for item in state.rule_receipts if item.group_id == group_id
+            )
+            if prior_receipts:
+                if len(prior_receipts) != 1:
+                    raise ResolutionError(
+                        "RULE_GROUP_REPLAY", "group has multiple durable commit receipts"
+                    )
+                receipt = prior_receipts[0]
+                if receipt.package_id != self._execution_package.package_id:
+                    raise ResolutionError(
+                        "RULE_GROUP_REPLAY", "group receipt belongs to another package"
+                    )
+                if supplied_request_ids is not None and supplied_request_ids != receipt.request_ids:
+                    raise ResolutionError(
+                        "RULE_GROUP_REPLAY", "request IDs differ from the committed group"
+                    )
+                if supplied_occurrences and supplied_occurrences != receipt.occurrence_ids:
+                    raise ResolutionError(
+                        "RULE_GROUP_REPLAY", "occurrence IDs differ from the committed group"
+                    )
+                if candidate_batch is not None:
+                    candidate_digest = hashlib.sha256(
+                        json.dumps(
+                            candidate_batch.model_dump(mode="json"),
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ).encode()
+                    ).hexdigest()
+                    if candidate_digest != receipt.outcome_digest:
+                        raise ResolutionError(
+                            "RULE_GROUP_REPLAY", "candidate batch differs from the committed group"
+                        )
+                return state
+            windows: dict[str, ActionWindow] = {}
+            for key, raw_window in state.action_windows.items():
+                try:
+                    window = _load_action_window(raw_window)
+                except (TypeError, ValueError) as exc:
+                    raise EventCommitError(
+                        "WINDOW_INVALID: stored action window is malformed"
+                    ) from exc
+                if window.settlement_group_id == group_id or window.window_id == group_id:
+                    windows[key] = window
+            package = self._execution_package
+            if package.window_metadata:
+                group_mapping = package.window_settlement_groups
+                expected_logical = tuple(
+                    row.window_id
+                    for row in package.window_metadata
+                    if (group_id == f"night:{state.round_no}" and not group_mapping)
+                    or (
+                        group_mapping
+                        and group_id == f"night:{state.round_no}:{group_mapping.get(row.window_id)}"
+                    )
+                )
+                if expected_logical:
+                    by_logical: dict[str, list[ActionWindow]] = {}
+                    for window in windows.values():
+                        if window.logical_window_id is not None:
+                            by_logical.setdefault(window.logical_window_id, []).append(window)
+                    missing_logical = [
+                        logical_id
+                        for logical_id in expected_logical
+                        if not by_logical.get(logical_id)
+                    ]
+                    if missing_logical:
+                        raise EventCommitError(
+                            "WINDOW_GROUP_INCOMPLETE: frozen settlement group has "
+                            "uninstalled windows"
+                        )
+                    for logical_id in expected_logical:
+                        physical = by_logical[logical_id]
+                        if any(
+                            window.settlement_group_id != group_id
+                            or window.collection_complete_at is None
+                            or window.closed_at is not None
+                            for window in physical
+                        ):
+                            raise EventCommitError(
+                                "WINDOW_GROUP_INCOMPLETE: every frozen group window "
+                                "must be collected"
+                            )
+                    rows = {row.window_id: row for row in package.window_metadata}
+                    for logical_id in expected_logical:
+                        for dependency in rows[logical_id].depends_on:
+                            dependency_group = (
+                                f"night:{state.round_no}"
+                                if not group_mapping
+                                else (f"night:{state.round_no}:{group_mapping.get(dependency)}")
+                            )
+                            dependency_windows = [
+                                raw_dependency
+                                for raw_dependency in state.action_windows.values()
+                                if isinstance(raw_dependency, Mapping)
+                                and raw_dependency.get("logical_window_id") == dependency
+                                and raw_dependency.get("settlement_group_id") == dependency_group
+                            ]
+                            if not dependency_windows:
+                                raise EventCommitError(
+                                    "WINDOW_DEPENDENCY_MISSING: frozen predecessor has "
+                                    "no durable window"
+                                )
+                            same_group = dependency in expected_logical
+                            if same_group:
+                                ready = all(
+                                    _load_action_window(item).collection_complete_at is not None
+                                    for item in dependency_windows
+                                )
+                            else:
+                                ready = all(
+                                    _load_action_window(item).closed_at is not None
+                                    for item in dependency_windows
+                                )
+                            if not ready:
+                                raise EventCommitError(
+                                    "WINDOW_DEPENDENCY_OPEN: frozen predecessor is not settled"
+                                )
+            for window in windows.values():
+                if window.closed_at is None and window.collection_complete_at is None:
+                    raise EventCommitError(
+                        "WINDOW_COLLECTION_OPEN: every window in the rule group must be complete"
+                    )
+            physical_ids = set(windows)
+            pending_ids = tuple(
+                sorted(
+                    request_id
+                    for request_id, payload in state.action_requests.items()
+                    if isinstance(payload, Mapping)
+                    and payload.get("status") == "PENDING"
+                    and (
+                        payload.get("window_id") in physical_ids
+                        or (not physical_ids and request_id in (supplied_request_ids or ()))
+                    )
+                )
+            )
+            request_ids_to_commit = (
+                pending_ids if supplied_request_ids is None else supplied_request_ids
+            )
+            if set(request_ids_to_commit) != set(pending_ids):
+                raise ResolutionError(
+                    "RESOLUTION_INCOMPLETE", "request IDs must cover every pending group request"
+                )
+            occurrences_by_id = {item.occurrence_id: item for item in state.rule_trigger_queue}
+            selected_occurrences: list[RuleTriggerOccurrence] = []
+            for occurrence_id in supplied_occurrences:
+                occurrence = occurrences_by_id.get(occurrence_id)
+                if occurrence is None or occurrence.status not in {
+                    "QUEUED",
+                    "READY",
+                    "WAITING_CHOICE",
+                }:
+                    raise ResolutionError(
+                        "RULE_OCCURRENCE_INVALID", "occurrence is absent or already consumed"
+                    )
+                cursor = state.rule_workflow_cursor
+                if cursor is None or cursor.active_occurrence_id != occurrence_id:
+                    raise ResolutionError(
+                        "RULE_OCCURRENCE_INVALID", "occurrence is not the active workflow step"
+                    )
+                if occurrence.mode == "AUTOMATIC" and occurrence.status != "READY":
+                    raise ResolutionError(
+                        "RULE_OCCURRENCE_INVALID",
+                        "automatic occurrence was not scheduled by advance",
+                    )
+                if occurrence.mode == "PLAYER_CHOICE" and occurrence.status != "WAITING_CHOICE":
+                    raise ResolutionError(
+                        "RULE_OCCURRENCE_INVALID", "choice occurrence was not installed by advance"
+                    )
+                selected_occurrences.append(occurrence)
+            if not windows:
+                cursor = state.rule_workflow_cursor
+                active_auto = (
+                    len(selected_occurrences) == 1
+                    and selected_occurrences[0].mode == "AUTOMATIC"
+                    and selected_occurrences[0].status == "READY"
+                    and cursor is not None
+                    and cursor.active_occurrence_id == selected_occurrences[0].occurrence_id
+                    and cursor.status == "DRAINING"
+                    and cursor.settlement_group_id == group_id
+                )
+                if not active_auto or supplied_request_ids not in {None, ()}:
+                    raise ResolutionError(
+                        "RULE_GROUP_INVALID",
+                        "settlement requires an installed frozen window or active "
+                        "automatic occurrence",
+                    )
+            auto_occurrences = tuple(
+                item for item in selected_occurrences if item.mode == "AUTOMATIC"
+            )
+            if any(item.mode == "PLAYER_CHOICE" for item in selected_occurrences):
+                if not request_ids_to_commit:
+                    raise ResolutionError(
+                        "RULE_OCCURRENCE_INVALID", "player-choice occurrence requires its request"
+                    )
+
+            if request_ids_to_commit:
+                request_windows = [
+                    _load_action_window(
+                        state.action_windows[_stored_action_request(state, rid).window_id]
+                    )
+                    for rid in request_ids_to_commit
+                ]
+                timings = {window.phase.value for window in request_windows}
+                if len(timings) != 1:
+                    raise ResolutionError(
+                        "TIMING_MISMATCH", "one settlement group must use one timing"
+                    )
+                timing = next(iter(timings))
+            elif auto_occurrences:
+                timing = GamePhase.TRIGGER_ACTION.value
+            elif windows:
+                timing = windows[sorted(windows)[0]].phase.value
+            else:
+                raise ResolutionError("RULE_GROUP_EMPTY", "rule group has no windows or requests")
+
+            requests: list[SkillRequest] = []
+            bindings: list[_RuleRequestBinding] = []
+            if request_ids_to_commit:
+                physical_group = self._rule_group_requests(
+                    state,
+                    request_ids_to_commit,
+                    timing=timing,
+                    group_id_override=group_id,
+                )
+                requests.extend(physical_group[0])
+                bindings.extend(physical_group[1])
+            for occurrence in auto_occurrences:
+                request = self._automatic_skill_request(state, occurrence, group_id=group_id)
+                requests.append(request)
+            request_tuple = tuple(requests)
+            try:
+                batch = self._rules.plan(
+                    state,
+                    request_tuple,
+                    group_id=group_id,
+                    timing=timing,
+                )
+            except (RuleAdapterError, TypeError, ValueError) as exc:
+                raise ResolutionError("RULE_PLAN_INVALID", str(exc)) from exc
+            if candidate_batch is not None and candidate_batch != batch:
+                raise ResolutionError(
+                    "RULE_BATCH_INVALID", "candidate batch differs from locked package re-plan"
+                )
+            self._validate_rule_batch(
+                state,
+                batch,
+                request_tuple,
+                group_id=group_id,
+                timing=timing,
+            )
+            candidate = self._apply_rule_batch(
+                state,
+                batch,
+                request_tuple,
+                tuple(bindings),
+                (),
+                group_id=group_id,
+                timing=timing,
+                timestamp=timestamp,
+            )
+            data = _state_data(candidate)
+            action_windows = dict(data["action_windows"])
+            for window_id, window in windows.items():
+                if window.closed_at is None:
+                    action_windows[window_id] = window.model_copy(
+                        update={"closed_at": timestamp}
+                    ).model_dump(mode="json")
+            data["action_windows"] = action_windows
+            completed = set(supplied_occurrences)
+            completed.update(
+                item.trigger_occurrence_id
+                for item in request_tuple
+                if item.trigger_occurrence_id is not None
+            )
+            queue = tuple(
+                item.model_copy(update={"status": "COMPLETED"})
+                if item.occurrence_id in completed
+                else item
+                for item in candidate.rule_trigger_queue
+            )
+            data["rule_trigger_queue"] = tuple(item.model_dump(mode="python") for item in queue)
+            cursor = candidate.rule_workflow_cursor or RuleWorkflowCursor()
+            data["rule_workflow_cursor"] = cursor.model_copy(
+                update={
+                    "settlement_group_id": group_id,
+                    "active_occurrence_id": None,
+                    "active_window_ids": tuple(sorted(windows)),
+                    "status": "DRAINING"
+                    if any(item.status in {"QUEUED", "READY", "WAITING_CHOICE"} for item in queue)
+                    else "RETURN_READY",
+                    "pending_boundary_id": None,
+                }
+            ).model_dump(mode="python")
+            data["state_revision"] = state.state_revision + 1
+            data["updated_at"] = timestamp
+            committed = GameState.model_validate(data)
+            self._state = committed
+            return committed
+
+    def _has_terminal_night_boundary_source(
+        self,
+        state: GameState,
+        boundary: RuleBoundary,
+    ) -> bool:
+        """Prove that a DAY_ANNOUNCE boundary resumes after the final night window."""
+
+        point = boundary.return_point
+        package = self._execution_package
+        night_phases = {
+            GamePhase.NIGHT_TEAM_CHAT,
+            GamePhase.NIGHT_ACTION,
+            GamePhase.NIGHT_RESOLVE,
+        }
+        cursor = state.rule_workflow_cursor
+        already_staged = (
+            point.day_no is not None
+            and state.day_no == point.day_no + 1
+            and state.phase is GamePhase.DAY_ANNOUNCE
+            and cursor is not None
+            and cursor.status == "WAITING_BOUNDARY"
+            and cursor.pending_boundary_id == boundary.boundary_id
+        )
+        if (
+            package is None
+            or not package.window_metadata
+            or point.phase is not GamePhase.DAY_ANNOUNCE
+            or point.window_id is None
+            or point.logical_window_id is not None
+            or point.day_no is None
+            or (state.day_no != point.day_no and not already_staged)
+        ):
+            return False
+
+        raw_source = state.action_windows.get(point.window_id)
+        if raw_source is None:
+            return False
+        try:
+            source = _load_action_window(raw_source)
+        except (TypeError, ValueError):
+            return False
+        if (
+            source.game_id != state.game_id
+            or source.phase not in night_phases
+            or source.closed_at is None
+            or source.logical_window_id is None
+            or source.next_window_id is not None
+            or (source.settlement_group_id or source.window_id) != boundary.source_group_id
+        ):
+            return False
+
+        rows = tuple(package.window_metadata)
+        source_row = next(
+            (row for row in rows if row.window_id == source.logical_window_id),
+            None,
+        )
+        if (
+            source_row is None
+            or source_row.phase != source.phase.value
+            or source_row.order != max(row.order for row in rows)
+        ):
+            return False
+
+        group_windows: list[ActionWindow] = []
+        for raw in state.action_windows.values():
+            if not isinstance(raw, Mapping):
+                continue
+            raw_group = raw.get("settlement_group_id") or raw.get("window_id")
+            if raw_group != boundary.source_group_id:
+                continue
+            try:
+                group_windows.append(_load_action_window(raw))
+            except (TypeError, ValueError):
+                return False
+        if not group_windows or any(window.closed_at is None for window in group_windows):
+            return False
+
+        matching_ledgers = tuple(
+            ledger
+            for ledger in state.rule_ledger
+            if ledger.batch_id == boundary.source_batch_id
+            and ledger.group_id == boundary.source_group_id
+            and ledger.timing in {phase.value for phase in night_phases}
+            and ledger.round_no == state.round_no
+            and set(boundary.death_fact_ids).issubset(
+                {
+                    fact.fact_id
+                    for fact in ledger.facts
+                    if fact.fact_type.upper() == "DEATH_CONFIRMED"
+                }
+            )
+        )
+        if len(matching_ledgers) != 1:
+            return False
+        ledger = matching_ledgers[0]
+        return any(
+            receipt.batch_id == ledger.batch_id
+            and receipt.package_id == ledger.package_id
+            and receipt.group_id == ledger.group_id
+            and receipt.timing == ledger.timing
+            and receipt.committed_revision == ledger.committed_revision
+            and receipt.request_ids == ledger.request_ids
+            and receipt.outcome_digest == ledger.outcome_digest
+            for receipt in state.rule_receipts
+        )
+
+    async def advance_rule_workflow(
+        self,
+        *,
+        expected_revision: int,
+        now: datetime | None = None,
+        hook_id: RuleHook | None = None,
+    ) -> RuleWorkflowStep:
+        """Advance the one durable trigger/cursor queue or return its boundary."""
+
+        timestamp = _aware_commit_time(now)
+        async with self._lock:
+            state = self._state
+            _revision_check(state, expected_revision)
+            cursor = state.rule_workflow_cursor or RuleWorkflowCursor()
+            if cursor.status == "ERROR":
+                return RuleWorkflowStep(
+                    kind="IDLE",
+                    cursor_id=cursor.cursor_id,
+                    queue_pending=True,
+                    return_point=cursor.return_point,
+                )
+            if cursor.status == "COLLECTING":
+                # Collection completion is not settlement. Only
+                # commit_rule_group may close this cursor's frozen group and
+                # move it into trigger draining/return; repeated runner polls
+                # must preserve the collecting proof verbatim.
+                return RuleWorkflowStep(
+                    kind="IDLE",
+                    cursor_id=cursor.cursor_id,
+                    queue_pending=True,
+                    return_point=cursor.return_point,
+                )
+            if (
+                hook_id is None
+                and cursor.status == "IDLE"
+                and cursor.pending_flow_action is None
+                and not any(
+                    item.status in {"QUEUED", "READY", "WAITING_CHOICE"}
+                    for item in state.rule_trigger_queue
+                )
+                and not any(item.is_pending for item in state.rule_boundaries)
+            ):
+                # Legacy callers poll the authority on ordinary empty turns.
+                # An idle cursor has no workflow return edge to execute.
+                return RuleWorkflowStep(
+                    kind="IDLE",
+                    cursor_id=cursor.cursor_id,
+                    queue_pending=False,
+                    return_point=cursor.return_point,
+                )
+            if hook_id is not None:
+                foreign_pending = any(
+                    item.status in {"QUEUED", "READY", "WAITING_CHOICE"} and item.hook_id != hook_id
+                    for item in state.rule_trigger_queue
+                )
+                if foreign_pending:
+                    return RuleWorkflowStep(
+                        kind="IDLE",
+                        cursor_id=cursor.cursor_id,
+                        queue_pending=True,
+                        return_point=cursor.return_point,
+                    )
+                resuming_hook = (
+                    cursor.return_point is not None
+                    and cursor.return_point.hook_id == hook_id
+                    and cursor.status in {"DRAINING", "WAITING_CHOICE", "RETURN_READY"}
+                    and any(item.hook_id == hook_id for item in state.rule_trigger_queue)
+                )
+                if not resuming_hook:
+                    source_id, hook_return_point = self._ordinary_speech_hook_source(state, hook_id)
+                    hook_occurrences = self._speech_hook_occurrences(
+                        state, hook_id, source_id=source_id
+                    )
+                    existing_ids = {item.occurrence_id for item in state.rule_trigger_queue}
+                    new_hook_occurrences = tuple(
+                        item for item in hook_occurrences if item.occurrence_id not in existing_ids
+                    )
+                    if new_hook_occurrences:
+                        if (
+                            cursor.status in {"IDLE", "RETURN_READY"}
+                            and not any(
+                                item.status in {"QUEUED", "READY", "WAITING_CHOICE"}
+                                for item in state.rule_trigger_queue
+                            )
+                            and not any(item.is_pending for item in state.rule_boundaries)
+                        ):
+                            # An ordinary speech hook is a new causal workflow
+                            # unless it was installed as part of a pending chain.
+                            cursor = RuleWorkflowCursor(budget_limit=cursor.budget_limit)
+                        data = _state_data(state)
+                        queue = (*state.rule_trigger_queue, *new_hook_occurrences)
+                        next_cursor = cursor.model_copy(
+                            update={
+                                "cursor_id": cursor.cursor_id
+                                or _stable_rule_identifier(
+                                    "hook-workflow",
+                                    state.game_id,
+                                    state.day_no,
+                                    hook_id,
+                                    source_id,
+                                ),
+                                "return_point": hook_return_point,
+                                "status": "DRAINING",
+                            }
+                        )
+                        data["rule_trigger_queue"] = tuple(
+                            item.model_dump(mode="python") for item in queue
+                        )
+                        data["rule_workflow_cursor"] = next_cursor.model_dump(mode="python")
+                        state = GameState.model_validate(data)
+                        cursor = state.rule_workflow_cursor or next_cursor
+                    elif (
+                        state.phase is GamePhase.DAY_SPEECH
+                        and cursor.status in {"IDLE", "RETURN_READY"}
+                        and not any(
+                            item.status in {"QUEUED", "READY", "WAITING_CHOICE"}
+                            for item in state.rule_trigger_queue
+                        )
+                        and not any(item.is_pending for item in state.rule_boundaries)
+                    ):
+                        # A valid speech boundary with no eligible hook skill
+                        # is an empty poll. Do not route it through the return
+                        # phase transition path or mutate the game.
+                        return RuleWorkflowStep(
+                            kind="IDLE",
+                            cursor_id=cursor.cursor_id,
+                            queue_pending=False,
+                            return_point=hook_return_point,
+                        )
+            pending = sorted(
+                (
+                    item
+                    for item in state.rule_trigger_queue
+                    if item.status in {"QUEUED", "READY", "WAITING_CHOICE"}
+                    and (hook_id is None or item.hook_id == hook_id)
+                ),
+                key=lambda item: (item.order, item.source_fact_id, item.ability_instance_id),
+            )
+            if (
+                hook_id is not None
+                and not pending
+                and any(
+                    item.status in {"QUEUED", "READY", "WAITING_CHOICE"}
+                    for item in state.rule_trigger_queue
+                )
+            ):
+                return RuleWorkflowStep(
+                    kind="IDLE",
+                    cursor_id=cursor.cursor_id,
+                    queue_pending=True,
+                    return_point=cursor.return_point,
+                )
+            if pending and pending[0].status in {"QUEUED", "READY"}:
+                invalid_reason = self._rule_occurrence_invalid_reason(state, pending[0])
+                if invalid_reason is not None:
+                    skipped = pending[0].model_copy(update={"status": "FAILED"})
+                    queue = tuple(
+                        skipped if item.occurrence_id == skipped.occurrence_id else item
+                        for item in state.rule_trigger_queue
+                    )
+                    next_cursor = cursor.model_copy(
+                        update={
+                            "active_occurrence_id": None,
+                            "active_window_ids": (),
+                            "steps_used": cursor.steps_used + 1,
+                            "status": "DRAINING",
+                            "error_code": None,
+                        }
+                    )
+                    data = _state_data(state)
+                    data["rule_trigger_queue"] = tuple(
+                        item.model_dump(mode="python") for item in queue
+                    )
+                    data["rule_workflow_cursor"] = next_cursor.model_dump(mode="python")
+                    data["moderator_audit"] = (
+                        *data["moderator_audit"],
+                        {
+                            "operation": "RULE_OCCURRENCE_SKIPPED",
+                            "occurrence_id": skipped.occurrence_id,
+                            "source_fact_id": skipped.source_fact_id,
+                            "ability_instance_id": skipped.ability_instance_id,
+                            "skill_id": skipped.skill_id,
+                            "reason": invalid_reason,
+                            "base_revision": state.state_revision,
+                            "committed_revision": state.state_revision + 1,
+                            "created_at": timestamp.isoformat(),
+                        },
+                    )
+                    data["state_revision"] = state.state_revision + 1
+                    data["updated_at"] = timestamp
+                    self._state = GameState.model_validate(data)
+                    return RuleWorkflowStep(
+                        kind="IDLE",
+                        cursor_id=next_cursor.cursor_id,
+                        queue_pending=True,
+                        return_point=next_cursor.return_point,
+                    )
+            if pending and cursor.active_occurrence_id == pending[0].occurrence_id:
+                active = pending[0]
+                if active.mode == "AUTOMATIC" and active.status == "READY":
+                    return self._workflow_step(
+                        active, self._workflow_skill(active), cursor, "AUTOMATIC"
+                    )
+                if active.mode == "PLAYER_CHOICE" and active.status == "WAITING_CHOICE":
+                    raw_window = state.action_windows.get(active.window_id or "")
+                    if raw_window is None:
+                        raise EventCommitError(
+                            "RULE_OCCURRENCE_INVALID: waiting choice window is missing"
+                        )
+                    waiting_action_window = _load_action_window(raw_window)
+                    return self._workflow_step(
+                        active,
+                        self._workflow_skill(active),
+                        cursor,
+                        "PLAYER_CHOICE",
+                        waiting_action_window,
+                    )
+            if cursor.steps_used >= cursor.budget_limit and pending:
+                next_cursor = cursor.model_copy(
+                    update={"status": "ERROR", "error_code": "RULE_WORKFLOW_BUDGET_EXHAUSTED"}
+                )
+                data = _state_data(state)
+                data["rule_workflow_cursor"] = next_cursor.model_dump(mode="python")
+                data["moderator_audit"] = (
+                    *data["moderator_audit"],
+                    {
+                        "operation": "RULE_WORKFLOW_ERROR",
+                        "error_code": "RULE_WORKFLOW_BUDGET_EXHAUSTED",
+                        "pending_occurrence_ids": [item.occurrence_id for item in pending],
+                        "base_revision": state.state_revision,
+                        "committed_revision": state.state_revision + 1,
+                        "created_at": timestamp.isoformat(),
+                    },
+                )
+                data["state_revision"] = state.state_revision + 1
+                data["updated_at"] = timestamp
+                self._state = GameState.model_validate(data)
+                return RuleWorkflowStep(
+                    kind="IDLE",
+                    cursor_id=next_cursor.cursor_id,
+                    queue_pending=True,
+                    return_point=next_cursor.return_point,
+                )
+            if pending:
+                occurrence = pending[0]
+                skill = self._workflow_skill(occurrence)
+                instance = next(
+                    (
+                        item
+                        for item in state.ability_instances
+                        if item.ability_instance_id == occurrence.ability_instance_id
+                        and item.actor_seat == occurrence.actor_seat
+                        and item.enabled
+                        and not item.consumed
+                    ),
+                    None,
+                )
+                if instance is None:
+                    raise EventCommitError("RULE_OCCURRENCE_INVALID: ability instance is inactive")
+                if occurrence.mode == "AUTOMATIC":
+                    next_occurrence = occurrence.model_copy(update={"status": "READY"})
+                    queue = tuple(
+                        next_occurrence if item.occurrence_id == occurrence.occurrence_id else item
+                        for item in state.rule_trigger_queue
+                    )
+                    next_cursor = cursor.model_copy(
+                        update={
+                            "cursor_id": cursor.cursor_id
+                            or _stable_rule_identifier(
+                                "workflow", state.game_id, state.round_no, occurrence.occurrence_id
+                            ),
+                            "settlement_group_id": f"automatic-{occurrence.occurrence_id}",
+                            "active_occurrence_id": occurrence.occurrence_id,
+                            "steps_used": cursor.steps_used + 1,
+                            "status": "DRAINING",
+                            "error_code": None,
+                        }
+                    )
+                    data = _state_data(state)
+                    data["rule_trigger_queue"] = tuple(
+                        item.model_dump(mode="python") for item in queue
+                    )
+                    data["rule_workflow_cursor"] = next_cursor.model_dump(mode="python")
+                    data["state_revision"] = state.state_revision + 1
+                    data["updated_at"] = timestamp
+                    self._state = GameState.model_validate(data)
+                    return self._workflow_step(occurrence, skill, next_cursor, "AUTOMATIC")
+
+                raw_window = state.action_windows.get(occurrence.window_id or "")
+                action_window: ActionWindow
+                if raw_window is not None:
+                    action_window = _load_action_window(raw_window)
+                else:
+                    action_window = self._build_trigger_action_window(
+                        state, occurrence, skill, now=timestamp
+                    )
+                    action_windows = dict(_state_data(state)["action_windows"])
+                    action_windows[action_window.window_id] = action_window.model_dump(mode="json")
+                    data = _state_data(state)
+                    data["action_windows"] = action_windows
+                    updated_occurrence = occurrence.model_copy(
+                        update={"status": "WAITING_CHOICE", "window_id": action_window.window_id}
+                    )
+                    data["rule_trigger_queue"] = tuple(
+                        updated_occurrence.model_dump(mode="python")
+                        if item.occurrence_id == occurrence.occurrence_id
+                        else item.model_dump(mode="python")
+                        for item in state.rule_trigger_queue
+                    )
+                    next_cursor = cursor.model_copy(
+                        update={
+                            "cursor_id": cursor.cursor_id
+                            or _stable_rule_identifier(
+                                "workflow", state.game_id, state.round_no, occurrence.occurrence_id
+                            ),
+                            "active_occurrence_id": occurrence.occurrence_id,
+                            "active_window_ids": (action_window.window_id,),
+                            "settlement_group_id": action_window.settlement_group_id,
+                            "steps_used": cursor.steps_used + 1,
+                            "status": "WAITING_CHOICE",
+                            "error_code": None,
+                        }
+                    )
+                    data["rule_workflow_cursor"] = next_cursor.model_dump(mode="python")
+                    data["phase"] = GamePhase.TRIGGER_ACTION
+                    data["pending_resolution"] = {
+                        "operation": "RULE_TRIGGER",
+                        "status": "RULE_TRIGGER_ACTION_REQUIRED",
+                        "occurrence_id": occurrence.occurrence_id,
+                        "source_fact_id": occurrence.source_fact_id,
+                        "window_id": action_window.window_id,
+                        "actor_seat": occurrence.actor_seat,
+                        "base_revision": state.state_revision,
+                    }
+                    data["state_revision"] = state.state_revision + 1
+                    data["updated_at"] = timestamp
+                    self._state = GameState.model_validate(data)
+                    return self._workflow_step(
+                        updated_occurrence, skill, next_cursor, "PLAYER_CHOICE", action_window
+                    )
+                return self._workflow_step(
+                    occurrence, skill, cursor, "PLAYER_CHOICE", action_window
+                )
+
+            boundary = None
+            if cursor.status == "WAITING_BOUNDARY" and cursor.pending_boundary_id is not None:
+                boundary = next(
+                    (
+                        item
+                        for item in state.rule_boundaries
+                        if item.boundary_id == cursor.pending_boundary_id
+                    ),
+                    None,
+                )
+            if boundary is None:
+                boundary = next((item for item in state.rule_boundaries if item.is_pending), None)
+            if boundary is not None:
+                updated_boundaries = self._refresh_boundary_completion(state, boundary)
+                refreshed = next(
+                    (
+                        item
+                        for item in updated_boundaries
+                        if item.boundary_id == boundary.boundary_id
+                    ),
+                    boundary,
+                )
+                data = _state_data(state)
+                data["rule_boundaries"] = tuple(
+                    item.model_dump(mode="python") for item in updated_boundaries
+                )
+                if not refreshed.is_pending:
+                    refreshed = refreshed.model_copy(update={"completed_at": timestamp})
+                    data["rule_boundaries"] = tuple(
+                        item.model_dump(mode="python")
+                        if item.boundary_id != refreshed.boundary_id
+                        else refreshed.model_dump(mode="python")
+                        for item in updated_boundaries
+                    )
+                    pending_occurrences = any(
+                        item.status in {"QUEUED", "READY", "WAITING_CHOICE"}
+                        for item in state.rule_trigger_queue
+                    )
+                    next_boundary = next(
+                        (item for item in updated_boundaries if item.is_pending),
+                        None,
+                    )
+                    next_cursor = cursor.model_copy(
+                        update={
+                            "pending_boundary_id": (
+                                next_boundary.boundary_id if next_boundary is not None else None
+                            ),
+                            "status": (
+                                "DRAINING"
+                                if pending_occurrences or next_boundary is not None
+                                else "RETURN_READY"
+                            ),
+                        }
+                    )
+                    data["rule_workflow_cursor"] = next_cursor.model_dump(mode="python")
+                    data["state_revision"] = state.state_revision + 1
+                    data["updated_at"] = timestamp
+                    self._state = GameState.model_validate(data)
+                    return RuleWorkflowStep(
+                        kind="IDLE",
+                        cursor_id=next_cursor.cursor_id,
+                        queue_pending=pending_occurrences or next_boundary is not None,
+                        return_point=next_cursor.return_point,
+                    )
+                next_cursor = cursor.model_copy(
+                    update={
+                        "pending_boundary_id": refreshed.boundary_id,
+                        "status": "WAITING_BOUNDARY",
+                        "active_occurrence_id": None,
+                    }
+                )
+                data["rule_workflow_cursor"] = next_cursor.model_dump(mode="python")
+                terminal_night_announcement = (
+                    refreshed.return_point.phase is GamePhase.DAY_ANNOUNCE
+                    and self._has_terminal_night_boundary_source(state, refreshed)
+                )
+                boundary_target_phase = (
+                    GamePhase.DAY_ANNOUNCE
+                    if terminal_night_announcement
+                    else GamePhase.DAY_RESOLVE
+                    if refreshed.return_point.phase is GamePhase.DAY_SPEECH
+                    or (
+                        refreshed.return_point.logical_window_id is not None
+                        and refreshed.return_point.phase
+                        in {
+                            GamePhase.NIGHT_TEAM_CHAT,
+                            GamePhase.NIGHT_ACTION,
+                            GamePhase.NIGHT_RESOLVE,
+                        }
+                    )
+                    else GamePhase.DAY_ANNOUNCE
+                    if refreshed.return_point.phase
+                    in {GamePhase.NIGHT_ACTION, GamePhase.NIGHT_RESOLVE, GamePhase.NIGHT_TEAM_CHAT}
+                    else GamePhase.DAY_RESOLVE
+                )
+                if state.phase is not boundary_target_phase:
+                    data["phase"] = boundary_target_phase
+                    if (
+                        boundary_target_phase is GamePhase.DAY_ANNOUNCE
+                        and state.day_no == refreshed.return_point.day_no
+                    ):
+                        data["day_no"] = state.day_no + 1
+                data["state_revision"] = state.state_revision + 1
+                data["updated_at"] = timestamp
+                self._state = GameState.model_validate(data)
+                return RuleWorkflowStep(
+                    kind="RETURN",
+                    return_point=refreshed.return_point,
+                    next_phase=boundary_target_phase,
+                    queue_pending=False,
+                    cursor_id=next_cursor.cursor_id,
+                    boundary=refreshed,
+                )
+
+            target_phase: GamePhase | None = None
+            if cursor.pending_flow_action == "ADVANCE_TO_NIGHT":
+                target_phase = GamePhase.VICTORY_CHECK
+            elif cursor.return_point is not None:
+                target_phase = cursor.return_point.phase
+            if target_phase is None:
+                target_phase = state.phase
+            if cursor.pending_flow_action == "ADVANCE_TO_NIGHT":
+                return_allowed = target_phase is GamePhase.VICTORY_CHECK and can_transition(
+                    state.phase, target_phase
+                )
+            else:
+                return_allowed = self._valid_rule_workflow_return(state, cursor, target_phase)
+            if not return_allowed:
+                raise EventCommitError(
+                    "PHASE_INVALID: workflow cannot return "
+                    f"{state.phase.value} to {target_phase.value}"
+                )
+            next_cursor = cursor.model_copy(
+                update={
+                    "status": "IDLE",
+                    "active_occurrence_id": None,
+                    "active_window_ids": (),
+                    "pending_boundary_id": None,
+                    "pending_flow_action": None,
+                    "error_code": None,
+                }
+            )
+            data = _state_data(state)
+            data["rule_workflow_cursor"] = next_cursor.model_dump(mode="python")
+            data["pending_resolution"] = None
+            if cursor.pending_flow_action == "ADVANCE_TO_NIGHT":
+                if state.serial_turn is not None:
+                    raise EventCommitError(
+                        "RULE_FLOW_ACTION_BLOCKED: ordinary serial turn is still active"
+                    )
+                cancelled_queue = tuple(state.current_queue or ())
+                data["current_queue"] = ()
+                if cancelled_queue:
+                    data["moderator_audit"] = (
+                        *data["moderator_audit"],
+                        {
+                            "operation": "DAY_SPEECH_SUFFIX_CANCELLED",
+                            "source_cursor_id": cursor.cursor_id,
+                            "source_hook_id": (
+                                cursor.return_point.hook_id
+                                if cursor.return_point is not None
+                                else None
+                            ),
+                            "source_serial_turn_id": (
+                                cursor.return_point.serial_turn_id
+                                if cursor.return_point is not None
+                                else None
+                            ),
+                            "source_day_no": state.day_no,
+                            "cancelled_seats": list(cancelled_queue),
+                            "base_revision": state.state_revision,
+                            "committed_revision": state.state_revision + 1,
+                            "created_at": timestamp.isoformat(),
+                        },
+                    )
+            # Keep the workflow cursor and the lifecycle edge in one atomic
+            # state replacement. For standard edges, reuse the phase reducer
+            # so day/round counters follow the same semantics as an ordinary
+            # coordinator transition.
+            intermediate = GameState.model_validate(data)
+            if can_transition(state.phase, target_phase):
+                returned = transition_phase(
+                    intermediate,
+                    target_phase,
+                    expected_revision=state.state_revision,
+                    now=timestamp,
+                )
+            else:
+                data = _state_data(intermediate)
+                data["phase"] = target_phase
+                data["state_revision"] = state.state_revision + 1
+                data["updated_at"] = timestamp
+                returned = GameState.model_validate(data)
+            if returned.phase is GamePhase.NIGHT_TEAM_CHAT or returned.round_no > state.round_no:
+                returned_data = _state_data(returned)
+                returned_data["rule_state"] = tuple(
+                    _rule_state_payload(value)
+                    for value in returned.rule_state
+                    if not (
+                        value.expires_at_round is not None
+                        and value.expires_at_round <= returned.round_no
+                        and (
+                            value.expiry_policy == "ROUND_END"
+                            or (
+                                value.expiry_policy == "NEXT_NIGHT_START"
+                                and returned.phase is GamePhase.NIGHT_TEAM_CHAT
+                            )
+                        )
+                    )
+                )
+                returned_data["rule_relations"] = tuple(
+                    value.model_dump(mode="python")
+                    for value in returned.rule_relations
+                    if not (
+                        value.expires_at_round is not None
+                        and value.expires_at_round <= returned.round_no
+                        and (
+                            value.expiry_policy == "ROUND_END"
+                            or (
+                                value.expiry_policy == "NEXT_NIGHT_START"
+                                and returned.phase is GamePhase.NIGHT_TEAM_CHAT
+                            )
+                        )
+                    )
+                )
+                returned = GameState.model_validate(returned_data)
+            returned = self._release_due_rule_disclosures(
+                returned,
+                target_phase.value,
+                None,
+                timestamp=timestamp,
+                next_revision=returned.state_revision,
+            )
+            self._state = returned
+            return RuleWorkflowStep(
+                kind="RETURN",
+                return_point=next_cursor.return_point,
+                next_phase=target_phase,
+                queue_pending=False,
+                cursor_id=next_cursor.cursor_id,
+            )
+
+    def _rule_occurrence_for_window(
+        self,
+        state: GameState,
+        window: ActionWindow,
+    ) -> RuleTriggerOccurrence | None:
+        if self._execution_package is None or window.phase is not GamePhase.TRIGGER_ACTION:
+            return None
+        occurrence_id = window.visible_context.get("rule_occurrence_id")
+        source_fact_id = window.visible_context.get("rule_source_fact_id")
+        actor_seat = window.visible_context.get("rule_actor_seat")
+        instance_id = window.visible_context.get("rule_ability_instance_id")
+        skill_id = window.visible_context.get("rule_skill_id")
+        action_code = window.visible_context.get("rule_action_code")
+        if (
+            not isinstance(occurrence_id, str)
+            or not isinstance(source_fact_id, str)
+            or type(actor_seat) is not int
+            or not isinstance(instance_id, str)
+            or not isinstance(skill_id, str)
+            or type(action_code) is not int
+        ):
+            return None
+        cursor = state.rule_workflow_cursor
+        pending = state.pending_resolution
+        if (
+            state.phase is not GamePhase.TRIGGER_ACTION
+            or cursor is None
+            or cursor.status not in {"WAITING_CHOICE", "COLLECTING"}
+            or cursor.active_occurrence_id != occurrence_id
+            or window.window_id not in cursor.active_window_ids
+            or cursor.settlement_group_id != window.settlement_group_id
+            or not isinstance(pending, Mapping)
+            or pending.get("operation") != "RULE_TRIGGER"
+            or pending.get("status") != "RULE_TRIGGER_ACTION_REQUIRED"
+            or pending.get("occurrence_id") != occurrence_id
+            or pending.get("window_id") != window.window_id
+            or pending.get("source_fact_id") != source_fact_id
+            or pending.get("actor_seat") != actor_seat
+        ):
+            return None
+        occurrence = next(
+            (
+                item
+                for item in state.rule_trigger_queue
+                if item.occurrence_id == occurrence_id
+                and item.source_fact_id == source_fact_id
+                and item.actor_seat == actor_seat
+                and item.ability_instance_id == instance_id
+                and item.skill_id == skill_id
+                and item.status == "WAITING_CHOICE"
+                and item.mode == "PLAYER_CHOICE"
+            ),
+            None,
+        )
+        if occurrence is None or occurrence.window_id != window.window_id:
+            return None
+        skill = next(
+            (item for item in self._execution_package.skills if item.skill_id == skill_id), None
+        )
+        instance = next(
+            (
+                item
+                for item in state.ability_instances
+                if item.ability_instance_id == instance_id
+                and item.actor_seat == actor_seat
+                and item.skill_id == skill_id
+                and item.enabled
+                and not item.consumed
+            ),
+            None,
+        )
+        player = state.players.get(actor_seat)
+        if (
+            skill is None
+            or instance is None
+            or player is None
+            or skill.action_code != action_code
+            or window.game_id != state.game_id
+            or window.session_epoch != player.session_epoch
+            or window.min_actions != 1
+            or window.max_actions != 1
+        ):
+            return None
+        if window.allowed_seats != (actor_seat,) or window.allowed_role_ids:
+            return None
+        expected_codes = (skill.action_code, 299) if window.allow_pass else (skill.action_code,)
+        if (
+            window.allowed_action_codes != expected_codes
+            or window.logical_window_id != occurrence.logical_window_id
+        ):
+            return None
+        stored_window = state.action_windows.get(window.window_id)
+        if stored_window is not None:
+            try:
+                if _load_action_window(stored_window) != window:
+                    return None
+            except (TypeError, ValueError):
+                return None
+        if occurrence.kind == "HOOK":
+            if (
+                occurrence.hook_id not in skill.hook_ids
+                or skill.trigger is not None
+                or window.hook_id != occurrence.hook_id
+            ):
+                return None
+            cursor = state.rule_workflow_cursor
+            return_point = cursor.return_point if cursor is not None else None
+            if return_point is None or return_point.hook_id != occurrence.hook_id:
+                return None
+            if occurrence.hook_id == "DAY_SPEECH_BEFORE":
+                if (
+                    not state.current_queue
+                    or state.current_queue[0] != return_point.speaker_seat
+                    or return_point.serial_turn_id != f"before-{source_fact_id}"
+                ):
+                    return None
+                expected_source = _stable_rule_identifier(
+                    "speech-before",
+                    state.game_id,
+                    state.day_no,
+                    return_point.speaker_seat,
+                    ",".join(str(item) for item in state.current_queue),
+                )
+            else:
+                last_turn = state.last_serial_turn
+                if (
+                    last_turn is None
+                    or last_turn.request_id != return_point.serial_turn_id
+                    or last_turn.seat != return_point.speaker_seat
+                    or last_turn.event_ids != return_point.event_ids
+                    or not any(
+                        event.event_id in last_turn.event_ids
+                        and event.event_type is EventType.SPEECH
+                        and event.phase is GamePhase.DAY_SPEECH
+                        and event.actor_seat == last_turn.seat
+                        for event in _typed_events(state)
+                    )
+                ):
+                    return None
+                expected_source = _stable_rule_identifier(
+                    "speech-after",
+                    state.game_id,
+                    state.day_no,
+                    last_turn.request_id,
+                    ",".join(str(item) for item in last_turn.event_ids),
+                )
+            if occurrence.source_fact_id != expected_source or occurrence.source_batch_id != (
+                _stable_rule_identifier(
+                    "hook-batch",
+                    state.game_id,
+                    state.day_no,
+                    occurrence.hook_id,
+                    expected_source,
+                )
+            ):
+                return None
+        else:
+            source_entry = next(
+                (
+                    entry
+                    for entry in state.rule_ledger
+                    if entry.batch_id == occurrence.source_batch_id
+                    and any(item.fact_id == source_fact_id for item in entry.facts)
+                ),
+                None,
+            )
+            fact = (
+                next(
+                    (item for item in source_entry.facts if item.fact_id == source_fact_id),
+                    None,
+                )
+                if source_entry is not None
+                else None
+            )
+            if fact is None:
+                return None
+            if skill.trigger is not None:
+                if (
+                    skill.trigger.mode != "PLAYER_CHOICE"
+                    or fact.fact_type not in skill.trigger.fact_types
+                ):
+                    return None
+                try:
+                    observation = (
+                        self._rules.observation(
+                            state,
+                            group_id=f"trigger-check:{occurrence.occurrence_id}",
+                            timing=GamePhase.TRIGGER_ACTION.value,
+                        )
+                        if self._rules is not None
+                        else None
+                    )
+                    if observation is None:
+                        return None
+                    observed_fact = DomainFact(
+                        fact_id=fact.fact_id,
+                        fact_type=fact.fact_type,
+                        source_rule_id=fact.source_rule_id,
+                        source_request_id=fact.source_request_id,
+                        actor_seat=fact.actor_seat,
+                        target_seat=fact.target_seat,
+                        death_cause=fact.death_cause,
+                        tags=fact.tags,
+                        data=json.loads(json.dumps(fact.data)),
+                    )
+                    observation = observation.model_copy(
+                        update={"facts": (*observation.facts, observed_fact)}
+                    )
+                    context = {
+                        "actor": next(
+                            item for item in observation.players if item.seat == actor_seat
+                        ),
+                        "target": next(
+                            (item for item in observation.players if item.seat == fact.target_seat),
+                            None,
+                        ),
+                        "source_fact": observed_fact,
+                        "observation": observation,
+                        "skill_state": {
+                            item.key: item.value
+                            for item in observation.skill_state
+                            if item.ability_instance_id == instance_id
+                        },
+                        "item": None,
+                    }
+                    if not evaluate_predicate(skill.trigger.condition, context):
+                        return None
+                except (StopIteration, TypeError, ValueError):
+                    return None
+            else:
+                legacy = next(
+                    (
+                        item
+                        for item in player.granted_trigger_abilities
+                        if item.action_code == skill.action_code and not item.consumed
+                    ),
+                    None,
+                )
+                if (
+                    legacy is None
+                    or sum(
+                        item.action_code == skill.action_code and not item.consumed
+                        for item in player.granted_trigger_abilities
+                    )
+                    != 1
+                    or legacy.trigger.mode is not TriggerMode.PLAYER_CHOICE
+                ):
+                    return None
+                trigger_event = legacy.trigger.event.value
+                if trigger_event == TriggerEvent.DEATH_CONFIRMED.value:
+                    if (
+                        fact.fact_type not in {"DEATH_CONFIRMED", "death_confirmed"}
+                        or fact.target_seat != actor_seat
+                        or player.alive
+                        or fact.death_cause not in legacy.trigger.allowed_death_causes
+                        or player.death_cause != fact.death_cause
+                    ):
+                        return None
+                elif fact.fact_type != trigger_event:
+                    return None
+        supplied_targets = window.visible_context.get("candidate_seats")
+        public_target_set = tuple(sorted(state.players))
+        if (
+            not isinstance(supplied_targets, (list, tuple))
+            or tuple(supplied_targets) != public_target_set
+        ):
+            return None
+        targets_by_action = window.visible_context.get("targets_by_action")
+        action_targets = (
+            targets_by_action.get(str(skill.action_code))
+            if isinstance(targets_by_action, Mapping)
+            else None
+        )
+        if (
+            not isinstance(action_targets, (list, tuple))
+            or tuple(action_targets) != public_target_set
+        ):
+            return None
+        return occurrence
+
+    def _is_trusted_speech_hook_request(
+        self,
+        state: GameState,
+        request: SkillRequest,
+    ) -> bool:
+        """Permit TRIGGER_ACTION timing only for a proven DAY_SPEECH hook."""
+
+        if (
+            request.hook_id not in {"DAY_SPEECH_BEFORE", "DAY_SPEECH_AFTER"}
+            or request.window_id is None
+            or request.trigger_occurrence_id is None
+            or request.source_fact_id is None
+        ):
+            return False
+        raw_window = state.action_windows.get(request.window_id)
+        if raw_window is None:
+            return False
+        try:
+            window = _load_action_window(raw_window)
+        except (TypeError, ValueError):
+            return False
+        occurrence = self._rule_occurrence_for_window(state, window)
+        if (
+            occurrence is None
+            or occurrence.kind != "HOOK"
+            or occurrence.occurrence_id != request.trigger_occurrence_id
+            or occurrence.source_fact_id != request.source_fact_id
+            or occurrence.actor_seat != request.actor_seat
+            or occurrence.ability_instance_id != request.ability_instance_id
+            or occurrence.skill_id != request.skill_id
+            or occurrence.hook_id != request.hook_id
+        ):
+            return False
+        skill = (
+            next(
+                (
+                    item
+                    for item in self._execution_package.skills
+                    if item.skill_id == occurrence.skill_id
+                ),
+                None,
+            )
+            if self._execution_package is not None
+            else None
+        )
+        return bool(
+            skill is not None
+            and skill.trigger is None
+            and request.hook_id in skill.hook_ids
+            and GamePhase.DAY_SPEECH.value in skill.timing
+            and self._trusted_active_hook_return_point(state, occurrence)
+        )
+
+    @staticmethod
+    def _trusted_active_hook_return_point(
+        state: GameState,
+        occurrence: RuleTriggerOccurrence,
+    ) -> bool:
+        """Verify the ordinary speech boundary that created this occurrence."""
+
+        cursor = state.rule_workflow_cursor
+        return_point = cursor.return_point if cursor is not None else None
+        if (
+            cursor is None
+            or cursor.status not in {"WAITING_CHOICE", "COLLECTING"}
+            or return_point is None
+            or return_point.phase is not GamePhase.DAY_SPEECH
+            or return_point.hook_id != occurrence.hook_id
+            or return_point.day_no != state.day_no
+            or occurrence.hook_id not in {"DAY_SPEECH_BEFORE", "DAY_SPEECH_AFTER"}
+        ):
+            return False
+        if occurrence.hook_id == "DAY_SPEECH_BEFORE":
+            if (
+                state.serial_turn is not None
+                or not state.current_queue
+                or state.current_queue[0] != return_point.speaker_seat
+                or return_point.serial_turn_id != f"before-{occurrence.source_fact_id}"
+                or return_point.event_ids
+            ):
+                return False
+            expected_source = _stable_rule_identifier(
+                "speech-before",
+                state.game_id,
+                state.day_no,
+                return_point.speaker_seat,
+                ",".join(str(item) for item in state.current_queue),
+            )
+        else:
+            last_turn = state.last_serial_turn
+            if (
+                state.serial_turn is not None
+                or last_turn is None
+                or last_turn.request_id != return_point.serial_turn_id
+                or last_turn.seat != return_point.speaker_seat
+                or last_turn.event_ids != return_point.event_ids
+                or not any(
+                    event.event_id in last_turn.event_ids
+                    and event.event_type is EventType.SPEECH
+                    and event.phase is GamePhase.DAY_SPEECH
+                    and event.actor_seat == last_turn.seat
+                    for event in _typed_events(state)
+                )
+            ):
+                return False
+            expected_source = _stable_rule_identifier(
+                "speech-after",
+                state.game_id,
+                state.day_no,
+                last_turn.request_id,
+                ",".join(str(item) for item in last_turn.event_ids),
+            )
+        return occurrence.source_fact_id == expected_source
+
+    def _trigger_target_seats(
+        self,
+        state: GameState,
+        occurrence: RuleTriggerOccurrence,
+        skill: SkillSpec,
+    ) -> tuple[int, ...]:
+        if self._rules is None:
+            return ()
+        observation = self._rules.observation(
+            state,
+            group_id=f"trigger-targets:{occurrence.occurrence_id}",
+            timing=GamePhase.TRIGGER_ACTION.value,
+        )
+        actor = next(
+            (item for item in observation.players if item.seat == occurrence.actor_seat),
+            None,
+        )
+        if actor is None:
+            return ()
+        skill_state = {
+            item.key: item.value
+            for item in observation.skill_state
+            if item.ability_instance_id == occurrence.ability_instance_id
+        }
+        return tuple(
+            sorted(
+                set(
+                    select_seats(
+                        skill.targets.selector,
+                        {
+                            "actor": actor,
+                            "observation": observation,
+                            "skill_state": skill_state,
+                            "request_targets": (),
+                        },
+                    )
+                )
+            )
+        )
+
+    def _workflow_skill(self, occurrence: RuleTriggerOccurrence) -> SkillSpec:
+        package = self._execution_package
+        if package is None:
+            raise EventCommitError("RULE_PACKAGE_MISSING: game has no pinned execution package")
+        skill = next(
+            (item for item in package.skills if item.skill_id == occurrence.skill_id), None
+        )
+        if skill is None:
+            raise EventCommitError("RULE_OCCURRENCE_INVALID: trigger skill is not frozen")
+        return skill
+
+    def _rule_occurrence_invalid_reason(
+        self,
+        state: GameState,
+        occurrence: RuleTriggerOccurrence,
+    ) -> str | None:
+        """Check that a queued source and its frozen ability are still usable."""
+
+        package = self._execution_package
+        if package is None or self._rules is None:
+            return "execution_package_missing"
+        skill = next(
+            (item for item in package.skills if item.skill_id == occurrence.skill_id), None
+        )
+        if skill is None:
+            return "skill_not_frozen"
+        instance = next(
+            (
+                item
+                for item in state.ability_instances
+                if item.ability_instance_id == occurrence.ability_instance_id
+                and item.actor_seat == occurrence.actor_seat
+                and item.skill_id == occurrence.skill_id
+                and item.enabled
+                and not item.consumed
+                and item.grant_id in {grant.grant_id for grant in skill.grants}
+            ),
+            None,
+        )
+        if instance is None:
+            return "ability_instance_inactive"
+        capacity_reason = self._rule_instance_capacity_reason(state, instance, skill)
+        if capacity_reason is not None:
+            return capacity_reason
+        actor = state.players.get(occurrence.actor_seat)
+        if actor is None:
+            return "actor_missing"
+
+        source_fact: RuleFactRecord | None = None
+        domain_fact: DomainFact | None = None
+        if occurrence.kind == "HOOK":
+            if (
+                occurrence.mode != "PLAYER_CHOICE"
+                or instance.grant_kind != "ACTIVE"
+                or skill.mode != "PLAYER"
+                or skill.trigger is not None
+                or occurrence.hook_id not in skill.hook_ids
+                or GamePhase.DAY_SPEECH.value not in skill.timing
+                or not actor.alive
+            ):
+                return "hook_skill_no_longer_eligible"
+            cursor = state.rule_workflow_cursor
+            if cursor is None or cursor.return_point is None:
+                return "hook_return_point_missing"
+            try:
+                actual_source, actual_return = self._ordinary_speech_hook_source(
+                    state,
+                    occurrence.hook_id,
+                )
+            except EventCommitError:
+                return "ordinary_speech_source_expired"
+            if (
+                actual_source != occurrence.source_fact_id
+                or cursor.return_point != actual_return
+                or occurrence.source_batch_id
+                != _stable_rule_identifier(
+                    "hook-batch",
+                    state.game_id,
+                    state.day_no,
+                    occurrence.hook_id,
+                    actual_source,
+                )
+            ):
+                return "ordinary_speech_source_mismatch"
+            timing = GamePhase.DAY_SPEECH.value
+        else:
+            trigger = skill.trigger
+            source_fact = next(
+                (
+                    fact
+                    for entry in state.rule_ledger
+                    if entry.batch_id == occurrence.source_batch_id
+                    for fact in entry.facts
+                    if fact.fact_id == occurrence.source_fact_id
+                ),
+                None,
+            )
+            if source_fact is None:
+                return "trigger_source_fact_expired"
+            if trigger is not None:
+                if (
+                    trigger.mode != occurrence.mode
+                    or instance.grant_kind != "TRIGGER"
+                    or source_fact.fact_type not in trigger.fact_types
+                ):
+                    return "trigger_skill_no_longer_eligible"
+            else:
+                legacy_grant = self._legacy_trigger_grant(state, instance, skill)
+                if (
+                    legacy_grant is None
+                    or legacy_grant.trigger.event is not TriggerEvent.DEATH_CONFIRMED
+                    or legacy_grant.trigger.mode.value != occurrence.mode
+                    or source_fact.fact_type.lower() != TriggerEvent.DEATH_CONFIRMED.value.lower()
+                    or source_fact.target_seat != occurrence.actor_seat
+                    or actor.alive
+                    or source_fact.death_cause not in legacy_grant.trigger.allowed_death_causes
+                    or actor.death_cause != source_fact.death_cause
+                ):
+                    return "legacy_trigger_source_no_longer_eligible"
+            domain_fact = DomainFact(
+                fact_id=source_fact.fact_id,
+                fact_type=source_fact.fact_type,
+                source_rule_id=source_fact.source_rule_id,
+                source_request_id=source_fact.source_request_id,
+                actor_seat=source_fact.actor_seat,
+                target_seat=source_fact.target_seat,
+                death_cause=source_fact.death_cause,
+                tags=source_fact.tags,
+                data=json.loads(json.dumps(source_fact.data)),
+            )
+            timing = GamePhase.TRIGGER_ACTION.value
+
+        try:
+            observation = self._rules.observation(
+                state,
+                group_id=f"occurrence-eligibility:{occurrence.occurrence_id}",
+                timing=timing,
+            )
+        except (RuleAdapterError, TypeError, ValueError):
+            return "eligibility_observation_invalid"
+        observed_players = {item.seat: item for item in observation.players}
+        if occurrence.kind == "TRIGGER" and skill.trigger is not None:
+            observed_fact = domain_fact
+            if observed_fact is None:
+                return "trigger_source_fact_expired"
+            trigger_context = {
+                "actor": observed_players.get(occurrence.actor_seat),
+                "target": (
+                    observed_players.get(observed_fact.target_seat)
+                    if observed_fact.target_seat is not None
+                    else None
+                ),
+                "source_fact": observed_fact,
+                "observation": observation,
+                "skill_state": {
+                    item.key: item.value
+                    for item in observation.skill_state
+                    if item.ability_instance_id == instance.ability_instance_id
+                },
+                "item": None,
+            }
+            try:
+                if not evaluate_predicate(skill.trigger.condition, trigger_context):
+                    return "trigger_condition_no_longer_met"
+            except (TypeError, ValueError):
+                return "trigger_condition_invalid"
+        if not self._rule_skill_condition_is_eligible(
+            observation,
+            skill,
+            instance,
+            actor=observed_players.get(occurrence.actor_seat),
+            target=(
+                observed_players.get(domain_fact.target_seat)
+                if domain_fact is not None and domain_fact.target_seat is not None
+                else None
+            ),
+            source_fact=domain_fact,
+            request={
+                "request_id": occurrence.request_id or occurrence.occurrence_id,
+                "action_code": skill.action_code,
+                "passed": False,
+                "actor_seat": occurrence.actor_seat,
+                "target_count": 0,
+                "parameters": {},
+                "window_id": occurrence.window_id,
+                "logical_window_id": occurrence.logical_window_id,
+                "hook_id": occurrence.hook_id,
+            },
+        ):
+            return "skill_condition_no_longer_met"
+        return None
+
+    def _automatic_skill_request(
+        self,
+        state: GameState,
+        occurrence: RuleTriggerOccurrence,
+        *,
+        group_id: str,
+    ) -> SkillRequest:
+        skill = self._workflow_skill(occurrence)
+        if skill.trigger is None or skill.trigger.mode != "AUTOMATIC":
+            raise EventCommitError(
+                "RULE_OCCURRENCE_INVALID: automatic execution requires a frozen automatic trigger"
+            )
+        facts = {fact.fact_id: fact for entry in state.rule_ledger for fact in entry.facts}
+        fact = facts.get(occurrence.source_fact_id)
+        if fact is None or fact.fact_type not in skill.trigger.fact_types:
+            raise EventCommitError("RULE_OCCURRENCE_INVALID: source fact is not confirmed")
+        instance = next(
+            (
+                item
+                for item in state.ability_instances
+                if item.ability_instance_id == occurrence.ability_instance_id
+                and item.actor_seat == occurrence.actor_seat
+                and item.skill_id == skill.skill_id
+                and item.enabled
+                and not item.consumed
+            ),
+            None,
+        )
+        if instance is None:
+            raise EventCommitError("RULE_OCCURRENCE_INVALID: ability instance is inactive")
+        return SkillRequest(
+            request_id=f"automatic-{occurrence.occurrence_id}",
+            ability_instance_id=instance.ability_instance_id,
+            skill_id=skill.skill_id,
+            action_code=skill.action_code,
+            actor_seat=occurrence.actor_seat,
+            origin="AUTOMATIC",
+            trigger_occurrence_id=occurrence.occurrence_id,
+            source_fact_id=occurrence.source_fact_id,
+            window_id=occurrence.window_id or f"auto-{occurrence.occurrence_id}",
+            logical_window_id=occurrence.logical_window_id
+            or (skill.window_ids[0] if skill.window_ids else None),
+            hook_id=occurrence.hook_id,
+        )
+
+    def _build_trigger_action_window(
+        self,
+        state: GameState,
+        occurrence: RuleTriggerOccurrence,
+        skill: SkillSpec,
+        *,
+        now: datetime,
+    ) -> ActionWindow:
+        if self._rules is None or self._execution_package is None:
+            raise EventCommitError("RULE_PACKAGE_MISSING: game has no pinned execution package")
+        player = state.players.get(occurrence.actor_seat)
+        if player is None:
+            raise EventCommitError("RULE_OCCURRENCE_INVALID: trigger actor is unassigned")
+        try:
+            authorized_targets = self._trigger_target_seats(state, occurrence, skill)
+        except (TypeError, ValueError) as exc:
+            raise EventCommitError("RULE_TARGET_INVALID: trigger selector failed") from exc
+        if any(seat not in state.players for seat in authorized_targets):
+            raise EventCommitError("RULE_TARGET_INVALID: trigger selector returned an unknown seat")
+        action_spec = next(
+            (
+                item
+                for item in self._execution_package.actions
+                if item.action_code == skill.action_code
+            ),
+            None,
+        )
+        if action_spec is None:
+            raise EventCommitError("RULE_ACTION_INVALID: trigger action is not frozen")
+        allow_pass = bool(action_spec.allow_pass and skill.mode == "PLAYER")
+        allowed_codes = (skill.action_code, 299) if allow_pass else (skill.action_code,)
+        window_id = f"rule-trigger-{occurrence.occurrence_id}"
+        if len(window_id) > 128:
+            window_id = f"trigger-{_stable_rule_identifier(occurrence.occurrence_id)}"
+        logical_window_id = occurrence.logical_window_id or (
+            skill.window_ids[0] if skill.window_ids else None
+        )
+        # Keep the private selector result inside the manager. A narrowed list
+        # would disclose hidden roles, factions, or unannounced deaths. The
+        # request reducer re-runs that selector against the frozen snapshot.
+        public_candidates = tuple(sorted(state.players))
+        return ActionWindow(
+            window_id=window_id,
+            game_id=state.game_id,
+            session_epoch=player.session_epoch,
+            phase=GamePhase.TRIGGER_ACTION,
+            allowed_seats=(occurrence.actor_seat,),
+            allowed_action_codes=allowed_codes,
+            min_actions=1,
+            max_actions=1,
+            allow_pass=allow_pass,
+            opened_at=now,
+            settlement_group_id=f"trigger-{occurrence.occurrence_id}",
+            logical_window_id=logical_window_id,
+            hook_id=occurrence.hook_id,
+            visible_context={
+                "rule_occurrence_id": occurrence.occurrence_id,
+                "rule_source_fact_id": occurrence.source_fact_id,
+                "rule_actor_seat": occurrence.actor_seat,
+                "rule_ability_instance_id": occurrence.ability_instance_id,
+                "rule_skill_id": occurrence.skill_id,
+                "rule_action_code": skill.action_code,
+                "candidate_seats": list(public_candidates),
+                "targets_by_action": {str(skill.action_code): list(public_candidates)},
+            },
+            max_submissions_per_seat=1,
+        )
+
+    @staticmethod
+    def _workflow_step(
+        occurrence: RuleTriggerOccurrence,
+        skill: SkillSpec,
+        cursor: RuleWorkflowCursor,
+        kind: Literal["AUTOMATIC", "PLAYER_CHOICE"],
+        action_window: ActionWindow | None = None,
+    ) -> RuleWorkflowStep:
+        return RuleWorkflowStep(
+            kind=kind,
+            occurrence_id=occurrence.occurrence_id,
+            source_fact_id=occurrence.source_fact_id,
+            actor_seat=occurrence.actor_seat,
+            ability_instance_id=occurrence.ability_instance_id,
+            skill_id=occurrence.skill_id,
+            mode=occurrence.mode,
+            window_id=action_window.window_id
+            if action_window is not None
+            else occurrence.window_id,
+            hook_id=occurrence.hook_id,
+            action_window=action_window,
+            return_point=cursor.return_point,
+            queue_pending=True,
+            cursor_id=cursor.cursor_id,
+        )
+
+    def _refresh_boundary_completion(
+        self,
+        state: GameState,
+        selected: RuleBoundary,
+    ) -> tuple[RuleBoundary, ...]:
+        """Rebuild boundary completion from persisted host evidence."""
+
+        completed_seats = set(selected.last_words_completed_seats)
+        try:
+            events_by_id = {event.event_id: event for event in _typed_events(state)}
+        except EventCommitError:
+            # A malformed or legacy event log is not proof that a boundary
+            # speech was committed. Existing tuple state remains authoritative.
+            events_by_id = {}
+        for audit in state.moderator_audit:
+            if (
+                audit.get("operation") != "RULE_BOUNDARY_LAST_WORDS_SPEECH_COMPLETE"
+                or audit.get("boundary_id") != selected.boundary_id
+                or audit.get("source_group_id") != selected.source_group_id
+                or audit.get("source_batch_id") != selected.source_batch_id
+                or _frozen_string_tuple(audit.get("death_fact_ids")) != selected.death_fact_ids
+            ):
+                continue
+            seat = audit.get("seat")
+            event_id = audit.get("speech_event_id")
+            request_id = audit.get("request_id")
+            logical_request_id = audit.get("logical_request_id")
+            session_epoch = audit.get("session_epoch")
+            attempt_no = audit.get("attempt_no")
+            if (
+                type(seat) is not int
+                or seat not in selected.last_words_seats
+                or type(event_id) is not int
+                or not isinstance(request_id, str)
+                or not request_id
+                or not isinstance(logical_request_id, str)
+                or not logical_request_id
+                or type(session_epoch) is not int
+                or session_epoch < 0
+                or type(attempt_no) is not int
+                or attempt_no < 1
+            ):
+                continue
+            event = events_by_id.get(event_id)
+            if (
+                event is None
+                or event.event_type is not EventType.SPEECH
+                or event.channel is not Channel.PUBLIC
+                or not isinstance(event.payload, PublicSpeechPayload)
+                or event.actor_seat != seat
+                or event.payload.speaker_seat != seat
+                or event.correlation_id != logical_request_id
+                or audit.get("phase") != event.phase.value
+                or audit.get("speech_event_revision") != event.state_revision
+                or audit.get("committed_revision") != event.state_revision
+            ):
+                continue
+            completed_seats.add(seat)
+        badge_completed = False
+        marker = state.sheriff_badge
+        if selected.sheriff_badge_required and isinstance(marker, Mapping):
+            source_seat = marker.get("source_seat")
+            request_id = marker.get("request_id")
+            marker_death_fact_ids = _frozen_string_tuple(marker.get("death_fact_ids"))
+            marker_matches = (
+                marker.get("status") == "COMPLETE"
+                and marker.get("rule_boundary_id") == selected.boundary_id
+                and marker.get("source_group_id") == selected.source_group_id
+                and marker.get("source_batch_id") == selected.source_batch_id
+                and marker_death_fact_ids == selected.death_fact_ids
+                and type(source_seat) is int
+                and source_seat in selected.death_seats
+                and isinstance(request_id, str)
+                and bool(request_id)
+            )
+            completion_audited = any(
+                audit.get("operation") == "SHERIFF_BADGE_COMPLETE"
+                and audit.get("rule_boundary_id") == selected.boundary_id
+                and audit.get("source_group_id") == selected.source_group_id
+                and audit.get("source_batch_id") == selected.source_batch_id
+                and _frozen_string_tuple(audit.get("death_fact_ids")) == selected.death_fact_ids
+                and audit.get("request_id") == request_id
+                and audit.get("source_seat") == source_seat
+                for audit in state.moderator_audit
+            )
+            if marker_matches and completion_audited:
+                badge_completed = True
+        updated = selected.model_copy(
+            update={
+                "last_words_completed_seats": tuple(
+                    seat for seat in selected.last_words_seats if seat in completed_seats
+                ),
+                "sheriff_badge_completed": badge_completed,
+            }
+        )
+        return tuple(
+            updated if boundary.boundary_id == selected.boundary_id else boundary
+            for boundary in state.rule_boundaries
+        )
+
+    @staticmethod
+    def _rule_work_blocks_lifecycle(state: GameState) -> bool:
+        """Return whether a queued rule settlement or boundary must still run."""
+
+        cursor = state.rule_workflow_cursor
+        if cursor is not None and (
+            cursor.status
+            in {"COLLECTING", "DRAINING", "WAITING_CHOICE", "WAITING_BOUNDARY", "ERROR"}
+            or cursor.pending_flow_action is not None
+        ):
+            return True
+        if any(
+            item.status in {"QUEUED", "READY", "WAITING_CHOICE"}
+            for item in state.rule_trigger_queue
+        ) or any(item.is_pending for item in state.rule_boundaries):
+            return True
+        for raw_window in state.action_windows.values():
+            try:
+                window = _load_action_window(raw_window)
+            except (TypeError, ValueError):
+                return True
+            if window.collection_complete_at is not None and window.closed_at is None:
+                return True
+        return False
+
+    def _is_unsettled_group_successor(
+        self,
+        state: GameState,
+        target_phase: GamePhase,
+    ) -> bool:
+        """Allow only the next frozen window phase during group collection."""
+
+        cursor = state.rule_workflow_cursor
+        package = self._execution_package
+        if (
+            cursor is None
+            or cursor.status != "COLLECTING"
+            or not cursor.settlement_group_id
+            or package is None
+        ):
+            return False
+        if not package.window_metadata:
+            # A/basic packages intentionally keep an empty metadata summary
+            # to preserve their pinned identity. Their fixed legacy sequence
+            # proves only Team Chat -> Action -> Resolve. The current durable
+            # collection and canonical group prove the edge; caller window
+            # IDs and next-window claims do not.
+            phase_order = (
+                GamePhase.NIGHT_TEAM_CHAT,
+                GamePhase.NIGHT_ACTION,
+                GamePhase.NIGHT_RESOLVE,
+            )
+            try:
+                current_index = phase_order.index(state.phase)
+            except ValueError:
+                return False
+            if (
+                current_index + 1 >= len(phase_order)
+                or phase_order[current_index + 1] is not target_phase
+                or not can_transition(state.phase, target_phase)
+                or state.serial_turn is not None
+                or any(
+                    item.status in {"QUEUED", "READY", "WAITING_CHOICE"}
+                    for item in state.rule_trigger_queue
+                )
+                or any(item.is_pending for item in state.rule_boundaries)
+            ):
+                return False
+            if state.phase is GamePhase.NIGHT_TEAM_CHAT and state.current_queue != ():
+                return False
+            group_windows = tuple(
+                _load_action_window(raw)
+                for raw in state.action_windows.values()
+                if isinstance(raw, Mapping)
+                and (raw.get("settlement_group_id") or raw.get("window_id"))
+                == cursor.settlement_group_id
+            )
+            if not group_windows or any(
+                item.closed_at is not None or item.collection_complete_at is None
+                for item in group_windows
+            ):
+                return False
+            phase_ranks = {phase: rank for rank, phase in enumerate(phase_order)}
+            group_ranks = tuple(phase_ranks.get(item.phase, -1) for item in group_windows)
+            if (
+                min(group_ranks) < 0
+                or max(group_ranks) != current_index
+                or not set(cursor.active_window_ids).issubset(
+                    {item.window_id for item in group_windows}
+                )
+                or not cursor.active_window_ids
+            ):
+                return False
+            group_window_ids = {item.window_id for item in group_windows}
+            if any(
+                isinstance(payload, Mapping)
+                and payload.get("window_id") in group_window_ids
+                and payload.get("status")
+                in {"OPEN", "REQUESTED", "SUBMITTING", "IN_FLIGHT", "PROCESSING"}
+                for payload in state.action_requests.values()
+            ):
+                return False
+            # Accepted requests remain PENDING until the entire frozen group
+            # is committed. They are safe across an adjacent same-group phase
+            # only when their source window is already durably collected; an
+            # open or in-flight request above still blocks progression.
+            if any(
+                isinstance(payload, Mapping)
+                and payload.get("window_id") in group_window_ids
+                and payload.get("status") == "PENDING"
+                and not any(
+                    item.window_id == payload.get("window_id")
+                    and item.collection_complete_at is not None
+                    and item.closed_at is None
+                    for item in group_windows
+                )
+                for payload in state.action_requests.values()
+            ):
+                return False
+            if cursor.settlement_group_id == f"night:{state.round_no}":
+                return True
+            # A snapshot created before the canonical group upgrade can use
+            # its physical source-window ID. In that narrow case a durable,
+            # unbound successor window is required as additional proof.
+            if any(
+                item.logical_window_id is not None or item.next_window_id is not None
+                for item in group_windows
+            ):
+                return False
+            return any(
+                isinstance(raw, Mapping)
+                and raw.get("phase") == target_phase.value
+                and raw.get("game_id") == state.game_id
+                and raw.get("logical_window_id") is None
+                and raw.get("settlement_group_id") is None
+                and raw.get("next_window_id") is None
+                and raw.get("collection_complete_at") is None
+                and raw.get("closed_at") is None
+                for raw in state.action_windows.values()
+            )
+        rows = tuple(sorted(package.window_metadata, key=lambda item: item.order))
+        groups = package.window_settlement_groups
+
+        def group_id_for(logical_id: str) -> str:
+            if not groups:
+                return f"night:{state.round_no}"
+            return f"night:{state.round_no}:{groups.get(logical_id)}"
+
+        group_rows = tuple(
+            row for row in rows if group_id_for(row.window_id) == cursor.settlement_group_id
+        )
+        if not group_rows:
+            return False
+        group_windows = tuple(
+            _load_action_window(raw)
+            for raw in state.action_windows.values()
+            if isinstance(raw, Mapping)
+            and raw.get("settlement_group_id") == cursor.settlement_group_id
+        )
+        if (
+            not group_windows
+            or any(
+                item.closed_at is not None or item.collection_complete_at is None
+                for item in group_windows
+            )
+            or any(item.logical_window_id is None for item in group_windows)
+        ):
+            return False
+        installed_logical_ids = {cast(str, item.logical_window_id) for item in group_windows}
+        if not installed_logical_ids.issubset({row.window_id for row in group_rows}):
+            return False
+        latest_id = max(
+            installed_logical_ids,
+            key=lambda logical_id: next(
+                row.order for row in group_rows if row.window_id == logical_id
+            ),
+        )
+        latest_order = next(row.order for row in group_rows if row.window_id == latest_id)
+        latest_index = next(index for index, row in enumerate(rows) if row.window_id == latest_id)
+        if latest_index + 1 >= len(rows):
+            return False
+        successor = rows[latest_index + 1]
+        if (
+            group_id_for(successor.window_id) != cursor.settlement_group_id
+            or successor.phase != target_phase.value
+            or successor.order <= latest_order
+        ):
+            return False
+        latest_windows = tuple(
+            item for item in group_windows if item.logical_window_id == latest_id
+        )
+        if not latest_windows or any(
+            item.next_window_id != successor.window_id for item in latest_windows
+        ):
+            return False
+        for dependency in successor.depends_on:
+            expected_dependency_group = group_id_for(dependency)
+            dependency_windows = tuple(
+                _load_action_window(raw)
+                for raw in state.action_windows.values()
+                if isinstance(raw, Mapping)
+                and raw.get("logical_window_id") == dependency
+                and raw.get("settlement_group_id") == expected_dependency_group
+            )
+            if not dependency_windows:
+                return False
+            if expected_dependency_group == cursor.settlement_group_id:
+                if any(item.collection_complete_at is None for item in dependency_windows):
+                    return False
+            elif any(item.closed_at is None for item in dependency_windows):
+                return False
+        return True
+
+    def _valid_rule_workflow_return(
+        self,
+        state: GameState,
+        cursor: RuleWorkflowCursor,
+        target_phase: GamePhase,
+    ) -> bool:
+        """Validate the narrow phase edges needed to resume frozen work."""
+
+        if (
+            cursor.status not in {"DRAINING", "RETURN_READY"}
+            or cursor.error_code is not None
+            or any(
+                item.status in {"QUEUED", "READY", "WAITING_CHOICE"}
+                for item in state.rule_trigger_queue
+            )
+            or any(item.is_pending for item in state.rule_boundaries)
+        ):
+            return False
+        return_point = cursor.return_point
+        if return_point is None or target_phase is not return_point.phase:
+            return False
+        if state.phase is target_phase or can_transition(state.phase, target_phase):
+            return True
+        has_current_day_host_exile = any(
+            isinstance(audit, Mapping)
+            and audit.get("operation") == "DAY_EXILE"
+            and audit.get("outcome_code") == "exiled"
+            and type(audit.get("target_seat")) is int
+            and isinstance(audit.get("vote_window_id"), str)
+            and isinstance(audit.get("rule_batch_id"), str)
+            and any(
+                ledger.batch_id == audit.get("rule_batch_id")
+                and ledger.group_id == f"day-resolve:{state.round_no}:{audit.get('vote_window_id')}"
+                and ledger.timing == GamePhase.DAY_RESOLVE.value
+                and ledger.round_no == state.round_no
+                and ledger.committed_revision == audit.get("committed_revision")
+                and ledger.skill_ids == ("exile_resolution",)
+                and ledger.action_codes == (203,)
+                and ledger.actor_seats == (audit.get("target_seat"),)
+                and len(ledger.request_ids) == 1
+                and ledger.request_ids[0].startswith("host-")
+                and any(
+                    fact.fact_type.upper() == "DEATH_CONFIRMED"
+                    and fact.target_seat == audit.get("target_seat")
+                    and fact.death_cause == "exiled"
+                    and fact.data.get("round_number") == state.round_no
+                    for fact in ledger.facts
+                )
+                and any(
+                    receipt.batch_id == ledger.batch_id
+                    and receipt.group_id == ledger.group_id
+                    and receipt.timing == GamePhase.DAY_RESOLVE.value
+                    and receipt.committed_revision == ledger.committed_revision
+                    and receipt.request_ids == ledger.request_ids
+                    for receipt in state.rule_receipts
+                )
+                for ledger in state.rule_ledger
+            )
+            for audit in state.moderator_audit
+        )
+        if (
+            target_phase is GamePhase.DAY_RESOLVE
+            and state.phase is GamePhase.TRIGGER_ACTION
+            and state.day_no == return_point.day_no
+            and has_current_day_host_exile
+        ):
+            return True
+        if (
+            return_point.phase is GamePhase.DAY_SPEECH
+            and state.phase in {GamePhase.DAY_RESOLVE, GamePhase.TRIGGER_ACTION}
+            and state.day_no == return_point.day_no
+        ):
+            return True
+        if (
+            return_point.logical_window_id is not None
+            and return_point.window_id is not None
+            and self._execution_package is not None
+            and state.day_no == return_point.day_no
+            and state.phase
+            in {
+                GamePhase.DAY_RESOLVE,
+                GamePhase.TRIGGER_ACTION,
+                GamePhase.NIGHT_TEAM_CHAT,
+                GamePhase.NIGHT_ACTION,
+                GamePhase.NIGHT_RESOLVE,
+            }
+            and cursor.next_logical_window_id == return_point.logical_window_id
+        ):
+            source_raw = state.action_windows.get(return_point.window_id)
+            if source_raw is None:
+                return False
+            source = _load_action_window(source_raw)
+            if source.closed_at is None or source.logical_window_id is None:
+                return False
+            rows = sorted(self._execution_package.window_metadata, key=lambda item: item.order)
+            source_row = next(
+                (row for row in rows if row.window_id == source.logical_window_id),
+                None,
+            )
+            source_index = next(
+                (
+                    index
+                    for index, row in enumerate(rows)
+                    if row.window_id == source.logical_window_id
+                ),
+                None,
+            )
+            target_row = next(
+                (
+                    row
+                    for row in rows
+                    if row.window_id == return_point.logical_window_id
+                    and row.phase == target_phase.value
+                ),
+                None,
+            )
+            if source_index is None or source_row is None or target_row is None:
+                return False
+            if (
+                source_index + 1 >= len(rows)
+                or rows[source_index + 1] != target_row
+                or source.next_window_id != target_row.window_id
+            ):
+                return False
+            source_group = source.settlement_group_id or source.window_id
+            if not all(
+                item.closed_at is not None
+                for item in (
+                    _load_action_window(raw)
+                    for raw in state.action_windows.values()
+                    if isinstance(raw, Mapping)
+                    and (raw.get("settlement_group_id") or raw.get("window_id")) == source_group
+                )
+            ):
+                return False
+            for dependency in target_row.depends_on:
+                dependency_windows = tuple(
+                    _load_action_window(raw)
+                    for raw in state.action_windows.values()
+                    if isinstance(raw, Mapping) and raw.get("logical_window_id") == dependency
+                )
+                if not dependency_windows or any(
+                    item.closed_at is None for item in dependency_windows
+                ):
+                    return False
+            return True
+        return False
 
     async def snapshot(self) -> GameState:
         """Read a state reference through the same serialization boundary."""
@@ -3570,6 +7764,7 @@ class GameManager:
                     initial_rule_state = build_initial_rule_state(
                         self._execution_package,
                         ability_instances,
+                        seats=assignment_plan.seats,
                     )
                 except (RuleAdapterError, TypeError, ValueError) as exc:
                     raise EventCommitError(
@@ -3800,7 +7995,9 @@ class GameManager:
                 raise EventCommitError("GAME_MISMATCH: action window belongs to another game")
             if window.phase != state.phase:
                 raise EventCommitError("PHASE_MISMATCH: action window is not active in this phase")
-            trigger_action = _is_trigger_window_state(state, window, require_bound=False)
+            legacy_trigger_action = _is_trigger_window_state(state, window, require_bound=False)
+            rule_occurrence = self._rule_occurrence_for_window(state, window)
+            trigger_action = legacy_trigger_action or rule_occurrence is not None
             if _is_sheriff_badge_window(window):
                 raise EventCommitError(
                     "BADGE_ACTION_INVALID: badge windows require the sheriff badge reducer"
@@ -3833,7 +8030,7 @@ class GameManager:
                     )
                 if not player.alive and not trigger_action:
                     raise EventCommitError("PLAYER_DEAD: dead seats cannot enter a night window")
-            if trigger_action:
+            if legacy_trigger_action:
                 pending = state.pending_resolution
                 if not isinstance(pending, dict):  # pragma: no cover - helper already checks
                     raise EventCommitError("TRIGGER_ACTION_INVALID: pending trigger is missing")
@@ -3847,11 +8044,20 @@ class GameManager:
             windows = dict(data["action_windows"])
             windows[window.window_id] = window.model_dump(mode="json")
             data["action_windows"] = windows
-            if trigger_action:
+            if legacy_trigger_action:
                 data["pending_resolution"] = pending_data
+            timestamp = _aware_commit_time(now)
             data["state_revision"] = state.state_revision + 1
-            data["updated_at"] = now or utc_now()
+            data["updated_at"] = timestamp
             candidate = GameState.model_validate(data)
+            if window.logical_window_id is not None:
+                candidate = self._release_due_rule_disclosures(
+                    candidate,
+                    window.logical_window_id,
+                    window.logical_window_id,
+                    timestamp=timestamp,
+                    next_revision=candidate.state_revision,
+                )
             self._state = candidate
             return candidate
 
@@ -3945,13 +8151,15 @@ class GameManager:
                 raise EventCommitError("GAME_MISMATCH: action window belongs to another game")
             if window.phase != state.phase:
                 raise EventCommitError("PHASE_MISMATCH: action window is not active in this phase")
-            if not window.is_open:
-                raise EventCommitError("WINDOW_CLOSED: action window is closed")
+            if not window.accepts_submissions:
+                raise EventCommitError("WINDOW_CLOSED: action window no longer accepts requests")
             if window.session_epoch != session_epoch:
                 raise EventCommitError("SESSION_MISMATCH: action window uses another session")
             if seat not in window.allowed_seats:
                 raise EventCommitError("SEAT_NOT_ALLOWED: seat is not allowed in this window")
-            trigger_action = _is_trigger_window_state(state, window, require_bound=True)
+            legacy_trigger_action = _is_trigger_window_state(state, window, require_bound=True)
+            rule_occurrence = self._rule_occurrence_for_window(state, window)
+            trigger_action = legacy_trigger_action or rule_occurrence is not None
             badge_action = _is_sheriff_badge_window(window)
             if _looks_like_trigger_window(window) and not trigger_action:
                 raise EventCommitError(
@@ -5035,11 +9243,43 @@ class GameManager:
                         "BADGE_ORIGIN_INVALID",
                         "trigger badge choice requires a closed DAY_EXILE source",
                     )
+            rule_boundary = next(
+                (
+                    item
+                    for item in current.rule_boundaries
+                    if item.is_pending
+                    and item.sheriff_badge_required
+                    and source_seat in item.death_seats
+                ),
+                None,
+            )
+            required_rule_badge = any(
+                item.is_pending and item.sheriff_badge_required for item in current.rule_boundaries
+            )
+            if required_rule_badge and rule_boundary is None:
+                raise SheriffElectionError(
+                    "BADGE_BOUNDARY_INVALID",
+                    "badge choice is not bound to the pending confirmed-death boundary",
+                )
             marker = current.sheriff_badge
             if isinstance(marker, dict):
+                if (
+                    marker.get("status") == "COMPLETE"
+                    and rule_boundary is not None
+                    and marker.get("rule_boundary_id") == rule_boundary.boundary_id
+                ):
+                    return current
                 if marker.get("status") == "OPEN" and marker.get("source_seat") != source_seat:
                     raise SheriffElectionError(
                         "BADGE_PENDING", "another badge choice is already pending"
+                    )
+                if (
+                    marker.get("status") == "OPEN"
+                    and rule_boundary is not None
+                    and marker.get("rule_boundary_id") != rule_boundary.boundary_id
+                ):
+                    raise SheriffElectionError(
+                        "BADGE_BOUNDARY_INVALID", "open badge belongs to another rule boundary"
                     )
                 raw_id = marker.get("window_id")
                 if (
@@ -5104,6 +9344,8 @@ class GameManager:
             visible_context = dict(window.visible_context)
             visible_context["kind"] = "sheriff_badge"
             visible_context["source_seat"] = source_seat
+            if rule_boundary is not None:
+                visible_context["rule_boundary_id"] = rule_boundary.boundary_id
             if trigger_origin is not None:
                 visible_context["origin"] = trigger_origin[0]
                 visible_context["origin_resolution_id"] = trigger_origin[1]
@@ -5122,6 +9364,18 @@ class GameManager:
                 "observation_revision": revision,
                 "candidate_seats": list(legal),
                 "trigger": "death" if not player.alive else "resignation",
+                "rule_boundary_id": (
+                    rule_boundary.boundary_id if rule_boundary is not None else None
+                ),
+                "source_group_id": (
+                    rule_boundary.source_group_id if rule_boundary is not None else None
+                ),
+                "source_batch_id": (
+                    rule_boundary.source_batch_id if rule_boundary is not None else None
+                ),
+                "death_fact_ids": (
+                    list(rule_boundary.death_fact_ids) if rule_boundary is not None else []
+                ),
                 "opened_at": timestamp.isoformat(),
             }
             data["state_revision"] = revision + 1
@@ -5310,6 +9564,12 @@ class GameManager:
                     "source_seat": source_seat,
                     "target_seat": target,
                     "request_id": request_id,
+                    "rule_boundary_id": marker.get("rule_boundary_id"),
+                    "source_group_id": marker.get("source_group_id"),
+                    "source_batch_id": marker.get("source_batch_id"),
+                    "death_fact_ids": list(
+                        _frozen_string_tuple(marker.get("death_fact_ids")) or ()
+                    ),
                     "base_revision": revision,
                     "committed_revision": commit_revision,
                     "created_at": timestamp.isoformat(),
@@ -5397,7 +9657,109 @@ class GameManager:
                     "REQUEST_INVALID", "badge actor still has an active request"
                 )
             timestamp = utc_now() if now is None else now
+            rule_boundary_id = marker.get("rule_boundary_id")
+            typed_boundary: RuleBoundary | None = None
+            if rule_boundary_id is not None:
+                typed_boundary = next(
+                    (
+                        item
+                        for item in current.rule_boundaries
+                        if item.boundary_id == rule_boundary_id
+                        and item.sheriff_badge_required
+                        and item.is_pending
+                    ),
+                    None,
+                )
+                if (
+                    typed_boundary is None
+                    or marker.get("source_group_id") != typed_boundary.source_group_id
+                    or marker.get("source_batch_id") != typed_boundary.source_batch_id
+                    or _frozen_string_tuple(marker.get("death_fact_ids"))
+                    != typed_boundary.death_fact_ids
+                    or source not in typed_boundary.death_seats
+                ):
+                    raise SheriffElectionError(
+                        "BADGE_BOUNDARY_INVALID",
+                        "completed badge is detached from its confirmed-death boundary",
+                    )
+                request_id = marker.get("request_id")
+                window_id = marker.get("window_id")
+                action_code = marker.get("action_code")
+                target_seat = marker.get("target_seat")
+                raw_request = (
+                    current.action_requests.get(request_id) if isinstance(request_id, str) else None
+                )
+                decision_status = "TRANSFERRED" if action_code == 201 else "TORN"
+                request_matches = (
+                    isinstance(request_id, str)
+                    and bool(request_id)
+                    and isinstance(window_id, str)
+                    and type(action_code) is int
+                    and action_code in {201, 202}
+                    and isinstance(raw_request, Mapping)
+                    and raw_request.get("window_id") == window_id
+                    and raw_request.get("seat") == source
+                    and raw_request.get("session_epoch") == marker.get("source_session_epoch")
+                    and raw_request.get("status") == "CONFIRMED"
+                    and raw_request.get("resolution_kind") == "SHERIFF_BADGE"
+                    and raw_request.get("resolved_action_code") == action_code
+                    and raw_request.get("resolved_target_seat") == target_seat
+                    and (action_code != 201 or type(target_seat) is int)
+                    and (action_code != 202 or target_seat is None)
+                )
+                raw_badge_window = current.action_windows.get(
+                    window_id if isinstance(window_id, str) else ""
+                )
+                try:
+                    completed_boundary_badge_window: ActionWindow | None = (
+                        _load_action_window(raw_badge_window)
+                        if raw_badge_window is not None
+                        else None
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise SheriffElectionError(
+                        "BADGE_BOUNDARY_INVALID", "completed badge window is malformed"
+                    ) from exc
+                window_matches = (
+                    completed_boundary_badge_window is not None
+                    and completed_boundary_badge_window.closed_at is not None
+                    and completed_boundary_badge_window.game_id == current.game_id
+                    and completed_boundary_badge_window.session_epoch
+                    == marker.get("source_session_epoch")
+                    and completed_boundary_badge_window.allowed_seats == (source,)
+                    and completed_boundary_badge_window.visible_context.get("kind")
+                    == "sheriff_badge"
+                    and completed_boundary_badge_window.visible_context.get("source_seat") == source
+                    and completed_boundary_badge_window.visible_context.get("rule_boundary_id")
+                    == typed_boundary.boundary_id
+                )
+                decision_audited = any(
+                    audit.get("operation") == "SHERIFF_BADGE"
+                    and audit.get("status") == decision_status
+                    and audit.get("source_seat") == source
+                    and audit.get("target_seat") == target_seat
+                    and audit.get("request_id") == request_id
+                    and audit.get("rule_boundary_id") == typed_boundary.boundary_id
+                    and audit.get("source_group_id") == typed_boundary.source_group_id
+                    and audit.get("source_batch_id") == typed_boundary.source_batch_id
+                    and _frozen_string_tuple(audit.get("death_fact_ids"))
+                    == typed_boundary.death_fact_ids
+                    for audit in current.moderator_audit
+                )
+                if not request_matches or not window_matches or not decision_audited:
+                    raise SheriffElectionError(
+                        "BADGE_BOUNDARY_INVALID",
+                        "completed badge lacks a matching decision request and boundary audit",
+                    )
             if current.phase is GamePhase.DAY_SPEECH:
+                data = _state_data(current)
+                data["state_revision"] = revision + 1
+                data["updated_at"] = timestamp
+                transitioned = GameState.model_validate(data)
+            elif typed_boundary is not None:
+                # A typed rule boundary temporarily stages host work in its
+                # current phase; it must return through advance_rule_workflow
+                # before the ordinary phase lifecycle moves on.
                 data = _state_data(current)
                 data["state_revision"] = revision + 1
                 data["updated_at"] = timestamp
@@ -5418,6 +9780,26 @@ class GameManager:
                 except (TypeError, ValueError) as exc:
                     raise SheriffElectionError("PHASE_INVALID", str(exc)) from exc
             data = _state_data(transitioned)
+            if typed_boundary is not None:
+                boundaries = tuple(
+                    item.model_copy(
+                        update={
+                            "sheriff_badge_completed": True,
+                            "completed_at": (
+                                timestamp
+                                if not item.last_words_required
+                                or item.last_words_completed_seats == item.last_words_seats
+                                else None
+                            ),
+                        }
+                    )
+                    if item.boundary_id == typed_boundary.boundary_id
+                    else item
+                    for item in current.rule_boundaries
+                )
+                data["rule_boundaries"] = tuple(
+                    item.model_dump(mode="python") for item in boundaries
+                )
             audits = list(data["moderator_audit"])
             audits.append(
                 {
@@ -5425,6 +9807,19 @@ class GameManager:
                     "source_seat": source,
                     "target_seat": marker.get("target_seat"),
                     "action_code": marker.get("action_code"),
+                    "rule_boundary_id": (
+                        typed_boundary.boundary_id if typed_boundary is not None else None
+                    ),
+                    "source_group_id": (
+                        typed_boundary.source_group_id if typed_boundary is not None else None
+                    ),
+                    "source_batch_id": (
+                        typed_boundary.source_batch_id if typed_boundary is not None else None
+                    ),
+                    "death_fact_ids": (
+                        list(typed_boundary.death_fact_ids) if typed_boundary is not None else []
+                    ),
+                    "request_id": marker.get("request_id"),
                     "base_revision": revision,
                     "committed_revision": transitioned.state_revision,
                     "created_at": timestamp.isoformat(),
@@ -6062,6 +10457,10 @@ class GameManager:
                 raise EventCommitError(
                     "VICTORY_BLOCKED: an unconfirmed resolution is still pending"
                 )
+            if self._rule_work_blocks_lifecycle(state):
+                raise EventCommitError(
+                    "VICTORY_BLOCKED: a rule settlement, trigger, or boundary is pending"
+                )
 
             active_request_statuses = {
                 "OPEN",
@@ -6296,6 +10695,10 @@ class GameManager:
                 raise EventCommitError("PHASE_MISMATCH: night victory check requires DAY_ANNOUNCE")
             if state.pending_resolution is not None or state.serial_turn is not None:
                 raise EventCommitError("VICTORY_BLOCKED: an action is still pending")
+            if self._rule_work_blocks_lifecycle(state):
+                raise EventCommitError(
+                    "VICTORY_BLOCKED: a rule settlement, trigger, or boundary is pending"
+                )
             if state.winner is not None:
                 raise EventCommitError("VICTORY_ALREADY_RECORDED: winner is already present")
             evaluation = evaluate_victory(state, board, role_groups=role_groups)
@@ -6470,6 +10873,7 @@ class GameManager:
         event_ids: tuple[int, ...] | None = None,
         retry: bool = False,
         phase: GamePhase = GamePhase.DAY_SPEECH,
+        rule_boundary_id: str | None = None,
         expected_revision: int | None = None,
         now: datetime | None = None,
     ) -> GameState:
@@ -6483,6 +10887,8 @@ class GameManager:
 
         if not request_id or not logical_request_id:
             raise EventCommitError("REQUEST_INVALID: request IDs must not be empty")
+        if rule_boundary_id is not None and not rule_boundary_id:
+            raise EventCommitError("BOUNDARY_INVALID: rule boundary ID must not be empty")
         if attempt_no < 1:
             raise EventCommitError("REQUEST_INVALID: attempt_no must be positive")
         async with self._lock:
@@ -6493,12 +10899,39 @@ class GameManager:
             state = self._state
             if state.run_status is RunStatus.PAUSED:
                 raise EventCommitError("GAME_PAUSED: serial speech is paused")
-            if state.current_queue is None or not state.current_queue:
-                raise EventCommitError("TURN_QUEUE_EMPTY: no serial speech turn is pending")
             if state.phase is not phase:
                 raise EventCommitError(f"PHASE_MISMATCH: serial speech requires {phase.value}")
-            if state.current_queue[0] != seat:
-                raise EventCommitError("TURN_NOT_AT_HEAD: only the queue head may speak")
+            if rule_boundary_id is not None:
+                boundary = next(
+                    (
+                        item
+                        for item in state.rule_boundaries
+                        if item.boundary_id == rule_boundary_id and item.is_pending
+                    ),
+                    None,
+                )
+                pending_seats = (
+                    tuple(
+                        item
+                        for item in boundary.last_words_seats
+                        if item not in boundary.last_words_completed_seats
+                    )
+                    if boundary is not None
+                    else ()
+                )
+                if boundary is None or seat not in pending_seats or pending_seats[0] != seat:
+                    raise EventCommitError(
+                        "BOUNDARY_NOT_PENDING: seat is not the pending boundary speech head"
+                    )
+            else:
+                if any(item.is_pending for item in state.rule_boundaries):
+                    raise EventCommitError(
+                        "BOUNDARY_REQUIRED: pending rule boundary must bind serial speech"
+                    )
+                if state.current_queue is None or not state.current_queue:
+                    raise EventCommitError("TURN_QUEUE_EMPTY: no serial speech turn is pending")
+                if state.current_queue[0] != seat:
+                    raise EventCommitError("TURN_NOT_AT_HEAD: only the queue head may speak")
             if phase is GamePhase.NIGHT_TEAM_CHAT:
                 _validate_team_chat_seat(state, seat)
             elif phase in {
@@ -6510,6 +10943,8 @@ class GameManager:
                         "SHERIFF_SEAT_NOT_AUTHORIZED: seat is outside the current "
                         "first-day election boundary"
                     )
+                if state.current_queue is None:
+                    raise EventCommitError("SHERIFF_QUEUE_INVALID: active queue is missing")
                 remaining = _sheriff_serial_speech_queue(state, phase)
                 if tuple(state.current_queue) != remaining:
                     raise EventCommitError(
@@ -6536,6 +10971,7 @@ class GameManager:
                     and previous.logical_request_id == logical_request_id
                     and previous.attempt_no == attempt_no
                     and previous.seat == seat
+                    and previous.rule_boundary_id == rule_boundary_id
                 )
                 if same_request:
                     return state
@@ -6545,6 +10981,7 @@ class GameManager:
                     previous.seat != seat
                     or previous.logical_request_id != logical_request_id
                     or previous.attempt_no != attempt_no - 1
+                    or previous.rule_boundary_id != rule_boundary_id
                 ):
                     raise EventCommitError("REQUEST_EXPIRED: retry does not match the active turn")
                 event_ids = previous.event_ids
@@ -6578,6 +11015,7 @@ class GameManager:
                 logical_request_id=logical_request_id,
                 attempt_no=attempt_no,
                 event_ids=candidate_cursor.in_flight_event_ids,
+                rule_boundary_id=rule_boundary_id,
             )
             data["state_revision"] = state.state_revision + 1
             data["updated_at"] = now or utc_now()
@@ -6595,6 +11033,7 @@ class GameManager:
         attempt_no: int,
         text: str,
         phase: GamePhase = GamePhase.DAY_SPEECH,
+        rule_boundary_id: str | None = None,
         expected_revision: int | None = None,
         now: datetime | None = None,
     ) -> GameState:
@@ -6610,15 +11049,48 @@ class GameManager:
                 raise EventCommitError("GAME_PAUSED: serial speech is paused")
             if state.phase is not phase:
                 raise EventCommitError(f"PHASE_MISMATCH: serial speech requires {phase.value}")
-            if state.current_queue is None or not state.current_queue:
+            if rule_boundary_id is not None and not rule_boundary_id:
+                raise EventCommitError("BOUNDARY_INVALID: rule boundary ID must not be empty")
+            boundary: RuleBoundary | None = None
+            if rule_boundary_id is not None:
+                boundary = next(
+                    (
+                        item
+                        for item in state.rule_boundaries
+                        if item.boundary_id == rule_boundary_id and item.is_pending
+                    ),
+                    None,
+                )
+                pending_seats = (
+                    tuple(
+                        item
+                        for item in boundary.last_words_seats
+                        if item not in boundary.last_words_completed_seats
+                    )
+                    if boundary is not None
+                    else ()
+                )
+                if boundary is None or seat not in pending_seats or pending_seats[0] != seat:
+                    raise EventCommitError(
+                        "BOUNDARY_NOT_PENDING: seat is not the pending boundary speech head"
+                    )
+            elif any(item.is_pending for item in state.rule_boundaries):
+                raise EventCommitError(
+                    "BOUNDARY_REQUIRED: pending rule boundary must bind serial speech"
+                )
+            elif state.current_queue is None or not state.current_queue:
                 raise EventCommitError("TURN_QUEUE_EMPTY: no serial speech turn is pending")
-            if state.current_queue[0] != seat:
+            elif state.current_queue[0] != seat:
                 raise EventCommitError("TURN_NOT_AT_HEAD: only the queue head may speak")
             team_window = (
                 _validate_team_chat_seat(state, seat)
                 if phase is GamePhase.NIGHT_TEAM_CHAT
                 else None
             )
+            if boundary is not None and team_window is not None:
+                raise EventCommitError(
+                    "BOUNDARY_SPEECH_INVALID: rule-boundary last words must be public speech"
+                )
             active = state.serial_turn
             if active is None or (
                 active.seat != seat
@@ -6626,6 +11098,7 @@ class GameManager:
                 or active.request_id != request_id
                 or active.logical_request_id != logical_request_id
                 or active.attempt_no != attempt_no
+                or active.rule_boundary_id != rule_boundary_id
             ):
                 raise EventCommitError("REQUEST_EXPIRED: speech response is stale or superseded")
             player = state.players.get(seat)
@@ -6686,7 +11159,68 @@ class GameManager:
                 ),
             )
             data = _state_data(candidate)
-            data["current_queue"] = tuple(state.current_queue[1:])
+            if rule_boundary_id is not None:
+                data["last_serial_turn"] = None
+            elif phase is GamePhase.DAY_SPEECH:
+                data["last_serial_turn"] = active.model_copy(
+                    update={"event_ids": tuple(sorted((*active.event_ids, event.event_id)))}
+                ).model_dump(mode="python")
+            else:
+                data["last_serial_turn"] = None
+            if rule_boundary_id is None:
+                current_queue = state.current_queue
+                if current_queue is None:
+                    raise EventCommitError("TURN_QUEUE_EMPTY: no serial speech turn is pending")
+                data["current_queue"] = tuple(current_queue[1:])
+            else:
+                assert boundary is not None
+                completed_seats = tuple(
+                    item
+                    for item in boundary.last_words_seats
+                    if item in boundary.last_words_completed_seats or item == seat
+                )
+                updated_boundary = boundary.model_copy(
+                    update={
+                        "last_words_completed_seats": completed_seats,
+                        "completed_at": timestamp
+                        if (
+                            len(completed_seats) == len(boundary.last_words_seats)
+                            and (
+                                not boundary.sheriff_badge_required
+                                or boundary.sheriff_badge_completed
+                            )
+                        )
+                        else None,
+                    }
+                )
+                data["rule_boundaries"] = tuple(
+                    updated_boundary.model_dump(mode="python")
+                    if item.boundary_id == boundary.boundary_id
+                    else item.model_dump(mode="python")
+                    for item in state.rule_boundaries
+                )
+                audits = list(data["moderator_audit"])
+                audits.append(
+                    {
+                        "operation": "RULE_BOUNDARY_LAST_WORDS_SPEECH_COMPLETE",
+                        "boundary_id": boundary.boundary_id,
+                        "source_group_id": boundary.source_group_id,
+                        "source_batch_id": boundary.source_batch_id,
+                        "death_fact_ids": list(boundary.death_fact_ids),
+                        "seat": seat,
+                        "session_epoch": active.session_epoch,
+                        "request_id": active.request_id,
+                        "logical_request_id": active.logical_request_id,
+                        "attempt_no": active.attempt_no,
+                        "phase": event.phase.value,
+                        "speech_event_id": event.event_id,
+                        "speech_event_revision": event.state_revision,
+                        "base_revision": revision,
+                        "committed_revision": event.state_revision,
+                        "created_at": timestamp.isoformat(),
+                    }
+                )
+                data["moderator_audit"] = tuple(audits)
             data["serial_turn"] = None
             committed = GameState.model_validate(data)
             self._state = committed
@@ -6702,6 +11236,7 @@ class GameManager:
         attempt_no: int,
         text: str,
         phase: GamePhase,
+        rule_boundary_id: str | None = None,
         expected_revision: int | None = None,
         now: datetime | None = None,
     ) -> GameState:
@@ -6719,6 +11254,10 @@ class GameManager:
         }:
             raise EventCommitError(
                 "PHASE_INVALID: sheriff serial speech requires a sheriff speech phase"
+            )
+        if rule_boundary_id is not None:
+            raise EventCommitError(
+                "BOUNDARY_INVALID: sheriff campaign speech cannot use a rule death boundary"
             )
         async with self._lock:
             revision = (
@@ -6848,13 +11387,73 @@ class GameManager:
             revision = (
                 self._state.state_revision if expected_revision is None else expected_revision
             )
-            candidate = reduce_state(
-                self._state,
-                StatePatch.phase_transition(
-                    target,
-                    expected_revision=revision,
-                    now=now,
-                ),
+            current = self._state
+            unsettled_successor = self._is_unsettled_group_successor(current, target)
+            if self._rule_work_blocks_lifecycle(current) and not unsettled_successor:
+                raise EventCommitError(
+                    "PHASE_BLOCKED: a rule settlement, trigger, or boundary is pending"
+                )
+            timestamp = _aware_commit_time(now)
+            if unsettled_successor and target is current.phase:
+                data = _state_data(current)
+                data["state_revision"] = revision + 1
+                data["updated_at"] = timestamp
+                candidate = GameState.model_validate(data)
+            else:
+                candidate = reduce_state(
+                    current,
+                    StatePatch.phase_transition(
+                        target,
+                        expected_revision=revision,
+                        now=timestamp,
+                    ),
+                )
+            # Persist discrete expiry crossings as part of the same phase
+            # transition. Adapter-side checks also handle older restored
+            # snapshots, but deleting the rows here prevents them from ever
+            # reappearing after the next NIGHT_TEAM_CHAT hook has passed.
+            if (
+                candidate.phase is GamePhase.NIGHT_TEAM_CHAT
+                or candidate.round_no > current.round_no
+            ):
+                data = _state_data(candidate)
+                data["rule_state"] = tuple(
+                    _rule_state_payload(value)
+                    for value in candidate.rule_state
+                    if not (
+                        value.expires_at_round is not None
+                        and value.expires_at_round <= candidate.round_no
+                        and (
+                            value.expiry_policy == "ROUND_END"
+                            or (
+                                value.expiry_policy == "NEXT_NIGHT_START"
+                                and candidate.phase is GamePhase.NIGHT_TEAM_CHAT
+                            )
+                        )
+                    )
+                )
+                data["rule_relations"] = tuple(
+                    value.model_dump(mode="python")
+                    for value in candidate.rule_relations
+                    if not (
+                        value.expires_at_round is not None
+                        and value.expires_at_round <= candidate.round_no
+                        and (
+                            value.expiry_policy == "ROUND_END"
+                            or (
+                                value.expiry_policy == "NEXT_NIGHT_START"
+                                and candidate.phase is GamePhase.NIGHT_TEAM_CHAT
+                            )
+                        )
+                    )
+                )
+                candidate = GameState.model_validate(data)
+            candidate = self._release_due_rule_disclosures(
+                candidate,
+                target.value,
+                None,
+                timestamp=timestamp,
+                next_revision=candidate.state_revision,
             )
             self._state = candidate
             return candidate
@@ -6880,8 +11479,13 @@ class GameManager:
             )
             _revision_check(self._state, revision)
             window = self._window_for_request(self._state, request)
-            if _looks_like_trigger_window(window) and not _is_trigger_window_state(
-                self._state, window, require_bound=True
+            if not window.accepts_submissions:
+                raise ActionValidationError(
+                    "WINDOW_CLOSED", "action window no longer accepts new requests"
+                )
+            if _looks_like_trigger_window(window) and not (
+                _is_trigger_window_state(self._state, window, require_bound=True)
+                or self._rule_occurrence_for_window(self._state, window) is not None
             ):
                 raise ActionValidationError(
                     "TRIGGER_ACTION_INVALID",
@@ -7722,7 +12326,8 @@ class GameManager:
         # ``validate_action_request`` still applies all ordinary target and
         # action checks to that request.
         trigger_binding = _pending_trigger_ability(state, window, require_bound=True)
-        trigger_action = trigger_binding is not None
+        rule_occurrence = self._rule_occurrence_for_window(state, window)
+        trigger_action = trigger_binding is not None or rule_occurrence is not None
         badge_action = _is_sheriff_badge_window(window)
         trigger_ability = trigger_binding[1] if trigger_binding is not None else None
         authorized_codes = context.authorized_action_codes
@@ -7732,6 +12337,16 @@ class GameManager:
                 if trigger_ability.trigger.allow_pass
                 else (trigger_ability.action_code,)
             )
+        if rule_occurrence is not None:
+            skill = self._workflow_skill(rule_occurrence)
+            allow_pass = bool(
+                window.allow_pass
+                and any(
+                    action.action_code == skill.action_code and action.allow_pass
+                    for action in cast(ExecutionPackage, self._execution_package).actions
+                )
+            )
+            authorized_codes = (skill.action_code, 299) if allow_pass else (skill.action_code,)
         updates: dict[str, object] = {
             "active_request_id": player.current_request_id,
             "session_epoch": player.session_epoch,
@@ -7753,6 +12368,7 @@ class GameManager:
                     player.seat,
                     window.phase.value,
                     allowed_codes=set(window.allowed_action_codes),
+                    logical_window_id=window.logical_window_id,
                 )
                 completed_skill_ids = self._rule_completed_skill_ids(state, window)
                 eligible_instances = tuple(
@@ -7872,6 +12488,11 @@ class GameManager:
                     if isinstance(item, int) and not isinstance(item, bool)
                 )
                 updates["eligible_targets_by_action"] = target_sets
+        if rule_occurrence is not None:
+            skill = self._workflow_skill(rule_occurrence)
+            updates["eligible_targets_by_action"] = {
+                skill.action_code: self._trigger_target_seats(state, rule_occurrence, skill)
+            }
 
         pending_ids = tuple(state.action_requests)
         fingerprints: dict[str, str] = {}
@@ -7904,6 +12525,7 @@ class GameManager:
         *,
         allowed_codes: set[int] | None = None,
         trigger_only: bool = False,
+        logical_window_id: str | None = None,
     ) -> tuple[tuple[AbilityInstanceState, SkillSpec], ...]:
         """Return active package skills for one actor and frozen timing."""
 
@@ -7926,32 +12548,49 @@ class GameManager:
                 or skill.action_code == 299
                 or timing not in skill.timing
                 or (allowed_codes is not None and skill.action_code not in allowed_codes)
+                or (skill.window_ids and logical_window_id not in skill.window_ids)
                 or (trigger_only and instance.grant_kind != "TRIGGER")
                 or (not trigger_only and instance.grant_kind != "ACTIVE")
+                or instance.grant_id not in {grant.grant_id for grant in skill.grants}
             ):
                 continue
-            usage = skill.usage
-            prior_uses = sum(
-                1
-                for entry in state.rule_ledger
-                for use in entry.history_updates
-                if use.ability_instance_id == instance.ability_instance_id
-                and use.skill_id == skill.skill_id
-                and (usage.scope == "GAME" or use.round_number == state.round_no)
-                and (not use.passed or usage.pass_updates_history)
-            )
-            if usage.max_uses is not None and prior_uses >= usage.max_uses:
-                continue
-            required: dict[str, int] = {}
-            for cost in usage.costs:
-                required[cost.resource_id] = required.get(cost.resource_id, 0) + cost.amount
-            if any(
-                actor.skill_resources.get(resource_id, 0) < amount
-                for resource_id, amount in required.items()
-            ):
+            if self._rule_instance_capacity_reason(state, instance, skill) is not None:
                 continue
             result.append((instance, skill))
         return tuple(result)
+
+    @staticmethod
+    def _rule_instance_capacity_reason(
+        state: GameState,
+        instance: AbilityInstanceState,
+        skill: SkillSpec,
+    ) -> str | None:
+        """Return why a frozen instance cannot pay or use this skill now."""
+
+        actor = state.players.get(instance.actor_seat)
+        if actor is None:
+            return "actor_missing"
+        usage = skill.usage
+        prior_uses = sum(
+            1
+            for entry in state.rule_ledger
+            for use in entry.history_updates
+            if use.ability_instance_id == instance.ability_instance_id
+            and use.skill_id == skill.skill_id
+            and (usage.scope == "GAME" or use.round_number == state.round_no)
+            and (not use.passed or usage.pass_updates_history)
+        )
+        if usage.max_uses is not None and prior_uses >= usage.max_uses:
+            return "usage_limit_reached"
+        required: dict[str, int] = {}
+        for cost in usage.costs:
+            required[cost.resource_id] = required.get(cost.resource_id, 0) + cost.amount
+        if any(
+            actor.skill_resources.get(resource_id, 0) < amount
+            for resource_id, amount in required.items()
+        ):
+            return "insufficient_resource"
+        return None
 
     def _rule_completed_skill_ids(
         self,
@@ -8003,6 +12642,7 @@ class GameManager:
                         if skill.skill_id == item.skill_id
                         and skill.action_code == item.action_code
                         and window.phase.value in skill.timing
+                        and (not skill.window_ids or window.logical_window_id in skill.window_ids)
                         and skill.mode == "PLAYER"
                     ),
                     None,

@@ -7,6 +7,8 @@ import json
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 
+from pydantic import BaseModel
+
 from werewolf.rules.effects import project_disclosures, resolve_effects
 from werewolf.rules.models import (
     AbilityInstance,
@@ -14,12 +16,15 @@ from werewolf.rules.models import (
     EffectIntent,
     EffectSpec,
     ExecutionPackage,
+    RefExpr,
     RequestDisposition,
     ResolutionBatch,
     RuleObservation,
+    RuleWindowBinding,
     SkillRequest,
     SkillSpec,
     SkillUseRecord,
+    StateDeclaration,
     UseUpdate,
 )
 from werewolf.rules.predicates import (
@@ -76,21 +81,132 @@ def _same_json(left: object, right: object) -> bool:
     return type(left) is type(right) and left == right
 
 
+def _references_target(value: object) -> bool:
+    """Return whether an expression tree reads the selected request target."""
+
+    if isinstance(value, RefExpr):
+        return value.source == "target"
+    if isinstance(value, BaseModel):
+        return any(
+            _references_target(getattr(value, field_name))
+            for field_name in type(value).model_fields
+        )
+    if isinstance(value, Mapping):
+        return any(_references_target(item) for item in value.values())
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+        return any(_references_target(item) for item in value)
+    return False
+
+
+def _matches_bound_day_speech_occurrence(
+    request: SkillRequest,
+    binding: RuleWindowBinding | None,
+) -> bool:
+    """Match a request's occurrence claims to a trusted day-hook binding.
+
+    The request's hook, occurrence, and source IDs are claims.  The matching
+    binding comes from the adapter's authoritative action-window and active
+    occurrence checks, so all three request claims must match it exactly.
+    """
+
+    if binding is None:
+        return False
+    return (
+        binding.hook_id in {"DAY_SPEECH_BEFORE", "DAY_SPEECH_AFTER"}
+        and request.hook_id == binding.hook_id
+        and binding.trigger_occurrence_id is not None
+        and binding.source_fact_id is not None
+        and request.trigger_occurrence_id == binding.trigger_occurrence_id
+        and request.source_fact_id == binding.source_fact_id
+    )
+
+
+def _matches_bound_legacy_trigger_occurrence(
+    request: SkillRequest,
+    binding: RuleWindowBinding | None,
+    source_fact: object | None,
+) -> bool:
+    """Match a legacy trigger request to an adapter-authorized binding."""
+
+    if binding is None:
+        return False
+    return (
+        binding.legacy_trigger
+        and binding.trigger_occurrence_id is not None
+        and binding.source_fact_id is not None
+        and request.trigger_occurrence_id == binding.trigger_occurrence_id
+        and request.source_fact_id == binding.source_fact_id
+        and source_fact is not None
+    )
+
+
+def _has_bound_legacy_trigger_timing(
+    observation: RuleObservation,
+    bound_legacy_trigger_occurrence: bool,
+) -> bool:
+    """Allow an adapter-authorized legacy trigger only in trigger action timing."""
+
+    return bound_legacy_trigger_occurrence and observation.timing == "TRIGGER_ACTION"
+
+
+def _has_bound_day_speech_timing(
+    observation: RuleObservation,
+    skill: SkillSpec,
+    binding: RuleWindowBinding | None,
+    occurrence_matches: bool,
+) -> bool:
+    """Allow a DAY_SPEECH skill at trigger timing only on its bound hook."""
+
+    return (
+        occurrence_matches
+        and binding is not None
+        and observation.timing == "TRIGGER_ACTION"
+        and "DAY_SPEECH" in skill.timing
+        and binding.hook_id in skill.hook_ids
+    )
+
+
 def _request_context(
     observation: RuleObservation,
     request: SkillRequest,
     skill: SkillSpec,
+    state_declarations: Sequence[StateDeclaration] = (),
 ) -> dict[str, object]:
     players = {player.seat: player for player in observation.players}
     state = {
-        item.key: item.value
-        for item in observation.skill_state
-        if item.ability_instance_id == request.ability_instance_id
+        item.key: item.initial for item in state_declarations if item.skill_id == skill.skill_id
     }
+    state.update(
+        {
+            item.key: item.value
+            for item in observation.state_values
+            if item.skill_id == skill.skill_id
+            and (
+                (item.scope == "GAME")
+                or (item.scope == "SEAT" and item.seat == request.actor_seat)
+                or (
+                    item.scope == "ABILITY"
+                    and item.ability_instance_id == request.ability_instance_id
+                )
+            )
+        }
+    )
+    state.update(
+        {
+            item.key: item.value
+            for item in observation.skill_state
+            if item.ability_instance_id == request.ability_instance_id
+            and item.skill_id == skill.skill_id
+        }
+    )
     return {
         "observation": observation,
         "actor": players.get(request.actor_seat),
         "target": players.get(request.targets[0]) if len(request.targets) == 1 else None,
+        "source_fact": next(
+            (fact for fact in observation.facts if fact.fact_id == request.source_fact_id),
+            None,
+        ),
         "request": {
             "request_id": request.request_id,
             "action_code": request.action_code,
@@ -98,6 +214,9 @@ def _request_context(
             "actor_seat": request.actor_seat,
             "target_count": len(request.targets),
             "parameters": request.parameters,
+            "window_id": request.window_id,
+            "logical_window_id": request.logical_window_id,
+            "hook_id": request.hook_id,
         },
         "request_targets": tuple(
             players[seat] for seat in sorted(request.targets) if seat in players
@@ -154,6 +273,11 @@ class RuleInterpreter:
         request_ids = [item.request_id for item in request_values]
         if len(request_ids) != len(set(request_ids)):
             raise ValueError("request ids must be unique within a resolution group")
+        binding_request_ids = tuple(
+            binding.request_id for binding in observation.current_window_bindings
+        )
+        if len(binding_request_ids) != len(set(binding_request_ids)):
+            raise ValueError("current window bindings must have unique request ids")
         player_seats = [item.seat for item in observation.players]
         if len(player_seats) != len(set(player_seats)):
             raise ValueError("observation player seats must be unique")
@@ -165,6 +289,9 @@ class RuleInterpreter:
         skills = {skill.skill_id: skill for skill in package.skills}
         actions = {action.action_code: action for action in package.actions}
         instances = {item.ability_instance_id: item for item in observation.ability_instances}
+        window_bindings_by_request: dict[str, RuleWindowBinding] = {
+            binding.request_id: binding for binding in observation.current_window_bindings
+        }
         old_request_ids = {item.request_id for item in observation.ledger}
         dispositions: dict[str, RequestDisposition] = {}
         candidates: dict[str, tuple[SkillSpec, AbilityInstance, SkillRequest]] = {}
@@ -182,6 +309,18 @@ class RuleInterpreter:
                     reason="duplicate_request",
                 )
                 continue
+            window_binding = window_bindings_by_request.get(request.request_id)
+            if observation.current_window_bindings and window_binding is None:
+                dispositions[request.request_id] = self._rejected(request, "window_binding_missing")
+                continue
+            if window_binding is None:
+                expected_window_id = observation.current_window_id
+                expected_logical_window_id = observation.current_logical_window_id
+                expected_hook_id = observation.current_hook_id
+            else:
+                expected_window_id = window_binding.window_id
+                expected_logical_window_id = window_binding.logical_window_id
+                expected_hook_id = window_binding.hook_id
             if instance is None:
                 dispositions[request.request_id] = self._rejected(
                     request, "unknown_ability_instance"
@@ -208,14 +347,119 @@ class RuleInterpreter:
                 )
                 continue
             if skill.mode == "AUTOMATIC":
-                dispositions[request.request_id] = self._rejected(
-                    request, "automatic_skill_not_requestable", skill_id
-                )
-                continue
-            if request.origin != skill.mode:
+                if request.origin != "AUTOMATIC" or skill.trigger is None:
+                    dispositions[request.request_id] = self._rejected(
+                        request, "automatic_origin_not_authorized", skill_id
+                    )
+                    continue
+            elif request.origin == "AUTOMATIC" or request.origin != skill.mode:
                 dispositions[request.request_id] = self._rejected(
                     request, "request_origin_not_authorized", skill_id
                 )
+                continue
+            trigger = skill.trigger
+            bound_day_speech_occurrence = _matches_bound_day_speech_occurrence(
+                request,
+                window_binding,
+            )
+            source_fact = next(
+                (fact for fact in observation.facts if fact.fact_id == request.source_fact_id),
+                None,
+            )
+            has_trigger_binding = (
+                request.trigger_occurrence_id is not None or request.source_fact_id is not None
+            )
+            bound_legacy_trigger_occurrence = (
+                _matches_bound_legacy_trigger_occurrence(
+                    request,
+                    window_binding,
+                    source_fact,
+                )
+                and trigger is None
+            )
+            if trigger is None:
+                if (
+                    (has_trigger_binding and not bound_day_speech_occurrence)
+                    and not bound_legacy_trigger_occurrence
+                ) or (
+                    window_binding is not None
+                    and window_binding.legacy_trigger
+                    and not bound_legacy_trigger_occurrence
+                ):
+                    dispositions[request.request_id] = self._rejected(
+                        request, "trigger_occurrence_not_bound", skill_id
+                    )
+                    continue
+                if bound_legacy_trigger_occurrence and not _has_bound_legacy_trigger_timing(
+                    observation,
+                    bound_legacy_trigger_occurrence,
+                ):
+                    dispositions[request.request_id] = self._rejected(
+                        request, "wrong_timing", skill_id
+                    )
+                    continue
+            else:
+                if (
+                    request.trigger_occurrence_id is None
+                    or request.source_fact_id is None
+                    or source_fact is None
+                ):
+                    dispositions[request.request_id] = self._rejected(
+                        request, "trigger_occurrence_not_bound", skill_id
+                    )
+                    continue
+                if source_fact.fact_type not in trigger.fact_types:
+                    dispositions[request.request_id] = self._rejected(
+                        request, "trigger_fact_not_authorized", skill_id
+                    )
+                    continue
+                if (trigger.mode == "AUTOMATIC") != (request.origin == "AUTOMATIC"):
+                    dispositions[request.request_id] = self._rejected(
+                        request, "trigger_origin_not_authorized", skill_id
+                    )
+                    continue
+                if trigger.mode == "PLAYER_CHOICE" and request.origin != "PLAYER":
+                    dispositions[request.request_id] = self._rejected(
+                        request, "trigger_origin_not_authorized", skill_id
+                    )
+                    continue
+                if request.window_id != expected_window_id:
+                    dispositions[request.request_id] = self._rejected(
+                        request, "trigger_window_mismatch", skill_id
+                    )
+                    continue
+            if request.window_id is not None and request.window_id != expected_window_id:
+                dispositions[request.request_id] = self._rejected(
+                    request, "window_mismatch", skill_id
+                )
+                continue
+            if request.logical_window_id is not None and (
+                request.logical_window_id != expected_logical_window_id
+            ):
+                dispositions[request.request_id] = self._rejected(
+                    request, "logical_window_mismatch", skill_id
+                )
+                continue
+            if skill.window_ids and (
+                request.logical_window_id is None
+                or request.window_id is None
+                or request.window_id != expected_window_id
+                or request.logical_window_id != expected_logical_window_id
+                or request.logical_window_id not in skill.window_ids
+            ):
+                dispositions[request.request_id] = self._rejected(request, "wrong_window", skill_id)
+                continue
+            if request.hook_id is not None and request.hook_id != expected_hook_id:
+                dispositions[request.request_id] = self._rejected(
+                    request, "hook_mismatch", skill_id
+                )
+                continue
+            if skill.hook_ids and (
+                request.hook_id is None
+                or request.hook_id != expected_hook_id
+                or request.hook_id not in skill.hook_ids
+            ):
+                dispositions[request.request_id] = self._rejected(request, "wrong_hook", skill_id)
                 continue
             if request.origin == "HOST":
                 if (
@@ -236,19 +480,28 @@ class RuleInterpreter:
                         request, "ability_not_granted", skill_id
                     )
                     continue
-                grant_context = {"observation": observation}
-                if request.actor_seat not in select_seats(grant.actor_selector, grant_context):
-                    dispositions[request.request_id] = self._rejected(
-                        request, "actor_not_eligible", skill_id
-                    )
-                    continue
             action = actions.get(request.action_code)
             if action is None or request.action_code != skill.action_code:
                 dispositions[request.request_id] = self._rejected(
                     request, "action_not_available", skill_id
                 )
                 continue
-            if skill.timing and observation.timing not in skill.timing:
+            if (
+                skill.timing
+                and observation.timing not in skill.timing
+                and not (
+                    _has_bound_day_speech_timing(
+                        observation,
+                        skill,
+                        window_binding,
+                        bound_day_speech_occurrence,
+                    )
+                )
+                and not _has_bound_legacy_trigger_timing(
+                    observation,
+                    bound_legacy_trigger_occurrence,
+                )
+            ):
                 dispositions[request.request_id] = self._rejected(request, "wrong_timing", skill_id)
                 continue
             if request.actor_seat not in players:
@@ -282,7 +535,9 @@ class RuleInterpreter:
                     request, "target_count_invalid", skill_id
                 )
                 continue
-            target_context = _request_context(observation, request, skill)
+            target_context = _request_context(
+                observation, request, skill, package.state_declarations
+            )
             try:
                 eligible_targets = set(select_seats(skill.targets.selector, target_context))
             except ValueError as exc:
@@ -300,6 +555,12 @@ class RuleInterpreter:
             target_context["request_targets"] = tuple(
                 players[seat] for seat in sorted(target_seats)
             )
+            target_context["source_fact"] = source_fact
+            if trigger is not None and not evaluate_predicate(trigger.condition, target_context):
+                dispositions[request.request_id] = self._rejected(
+                    request, "trigger_condition_not_met", skill_id
+                )
+                continue
             if not request.passed and not evaluate_predicate(skill.condition, target_context):
                 dispositions[request.request_id] = self._rejected(
                     request, "condition_not_met", skill_id
@@ -371,12 +632,47 @@ class RuleInterpreter:
                 applied_by_request[effect.source_request_id] = True
 
         updates = list(effect_resolution.state_updates)
-        state_signatures: dict[tuple[str, str], object] = {}
-        for update in updates:
-            key = (update.ability_instance_id, update.key)
-            if key in state_signatures and not _same_json(state_signatures[key], update.value):
-                raise ValueError(f"simultaneous conflicting state updates for {key[1]}")
-            state_signatures[key] = update.value
+        state_signatures: dict[tuple[object, ...], object] = {}
+        for state_update in updates:
+            state_key = (
+                state_update.scope,
+                state_update.skill_id,
+                state_update.ability_instance_id,
+                state_update.seat,
+                state_update.key,
+            )
+            if state_key in state_signatures and not _same_json(
+                state_signatures[state_key], state_update.value
+            ):
+                raise ValueError(f"simultaneous conflicting state updates for {state_key[1]}")
+            state_signatures[state_key] = state_update.value
+        field_signatures: dict[tuple[int, str], object] = {}
+        for player_update in effect_resolution.player_updates:
+            field_key = (player_update.seat, player_update.player_field)
+            if field_key in field_signatures and not _same_json(
+                field_signatures[field_key], player_update.value
+            ):
+                raise ValueError(
+                    f"simultaneous conflicting player field updates for seat {player_update.seat}"
+                )
+            field_signatures[field_key] = player_update.value
+        relation_writes: set[str] = set()
+        for relation_update in effect_resolution.relation_updates:
+            if relation_update.relation_id in relation_writes:
+                raise ValueError("simultaneous conflicting relation updates")
+            relation_writes.add(relation_update.relation_id)
+        ability_writes: set[tuple[int, str, str]] = set()
+        for ability_update in effect_resolution.ability_updates:
+            ability_key = (
+                ability_update.target_seat,
+                ability_update.skill_id,
+                ability_update.grant_id,
+            )
+            if ability_key in ability_writes:
+                raise ValueError("simultaneous conflicting ability updates")
+            ability_writes.add(ability_key)
+        if len(effect_resolution.flow_updates) > 1:
+            raise ValueError("multiple FLOW effects in one resolution group are ambiguous")
         vote_values: dict[int, bool] = {}
         for effect in effect_resolution.effects:
             if effect.effect_type != "SET_CAN_VOTE" or effect.target_seat is None:
@@ -391,9 +687,55 @@ class RuleInterpreter:
                 )
             vote_values[effect.target_seat] = effect.value
 
+        resource_declarations = {item.resource_id: item for item in package.resource_declarations}
+        resource_deltas: dict[tuple[int, str], int] = defaultdict(int)
+        cost_updates: list[CostUpdate] = []
+        for request_id in sorted(candidates):
+            skill, instance, request = candidates[request_id]
+            if request.passed and not skill.usage.charge_on_pass:
+                continue
+            for cost in skill.usage.costs:
+                charged = (
+                    skill.usage.cost_policy == "ON_ATTEMPT"
+                    or skill.usage.cost_policy == "ON_SUCCESS"
+                    or (
+                        skill.usage.cost_policy == "ON_EFFECT"
+                        and applied_by_request.get(request.request_id, False)
+                    )
+                )
+                if charged:
+                    cost_updates.append(
+                        CostUpdate(
+                            resource_id=cost.resource_id,
+                            actor_seat=request.actor_seat,
+                            amount=cost.amount,
+                            source_request_id=request.request_id,
+                            ability_instance_id=instance.ability_instance_id,
+                        )
+                    )
+        for resource_update in effect_resolution.resource_updates:
+            declaration = resource_declarations.get(resource_update.resource_id)
+            if declaration is None:
+                raise ValueError("resolved resource update has no declaration")
+            resource_deltas[(resource_update.seat, resource_update.resource_id)] += (
+                resource_update.delta
+            )
+        for cost_update in cost_updates:
+            resource_deltas[(cost_update.actor_seat, cost_update.resource_id)] -= cost_update.amount
+        for (seat, resource_id), delta in resource_deltas.items():
+            current = players[seat].resources.get(resource_id, 0)
+            declaration = resource_declarations.get(resource_id)
+            result = current + delta
+            if result < (declaration.min_value if declaration is not None else 0) or (
+                declaration is not None and result > declaration.max_value
+            ):
+                raise ValueError(
+                    "simultaneous resource deltas and costs exceed bounds for "
+                    f"seat {seat} resource {resource_id}"
+                )
+
         history_updates: list[SkillUseRecord] = []
         use_updates: list[UseUpdate] = []
-        cost_updates: list[CostUpdate] = []
         for request_id in sorted(candidates):
             skill, instance, request = candidates[request_id]
             # ACCEPTED means the configured action was legally executed. A
@@ -427,27 +769,6 @@ class RuleInterpreter:
                     accepted=should_update_use,
                 )
             )
-            for cost in skill.usage.costs:
-                if request.passed and not skill.usage.charge_on_pass:
-                    continue
-                charged = (
-                    (skill.usage.cost_policy == "ON_ATTEMPT")
-                    or (skill.usage.cost_policy == "ON_SUCCESS" and successful)
-                    or (
-                        skill.usage.cost_policy == "ON_EFFECT"
-                        and applied_by_request.get(request.request_id, False)
-                    )
-                )
-                if charged:
-                    cost_updates.append(
-                        CostUpdate(
-                            resource_id=cost.resource_id,
-                            actor_seat=request.actor_seat,
-                            amount=cost.amount,
-                            source_request_id=request.request_id,
-                            ability_instance_id=instance.ability_instance_id,
-                        )
-                    )
 
         disclosures = project_disclosures(
             package,
@@ -480,9 +801,22 @@ class RuleInterpreter:
             state_updates=tuple(
                 sorted(
                     updates,
-                    key=lambda item: (item.ability_instance_id, item.key, item.source_request_id),
+                    key=lambda item: (
+                        item.scope,
+                        item.skill_id,
+                        item.ability_instance_id or "",
+                        item.seat or 0,
+                        item.key,
+                        item.source_request_id,
+                        item.source_rule_id,
+                    ),
                 )
             ),
+            player_updates=effect_resolution.player_updates,
+            resource_updates=effect_resolution.resource_updates,
+            relation_updates=effect_resolution.relation_updates,
+            ability_updates=effect_resolution.ability_updates,
+            flow_updates=effect_resolution.flow_updates,
             use_updates=tuple(
                 sorted(
                     use_updates, key=lambda item: (item.ability_instance_id, item.source_request_id)
@@ -525,13 +859,41 @@ class RuleInterpreter:
         specs: Sequence[EffectSpec],
     ) -> tuple[EffectIntent, ...]:
         players = {player.seat: player for player in observation.players}
-        base_context = _request_context(observation, request, skill)
+        base_context = _request_context(observation, request, skill, package.state_declarations)
+        state_declarations = {
+            (item.skill_id, item.key): item for item in package.state_declarations
+        }
+        resource_declarations = {item.resource_id: item for item in package.resource_declarations}
+        skill_specs = {item.skill_id: item for item in package.skills}
         intents: list[EffectIntent] = []
         for spec in specs:
+            targets: tuple[int | None, ...]
+            state_declaration = (
+                state_declarations.get((skill.skill_id, spec.state_key))
+                if spec.effect_type == "STATE_SET" and spec.state_key is not None
+                else None
+            )
             if spec.target is None:
-                targets: tuple[int | None, ...] = (
-                    tuple(sorted(request.targets)) if request.targets else (None,)
-                )
+                if spec.effect_type == "FLOW" or (
+                    spec.effect_type == "STATE_SET"
+                    and state_declaration is not None
+                    and state_declaration.scope in {"GAME", "ABILITY"}
+                ):
+                    targets = (None,)
+                elif request.targets:
+                    targets = tuple(sorted(request.targets))
+                elif spec.effect_type in {
+                    "PLAYER_FIELD_SET",
+                    "RESOURCE_DELTA",
+                    "RELATION_ADD",
+                    "RELATION_REMOVE",
+                    "ABILITY_GRANT",
+                    "ABILITY_REVOKE",
+                    "STATE_SET",
+                }:
+                    targets = (request.actor_seat,)
+                else:
+                    targets = (None,)
             else:
                 source_targets: tuple[int | None, ...] = (
                     tuple(sorted(request.targets)) if request.targets else (None,)
@@ -556,14 +918,40 @@ class RuleInterpreter:
                 targets = tuple(sorted(resolved_targets, key=lambda item: item or 0))
             for target in targets:
                 context = dict(base_context)
-                context["target"] = players.get(target) if target is not None else None
+                expression_target = target
+                if (
+                    target is None
+                    and spec.target is None
+                    and spec.effect_type == "STATE_SET"
+                    and state_declaration is not None
+                    and state_declaration.scope == "ABILITY"
+                ):
+                    if len(request.targets) == 1:
+                        expression_target = request.targets[0]
+                    elif len(request.targets) > 1 and any(
+                        _references_target(expression)
+                        for expression in (spec.condition, spec.value)
+                    ):
+                        raise ValueError(
+                            "ABILITY-scoped STATE_SET cannot resolve target references "
+                            "for multiple request targets"
+                        )
+                context["target"] = (
+                    players.get(expression_target) if expression_target is not None else None
+                )
                 if not evaluate_predicate(spec.condition, context):
                     continue
                 authorized = set(request.targets)
+                # Self-targeting is implicitly permitted for this effect. Carry that same
+                # narrow authorization with the intent for the authority layer to recheck.
+                if target == request.actor_seat:
+                    authorized.add(request.actor_seat)
                 for authorized_expr in spec.authorized_targets:
                     resolved = evaluate_expr(authorized_expr, context)
-                    values = resolved if isinstance(resolved, (tuple, list)) else (resolved,)
-                    for seat in values:
+                    authorization_values = (
+                        resolved if isinstance(resolved, (tuple, list)) else (resolved,)
+                    )
+                    for seat in authorization_values:
                         if seat is None:
                             continue
                         if (
@@ -576,9 +964,10 @@ class RuleInterpreter:
                             )
                         authorized.add(seat)
                 if target is not None and target not in authorized:
-                    raise ValueError(
-                        f"effect {spec.effect_id} writes outside its declared authorization"
-                    )
+                    if target != request.actor_seat:
+                        raise ValueError(
+                            f"effect {spec.effect_id} writes outside its declared authorization"
+                        )
                 if target is not None and target not in players:
                     raise ValueError(
                         f"effect {spec.effect_id} target is absent from the observation"
@@ -599,6 +988,129 @@ class RuleInterpreter:
                 value_result = (
                     evaluate_expr(spec.value, context) if spec.value is not None else None
                 )
+                if (
+                    target is not None
+                    and spec.effect_type
+                    in {
+                        "PLAYER_FIELD_SET",
+                        "RESOURCE_DELTA",
+                        "ABILITY_GRANT",
+                        "ABILITY_REVOKE",
+                    }
+                    and target not in players
+                ):
+                    raise ValueError(f"effect {spec.effect_id} target is absent from observation")
+                if spec.effect_type == "PLAYER_FIELD_SET":
+                    field_values = package.player_field_values
+                    if spec.player_field is None or field_values is None:
+                        raise ValueError("PLAYER_FIELD_SET requires compiler-bound field values")
+                    allowed: tuple[str, ...]
+                    if spec.player_field == "role_id":
+                        allowed = field_values.role_ids
+                        valid = isinstance(value_result, str) and value_result in allowed
+                    elif spec.player_field == "faction_id":
+                        allowed = field_values.faction_ids
+                        valid = isinstance(value_result, str) and value_result in allowed
+                    elif spec.player_field == "victory_group_id":
+                        allowed = field_values.victory_group_ids
+                        valid = value_result is None or (
+                            isinstance(value_result, str) and value_result in allowed
+                        )
+                    else:
+                        allowed = field_values.chat_group_ids
+                        valid = (
+                            isinstance(value_result, (tuple, list))
+                            and all(
+                                isinstance(item, str) and item in allowed for item in value_result
+                            )
+                            and len(value_result) == len(set(value_result))
+                        )
+                    if not valid:
+                        raise ValueError(
+                            f"effect {spec.effect_id} player field value is outside "
+                            "the frozen vocabulary"
+                        )
+                delta: int | None = None
+                if spec.effect_type == "RESOURCE_DELTA":
+                    if spec.resource_id not in resource_declarations or spec.delta is None:
+                        raise ValueError("RESOURCE_DELTA requires a declared resource and delta")
+                    resolved_delta = evaluate_expr(spec.delta, context)
+                    if not isinstance(resolved_delta, int) or isinstance(resolved_delta, bool):
+                        raise ValueError("RESOURCE_DELTA delta must resolve to an integer")
+                    if abs(resolved_delta) > 1_000_000:
+                        raise ValueError("RESOURCE_DELTA exceeds the bounded delta limit")
+                    delta = resolved_delta
+                relation_type = spec.relation_type
+                relation_source_seat: int | None = None
+                relation_target_seat: int | None = None
+                relation_expiry_policy = spec.relation_expiry_policy
+                if spec.effect_type in {"RELATION_ADD", "RELATION_REMOVE"}:
+                    if (
+                        relation_type is None
+                        or spec.relation_source is None
+                        or spec.relation_target is None
+                    ):
+                        raise ValueError("relation effects require a declared type and endpoints")
+                    source_value = evaluate_expr(spec.relation_source, context)
+                    target_value = evaluate_expr(spec.relation_target, context)
+                    if (
+                        not isinstance(source_value, int)
+                        or isinstance(source_value, bool)
+                        or not isinstance(target_value, int)
+                        or isinstance(target_value, bool)
+                        or source_value not in players
+                        or target_value not in players
+                    ):
+                        raise ValueError("relation endpoints must be observed seats")
+                    relation_source_seat = source_value
+                    relation_target_seat = target_value
+                    if spec.effect_type == "RELATION_ADD":
+                        relation_expiry_policy = relation_expiry_policy or "NEVER"
+                    else:
+                        relation_expiry_policy = None
+                    for endpoint in (source_value, target_value):
+                        if endpoint != request.actor_seat and endpoint not in authorized:
+                            raise ValueError(
+                                f"effect {spec.effect_id} relation endpoint is not authorized"
+                            )
+                grant_skill_id = spec.grant_skill_id
+                grant_id = spec.grant_id
+                granted_instance_id: str | None = None
+                if spec.effect_type in {"ABILITY_GRANT", "ABILITY_REVOKE"}:
+                    if grant_skill_id is None or grant_id is None:
+                        raise ValueError("ability operation requires skill and grant identifiers")
+                    target_skill = skill_specs.get(grant_skill_id)
+                    if target_skill is None or grant_id not in {
+                        grant.grant_id for grant in target_skill.grants
+                    }:
+                        raise ValueError("ability operation references an unknown skill grant")
+                    if spec.effect_type == "ABILITY_GRANT":
+                        granted_instance_id = _stable_id(
+                            "granted-ability",
+                            observation.game_id,
+                            observation.group_id,
+                            request.request_id,
+                            target,
+                            grant_skill_id,
+                            grant_id,
+                        )
+                state_scope = state_declaration.scope if state_declaration is not None else None
+                state_ability_instance_id: str | None = None
+                if state_declaration is not None and state_scope == "ABILITY":
+                    if target is not None and target != request.actor_seat:
+                        raise ValueError("ABILITY-scoped state can only target its source instance")
+                    state_ability_instance_id = instance.ability_instance_id
+                if state_declaration is not None and state_scope == "SEAT" and target is None:
+                    raise ValueError("SEAT-scoped state requires a target seat")
+                if state_declaration is not None and state_scope == "GAME" and target is not None:
+                    raise ValueError("GAME-scoped state cannot target a seat")
+                if spec.effect_type == "FLOW":
+                    if spec.flow_action is None:
+                        raise ValueError("FLOW requires a typed flow action")
+                    if spec.flow_action == "RESUME_HOOK" and (
+                        request.hook_id is None or request.hook_id not in skill.hook_ids
+                    ):
+                        raise ValueError("RESUME_HOOK requires the currently bound skill hook")
                 if spec.effect_type == "CONSUME_ABILITY" and (
                     not isinstance(value_result, str) or not value_result
                 ):
@@ -622,6 +1134,29 @@ class RuleInterpreter:
                         state_key=spec.state_key,
                         fact_type=spec.fact_type,
                         authorized_targets=tuple(sorted(authorized)),
+                        player_field=spec.player_field,
+                        resource_id=spec.resource_id,
+                        delta=delta,
+                        relation_type=relation_type,
+                        relation_source_seat=relation_source_seat,
+                        relation_target_seat=relation_target_seat,
+                        relation_expiry_policy=relation_expiry_policy,
+                        grant_skill_id=grant_skill_id,
+                        grant_id=grant_id,
+                        granted_ability_instance_id=granted_instance_id,
+                        state_scope=state_scope,
+                        state_ability_instance_id=state_ability_instance_id,
+                        state_expiry_policy=(
+                            state_declaration.expiry_policy
+                            if state_declaration is not None
+                            else None
+                        ),
+                        flow_action=spec.flow_action,
+                        trigger_occurrence_id=request.trigger_occurrence_id,
+                        source_fact_id=request.source_fact_id,
+                        window_id=request.window_id,
+                        logical_window_id=request.logical_window_id,
+                        hook_id=request.hook_id,
                     )
                 )
         return tuple(

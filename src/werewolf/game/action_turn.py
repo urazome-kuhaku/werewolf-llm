@@ -49,7 +49,18 @@ from .manager import EventCommitError, GameManager
 from .state import GameState, GrantedAbility, GrantedTriggerAbility, PlayerState
 
 _PRIVATE_WINDOW_CONTEXT_KEYS = frozenset(
-    {"resolution_id", "origin_resolution_id", "snapshot_revision", "operation"}
+    {
+        "resolution_id",
+        "origin_resolution_id",
+        "snapshot_revision",
+        "operation",
+        "rule_occurrence_id",
+        "rule_source_fact_id",
+        "rule_actor_seat",
+        "rule_ability_instance_id",
+        "rule_skill_id",
+        "rule_action_code",
+    }
 )
 
 
@@ -67,7 +78,9 @@ def _runtime_visible_context(
     """
 
     projected = {
-        key: value for key, value in context.items() if key not in _PRIVATE_WINDOW_CONTEXT_KEYS
+        key: value
+        for key, value in context.items()
+        if key not in _PRIVATE_WINDOW_CONTEXT_KEYS and not key.startswith("rule_")
     }
     if "candidate_seats" in context:
         projected["candidate_seats"] = [cast(JsonValue, seat) for seat in candidates]
@@ -527,6 +540,8 @@ class ActionTurnScheduler:
             return self._visible_badge_window(state, window, context)
 
         if window.phase is GamePhase.TRIGGER_ACTION:
+            if "rule_occurrence_id" in window.visible_context:
+                return self._visible_rule_trigger_window(state, window, player)
             return self._visible_trigger_window(state, window, player)
         if window.phase is GamePhase.NIGHT_ACTION:
             return self._visible_night_window(state, window, player, context)
@@ -593,6 +608,7 @@ class ActionTurnScheduler:
                 player.seat,
                 window.phase.value,
                 allowed_codes=set(window.allowed_action_codes),
+                logical_window_id=window.logical_window_id,
             )
             authorized = set(context.authorized_action_codes)
             executable_usable = [
@@ -621,6 +637,35 @@ class ActionTurnScheduler:
             codes = (*codes, 299)
         candidates = self._candidate_seats(state, window)
         return tuple(dict.fromkeys(codes)), candidates, ""
+
+    @staticmethod
+    def _visible_rule_trigger_window(
+        state: GameState,
+        window: ActionWindow,
+        player: PlayerState,
+    ) -> tuple[tuple[int, ...], list[int], str]:
+        """Project a manager-installed trigger occurrence to its chosen actor.
+
+        The action and candidate projection is read from the installed
+        occurrence window.  It deliberately does not inspect role names or
+        reconstruct skill authority; the manager performs that check again
+        when it accepts the resulting ActionRequest.
+        """
+
+        context = window.visible_context
+        raw_actor = context.get("rule_actor_seat")
+        raw_action = context.get("rule_action_code")
+        if raw_actor != player.seat or type(raw_action) is not int:
+            return (), [], ""
+        if raw_action not in window.allowed_action_codes:
+            return (), [], ""
+        raw_candidates = context.get("candidate_seats")
+        candidates = sorted(
+            {seat for seat in raw_candidates if type(seat) is int and seat in state.players}
+            if isinstance(raw_candidates, (list, tuple))
+            else set()
+        )
+        return (raw_action,), candidates, ""
 
     def _visible_trigger_window(
         self,

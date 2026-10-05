@@ -959,6 +959,65 @@ class ModeratorShell:
             candidates.append(seat)
         return tuple(candidates)
 
+    async def _day_speech_next_with_hooks(
+        self,
+        flow: ModeratorDayFlow,
+    ) -> dict[str, object]:
+        """Poll only ordinary speech hooks around one committed speech turn."""
+
+        if (
+            self.manager is None
+            or self.manager.execution_package is None
+            or self.state.phase not in {GamePhase.DAY_ANNOUNCE, GamePhase.DAY_SPEECH}
+        ):
+            await flow.next_speech()
+            return {"status": "accepted", "phase": self.state.phase.value}
+
+        if self.state.phase is GamePhase.DAY_ANNOUNCE or self.state.current_queue in (None, ()):
+            await flow.open_speech()
+        if self.state.phase is not GamePhase.DAY_SPEECH:
+            return {"status": "advanced", "phase": self.state.phase.value}
+
+        triggers = self._require_trigger_flow()
+        before = await triggers.poll_hook("DAY_SPEECH_BEFORE")
+        if before.get("status") == "choice_pending" or self.state.phase is not GamePhase.DAY_SPEECH:
+            return {
+                "status": "hook_pending",
+                "hook": "DAY_SPEECH_BEFORE",
+                "phase": self.state.phase.value,
+            }
+
+        spoken = await flow.next_speech()
+        speaker_seat = getattr(spoken.event.payload, "speaker_seat", None)
+        if type(speaker_seat) is not int:
+            raise ModeratorError("SPEECH_EVENT_INVALID: committed speech has no speaker seat")
+        if self.state.phase is not GamePhase.DAY_SPEECH:
+            return {
+                "status": "accepted",
+                "phase": self.state.phase.value,
+                "speaker_seat": speaker_seat,
+                "speech_event_id": spoken.event.event_id,
+            }
+        after = await triggers.poll_hook("DAY_SPEECH_AFTER")
+        if after.get("status") == "choice_pending" or self.state.phase is not GamePhase.DAY_SPEECH:
+            return {
+                "status": "hook_pending",
+                "hook": "DAY_SPEECH_AFTER",
+                "phase": self.state.phase.value,
+                "speaker_seat": speaker_seat,
+                "speech_event_id": spoken.event.event_id,
+                "serial_request_id": spoken.request.request_id,
+                "logical_request_id": spoken.request.logical_request_id,
+            }
+        return {
+            "status": "accepted",
+            "phase": self.state.phase.value,
+            "speaker_seat": speaker_seat,
+            "speech_event_id": spoken.event.event_id,
+            "serial_request_id": spoken.request.request_id,
+            "logical_request_id": spoken.request.logical_request_id,
+        }
+
     async def _sheriff_command(self, args: list[str]) -> dict[str, object]:
         if args and args[0].lower() in {"help", "?"}:
             if len(args) != 1:
@@ -1518,7 +1577,10 @@ class ModeratorShell:
                         is_pk=True if pk_command else None,
                     )
                 elif subcommand in {"next", "run"} and len(args) == 2:
-                    await flow.next_speech()
+                    speech_action = await self._day_speech_next_with_hooks(flow)
+                    payload = self._day_payload()
+                    payload["speech_action"] = speech_action
+                    return payload
                 elif subcommand == "retry" and len(args) == 2:
                     await flow.retry_speech()
                 elif subcommand in {"close", "advance"} and len(args) == 2:
@@ -1528,9 +1590,15 @@ class ModeratorShell:
                         "day speech syntax: open [seat ...] | next | retry | close"
                     )
             elif action in {"next-speech", "speech-next"} and len(args) == 1:
-                await flow.next_speech()
+                speech_action = await self._day_speech_next_with_hooks(flow)
+                payload = self._day_payload()
+                payload["speech_action"] = speech_action
+                return payload
             elif action == "next" and len(args) == 1:
-                await flow.next_speech()
+                speech_action = await self._day_speech_next_with_hooks(flow)
+                payload = self._day_payload()
+                payload["speech_action"] = speech_action
+                return payload
             elif action in {"retry-speech", "speech-retry"} and len(args) == 1:
                 await flow.retry_speech()
             elif action == "retry" and len(args) == 1:

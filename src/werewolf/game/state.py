@@ -31,6 +31,7 @@ from werewolf.knowledge.role import (
     UsageLimit,
 )
 
+from .actions import ActionWindow
 from .events import DeliveryCursor, GameEvent
 
 SCHEMA_VERSION: Literal[1] = 1
@@ -42,6 +43,7 @@ GameId = Annotated[str, Field(min_length=1, max_length=64, strict=True)]
 LogicalId = Annotated[str, Field(min_length=1, max_length=128, strict=True)]
 SeatNo = Annotated[int, Field(ge=1, le=64, strict=True)]
 NonNegativeInt = Annotated[int, Field(ge=0, strict=True)]
+RuleHook = Literal["DAY_SPEECH_BEFORE", "DAY_SPEECH_AFTER"]
 
 
 def utc_now() -> datetime:
@@ -266,6 +268,13 @@ class RuleStateValue(_StrictModel):
     value_type: LogicalId
     value: JsonValue
     source_batch_id: LogicalId
+    skill_id: LogicalId | None = None
+    source_request_id: LogicalId | None = None
+    source_rule_id: LogicalId | None = None
+    source_ability_instance_id: LogicalId | None = None
+    expiry_policy: Literal["NEVER", "ROUND_END", "NEXT_NIGHT_START"] = "NEVER"
+    expires_at_round: NonNegativeInt | None = None
+    expires_at_hook: LogicalId | None = None
 
     @field_validator("value", mode="before")
     @classmethod
@@ -286,6 +295,266 @@ class RuleStateValue(_StrictModel):
             raise ValueError("game-scoped rule state must not have scope_id")
         if self.scope != "GAME" and self.scope_id is None:
             raise ValueError("seat- and ability-scoped rule state require scope_id")
+        return self
+
+
+class RuleRelationValue(_StrictModel):
+    """One persistent typed relation with the provenance that created it."""
+
+    schema_version: Literal[1] = 1
+    relation_id: LogicalId
+    relation_type: LogicalId
+    source_seat: SeatNo
+    target_seat: SeatNo
+    source_skill_id: LogicalId
+    source_rule_id: LogicalId
+    source_request_id: LogicalId
+    created_round: NonNegativeInt
+    source_ability_instance_id: LogicalId
+    expiry_policy: Literal["NEVER", "ROUND_END", "NEXT_NIGHT_START"] = "NEVER"
+    expires_at_round: NonNegativeInt | None = None
+    expires_at_hook: LogicalId | None = None
+
+
+class RuleDeferredDisclosure(_StrictModel):
+    """A fixed, package-authorized projection waiting for its declared hook."""
+
+    schema_version: Literal[1] = 1
+    delivery_id: LogicalId
+    package_id: LogicalId
+    source_batch_id: LogicalId
+    source_request_id: LogicalId
+    source_revision: NonNegativeInt
+    source_round_no: NonNegativeInt
+    source_phase: GamePhase
+    source_window_id: LogicalId | None = None
+    source_logical_window_id: LogicalId | None = None
+    actor_seat: SeatNo
+    ability_instance_id: LogicalId
+    action_code: ActionCode
+    skill_id: LogicalId
+    disclosure_id: LogicalId
+    audience: Literal["SELF", "TEAM", "ALL", "SEATS"]
+    recipients: tuple[SeatNo, ...]
+    source_team_roster: tuple[SeatNo, ...] = ()
+    fields: dict[str, JsonValue] = Field(default_factory=dict)
+    hook: LogicalId
+    event_type: LogicalId | None = None
+
+    @field_validator("recipients", "source_team_roster", mode="before")
+    @classmethod
+    def accept_disclosure_recipients(cls, value: object) -> object:
+        return tuple(value) if isinstance(value, list) else value
+
+    @field_validator("fields", mode="before")
+    @classmethod
+    def accept_disclosure_fields(cls, value: object) -> object:
+        return _deep_thaw_json(value) if isinstance(value, dict) else value
+
+    @field_serializer("fields")
+    def serialize_disclosure_fields(self, value: dict[str, JsonValue]) -> object:
+        return _deep_thaw_json(value)
+
+    @model_validator(mode="after")
+    def validate_deferred_disclosure(self) -> RuleDeferredDisclosure:
+        if len(set(self.recipients)) != len(self.recipients):
+            raise ValueError("deferred disclosure recipients must be unique")
+        if self.audience == "TEAM" and self.source_team_roster != self.recipients:
+            raise ValueError("TEAM deferred disclosure must preserve its source roster")
+        if self.audience != "TEAM" and self.source_team_roster:
+            raise ValueError("only TEAM disclosures may carry a source roster")
+        return self
+
+
+class RuleReturnPoint(_StrictModel):
+    """A workflow resume reference that never duplicates speech queue state."""
+
+    schema_version: Literal[1] = 1
+    phase: GamePhase
+    hook_id: RuleHook | None = None
+    window_id: LogicalId | None = None
+    logical_window_id: LogicalId | None = None
+    speaker_seat: SeatNo | None = None
+    serial_turn_id: LogicalId | None = None
+    event_ids: tuple[NonNegativeInt, ...] = ()
+    day_no: NonNegativeInt | None = None
+
+    @field_validator("event_ids", mode="before")
+    @classmethod
+    def accept_return_event_ids(cls, value: object) -> object:
+        return tuple(value) if isinstance(value, list) else value
+
+    @field_validator("event_ids")
+    @classmethod
+    def validate_return_event_ids(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        if tuple(sorted(set(value))) != value:
+            raise ValueError("return point event_ids must be sorted and unique")
+        return value
+
+
+class RuleBoundary(_StrictModel):
+    """Confirmed-death boundary and its durable host-work completion proof."""
+
+    schema_version: Literal[1] = 1
+    boundary_id: LogicalId
+    source_group_id: LogicalId
+    source_batch_id: LogicalId
+    death_fact_ids: tuple[LogicalId, ...]
+    death_seats: tuple[SeatNo, ...]
+    return_point: RuleReturnPoint
+    last_words_required: bool = False
+    last_words_seats: tuple[SeatNo, ...] = ()
+    last_words_completed_seats: tuple[SeatNo, ...] = ()
+    sheriff_badge_required: bool = False
+    sheriff_badge_completed: bool = False
+    created_at: datetime
+    completed_at: datetime | None = None
+
+    @field_validator(
+        "death_fact_ids",
+        "death_seats",
+        "last_words_seats",
+        "last_words_completed_seats",
+        mode="before",
+    )
+    @classmethod
+    def accept_boundary_arrays(cls, value: object) -> object:
+        return tuple(value) if isinstance(value, list) else value
+
+    @field_validator("created_at", "completed_at", mode="before")
+    @classmethod
+    def validate_boundary_timestamps(cls, value: object) -> datetime | None:
+        return None if value is None else _utc_datetime(value)
+
+    @model_validator(mode="after")
+    def validate_boundary(self) -> RuleBoundary:
+        if not self.death_fact_ids or not self.death_seats:
+            raise ValueError("rule boundary requires confirmed death facts and seats")
+        if len(set(self.death_fact_ids)) != len(self.death_fact_ids):
+            raise ValueError("rule boundary death fact IDs must be unique")
+        if len(set(self.death_seats)) != len(self.death_seats):
+            raise ValueError("rule boundary death seats must be unique")
+        if len(set(self.last_words_seats)) != len(self.last_words_seats):
+            raise ValueError("rule boundary last-words seats must be unique")
+        if len(set(self.last_words_completed_seats)) != len(self.last_words_completed_seats):
+            raise ValueError("completed last-words seats must be unique")
+        if not set(self.last_words_completed_seats).issubset(self.last_words_seats):
+            raise ValueError("last-words completion must belong to a pending boundary seat")
+        if not self.last_words_required and self.last_words_seats:
+            raise ValueError("last-words seats require last_words_required")
+        if self.sheriff_badge_completed and not self.sheriff_badge_required:
+            raise ValueError("sheriff badge completion requires a badge boundary")
+        if self.completed_at is not None and self.is_pending:
+            raise ValueError("incomplete rule boundary cannot have completed_at")
+        return self
+
+    @property
+    def is_pending(self) -> bool:
+        return (
+            self.last_words_required and self.last_words_completed_seats != self.last_words_seats
+        ) or (self.sheriff_badge_required and not self.sheriff_badge_completed)
+
+
+class RuleTriggerOccurrence(_StrictModel):
+    """One deduplicated, resumable automatic or player-choice workflow item."""
+
+    schema_version: Literal[1] = 1
+    occurrence_id: LogicalId
+    kind: Literal["TRIGGER", "HOOK"]
+    source_fact_id: LogicalId
+    source_batch_id: LogicalId
+    ability_instance_id: LogicalId
+    skill_id: LogicalId
+    actor_seat: SeatNo
+    mode: Literal["AUTOMATIC", "PLAYER_CHOICE"]
+    order: NonNegativeInt
+    status: Literal["QUEUED", "READY", "WAITING_CHOICE", "COMPLETED", "FAILED"] = "QUEUED"
+    window_id: LogicalId | None = None
+    request_id: LogicalId | None = None
+    hook_id: RuleHook | None = None
+    logical_window_id: LogicalId | None = None
+
+
+class RuleWorkflowCursor(_StrictModel):
+    """Durable progress for collection, trigger draining, and flow resumption."""
+
+    schema_version: Literal[1] = 1
+    cursor_id: LogicalId | None = None
+    settlement_group_id: LogicalId | None = None
+    active_window_ids: tuple[LogicalId, ...] = ()
+    completed_collection_window_ids: tuple[LogicalId, ...] = ()
+    active_occurrence_id: LogicalId | None = None
+    return_point: RuleReturnPoint | None = None
+    pending_flow_action: Literal["RESUME_HOOK", "ADVANCE_TO_NIGHT"] | None = None
+    next_logical_window_id: LogicalId | None = None
+    pending_boundary_id: LogicalId | None = None
+    steps_used: NonNegativeInt = 0
+    budget_limit: Annotated[int, Field(ge=1, le=100_000, strict=True)] = 512
+    status: Literal[
+        "IDLE",
+        "COLLECTING",
+        "DRAINING",
+        "WAITING_CHOICE",
+        "WAITING_BOUNDARY",
+        "RETURN_READY",
+        "ERROR",
+    ] = "IDLE"
+    error_code: LogicalId | None = None
+
+    @field_validator("active_window_ids", "completed_collection_window_ids", mode="before")
+    @classmethod
+    def accept_workflow_arrays(cls, value: object) -> object:
+        return tuple(value) if isinstance(value, list) else value
+
+    @model_validator(mode="after")
+    def validate_cursor(self) -> RuleWorkflowCursor:
+        if len(set(self.active_window_ids)) != len(self.active_window_ids):
+            raise ValueError("active_window_ids must be unique")
+        if len(set(self.completed_collection_window_ids)) != len(
+            self.completed_collection_window_ids
+        ):
+            raise ValueError("completed collection window IDs must be unique")
+        if self.status == "ERROR" and self.error_code is None:
+            raise ValueError("an error workflow cursor requires an error_code")
+        return self
+
+
+class RuleWorkflowStep(_StrictModel):
+    """Read-only manager response describing the next durable workflow step."""
+
+    schema_version: Literal[1] = 1
+    kind: Literal["IDLE", "RETURN", "AUTOMATIC", "PLAYER_CHOICE"]
+    occurrence_id: LogicalId | None = None
+    source_fact_id: LogicalId | None = None
+    actor_seat: SeatNo | None = None
+    ability_instance_id: LogicalId | None = None
+    skill_id: LogicalId | None = None
+    mode: Literal["AUTOMATIC", "PLAYER_CHOICE"] | None = None
+    window_id: LogicalId | None = None
+    hook_id: RuleHook | None = None
+    action_window: ActionWindow | None = None
+    return_point: RuleReturnPoint | None = None
+    next_phase: GamePhase | None = None
+    queue_pending: bool = False
+    cursor_id: LogicalId | None = None
+    boundary: RuleBoundary | None = None
+
+    @model_validator(mode="after")
+    def validate_step_shape(self) -> RuleWorkflowStep:
+        if self.kind in {"AUTOMATIC", "PLAYER_CHOICE"} and any(
+            value is None
+            for value in (
+                self.occurrence_id,
+                self.source_fact_id,
+                self.actor_seat,
+                self.ability_instance_id,
+                self.skill_id,
+                self.mode,
+            )
+        ):
+            raise ValueError("trigger workflow steps require a complete occurrence binding")
+        if self.kind == "PLAYER_CHOICE" and (self.window_id is None or self.action_window is None):
+            raise ValueError("player-choice workflow steps require an installed action window")
         return self
 
 
@@ -321,6 +590,7 @@ class RuleFactRecord(_StrictModel):
     source_request_id: LogicalId | None = None
     actor_seat: SeatNo | None = None
     target_seat: SeatNo | None = None
+    death_cause: LogicalId | None = None
     tags: tuple[LogicalId, ...] = ()
     data: dict[str, JsonValue] = Field(default_factory=dict)
 
@@ -398,12 +668,20 @@ class RuleCommitReceipt(_StrictModel):
     read_revision: NonNegativeInt
     committed_revision: NonNegativeInt
     request_ids: tuple[LogicalId, ...]
+    occurrence_ids: tuple[LogicalId, ...] = ()
     outcome_digest: Annotated[str, Field(min_length=64, max_length=64, strict=True)]
 
-    @field_validator("request_ids", mode="before")
+    @field_validator("request_ids", "occurrence_ids", mode="before")
     @classmethod
     def accept_receipt_array(cls, value: object) -> object:
         return tuple(value) if isinstance(value, list) else value
+
+    @field_validator("request_ids", "occurrence_ids")
+    @classmethod
+    def validate_receipt_unique_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(value)) != len(value):
+            raise ValueError("rule receipt IDs must be unique")
+        return value
 
 
 class GrantedTriggerAbility(_StrictModel):
@@ -575,6 +853,7 @@ class SerialTurnBinding(_StrictModel):
     logical_request_id: LogicalId
     attempt_no: Annotated[int, Field(ge=1, strict=True)]
     event_ids: tuple[NonNegativeInt, ...] = ()
+    rule_boundary_id: LogicalId | None = None
 
     @field_validator("event_ids")
     @classmethod
@@ -611,6 +890,13 @@ class GameState(_StrictModel):
     execution_identity: RuleExecutionIdentity | None = None
     ability_instances: tuple[AbilityInstanceState, ...] = ()
     rule_state: tuple[RuleStateValue, ...] = ()
+    # B adds typed relations and one durable trigger/workflow queue.  These
+    # empty defaults preserve schema-1 A snapshots and manual legacy paths.
+    rule_relations: tuple[RuleRelationValue, ...] = ()
+    rule_deferred_disclosures: tuple[RuleDeferredDisclosure, ...] = ()
+    rule_trigger_queue: tuple[RuleTriggerOccurrence, ...] = ()
+    rule_workflow_cursor: RuleWorkflowCursor | None = None
+    rule_boundaries: tuple[RuleBoundary, ...] = ()
     rule_ledger: tuple[RuleLedgerEntry, ...] = ()
     rule_receipts: tuple[RuleCommitReceipt, ...] = ()
     players: dict[SeatNo, PlayerState] = Field(default_factory=dict)
@@ -629,6 +915,10 @@ class GameState(_StrictModel):
     # ``GameManager`` is the only writer and replaces it atomically with the
     # delivery cursor and the public speech event.
     serial_turn: SerialTurnBinding | None = None
+    # The last ordinary committed speech turn remains as a durable source
+    # reference for DAY_SPEECH_AFTER hooks. It is not an active turn and does
+    # not alter the original serialized queue.
+    last_serial_turn: SerialTurnBinding | None = None
     action_windows: dict[str, dict[str, JsonValue]] = Field(default_factory=dict)
     action_requests: dict[str, dict[str, JsonValue]] = Field(default_factory=dict)
     resolutions: tuple[dict[str, JsonValue], ...] = ()
@@ -687,6 +977,10 @@ class GameState(_StrictModel):
     @field_validator(
         "ability_instances",
         "rule_state",
+        "rule_relations",
+        "rule_deferred_disclosures",
+        "rule_trigger_queue",
+        "rule_boundaries",
         "rule_ledger",
         "rule_receipts",
         mode="before",
@@ -731,9 +1025,48 @@ class GameState(_StrictModel):
             raise ValueError("ability instance IDs must be unique")
         if any(item.actor_seat not in self.players for item in self.ability_instances):
             raise ValueError("ability instances may only belong to assigned seats")
-        state_keys = tuple((item.scope, item.scope_id, item.key) for item in self.rule_state)
+        state_keys = tuple(
+            (item.scope, item.scope_id, item.skill_id, item.key) for item in self.rule_state
+        )
         if len(set(state_keys)) != len(state_keys):
             raise ValueError("rule state scope/key pairs must be unique")
+        relation_ids = tuple(item.relation_id for item in self.rule_relations)
+        if len(set(relation_ids)) != len(relation_ids):
+            raise ValueError("rule relation IDs must be unique")
+        disclosure_ids = tuple(item.delivery_id for item in self.rule_deferred_disclosures)
+        if len(set(disclosure_ids)) != len(disclosure_ids):
+            raise ValueError("deferred rule disclosure IDs must be unique")
+        if any(
+            item.source_seat not in self.players or item.target_seat not in self.players
+            for item in self.rule_relations
+        ):
+            raise ValueError("rule relation endpoints must be assigned seats")
+        occurrence_ids = tuple(item.occurrence_id for item in self.rule_trigger_queue)
+        if len(set(occurrence_ids)) != len(occurrence_ids):
+            raise ValueError("rule trigger occurrence IDs must be unique")
+        if any(
+            item.actor_seat not in self.players or item.ability_instance_id not in set(instance_ids)
+            for item in self.rule_trigger_queue
+        ):
+            raise ValueError("rule trigger occurrence must bind an assigned seat and instance")
+        boundary_ids = tuple(item.boundary_id for item in self.rule_boundaries)
+        if len(set(boundary_ids)) != len(boundary_ids):
+            raise ValueError("rule boundary IDs must be unique")
+        if any(
+            seat not in self.players
+            for boundary in self.rule_boundaries
+            for seat in (*boundary.death_seats, *boundary.last_words_seats)
+        ):
+            raise ValueError("rule boundaries may only refer to assigned seats")
+        if self.rule_workflow_cursor is not None:
+            active_occurrence = self.rule_workflow_cursor.active_occurrence_id
+            if active_occurrence is not None and active_occurrence not in set(occurrence_ids):
+                raise ValueError("workflow cursor references an unknown trigger occurrence")
+            if any(
+                window_id not in self.action_windows
+                for window_id in self.rule_workflow_cursor.active_window_ids
+            ):
+                raise ValueError("workflow cursor references an unknown action window")
         batch_ids = tuple(item.batch_id for item in self.rule_receipts)
         if len(set(batch_ids)) != len(batch_ids):
             raise ValueError("rule batch receipts must be unique")
@@ -762,6 +1095,14 @@ __all__ = [
     "RuleExecutionIdentity",
     "RuleLedgerEntry",
     "RuleStateValue",
+    "RuleRelationValue",
+    "RuleDeferredDisclosure",
+    "RuleBoundary",
+    "RuleReturnPoint",
+    "RuleTriggerOccurrence",
+    "RuleWorkflowCursor",
+    "RuleWorkflowStep",
+    "RuleHook",
     "RuleUseRecord",
     "RuleFactRecord",
     "SerialTurnBinding",

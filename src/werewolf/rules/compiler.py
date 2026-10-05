@@ -6,7 +6,7 @@ import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 from pydantic import BaseModel, ValidationError
 
@@ -15,7 +15,7 @@ from werewolf.knowledge.package_loader import KnowledgePackage
 from werewolf.knowledge.refs import VersionedRef
 from werewolf.rules.predicates import validate_package_expressions
 
-from .models import ExecutionPackage
+from .models import BoundaryPolicy, ExecutionPackage, ExecutionWindow, PlayerFieldValues
 from .registry import (
     ActionRegistryCompilationError,
     merge_action_registries,
@@ -25,6 +25,7 @@ from .scheduler import SkillDependencyError, skill_dependency_ranks
 
 if TYPE_CHECKING:
     from werewolf.game.actions import ActionRegistry
+    from werewolf.knowledge.board import BoardDefinition
 
 
 class ExecutionCompilerError(ValueError):
@@ -41,6 +42,14 @@ class CompiledExecution:
     source_sha256: str
 
 
+_LEGACY_WINDOW_TOPOLOGY = (
+    "NIGHT_TEAM_CHAT",
+    "NIGHT_ACTION",
+    "NIGHT_RESOLVE",
+)
+_DAY_SPEECH_HOOKS = {"DAY_SPEECH_BEFORE", "DAY_SPEECH_AFTER"}
+
+
 def _canonical_json(value: object) -> str:
     return json.dumps(
         value,
@@ -53,6 +62,85 @@ def _canonical_json(value: object) -> str:
 
 def _error(message: str) -> ExecutionCompilerError:
     return ExecutionCompilerError(message)
+
+
+def execution_windows_from_board(board: BoardDefinition) -> tuple[ExecutionWindow, ...]:
+    """Return the compact, ordered scheduling contract from one frozen board."""
+
+    return tuple(
+        ExecutionWindow(
+            window_id=window.window_id,
+            order=window.order,
+            phase=cast(
+                Literal["NIGHT_TEAM_CHAT", "NIGHT_ACTION", "NIGHT_RESOLVE"],
+                window.phase.value,
+            ),
+            depends_on=tuple(window.depends_on),
+        )
+        for window in sorted(board.night_windows, key=lambda item: item.order)
+    )
+
+
+def _requires_frozen_window_metadata(windows: Sequence[ExecutionWindow]) -> bool:
+    if tuple(item.phase for item in windows) != _LEGACY_WINDOW_TOPOLOGY:
+        return True
+    if len(windows) != 3:
+        return True
+    return tuple(tuple(item.depends_on) for item in windows) != (
+        (),
+        (windows[0].window_id,),
+        (windows[1].window_id,),
+    )
+
+
+def _has_window_disclosure_hook(
+    execution: ExecutionPackage,
+    window_ids: set[str],
+) -> bool:
+    return any(
+        disclosure.hook in window_ids or disclosure.hook in _DAY_SPEECH_HOOKS
+        for skill in execution.skills
+        for disclosure in skill.disclosures
+    ) or any(
+        disclosure.hook in window_ids or disclosure.hook in _DAY_SPEECH_HOOKS
+        for interaction in execution.interactions
+        for disclosure in interaction.disclosures
+    )
+
+
+def boundary_policy_from_board(board: BoardDefinition) -> BoundaryPolicy:
+    """Return the compact death and sheriff boundary contract from a frozen board."""
+
+    words = board.day_flow.last_words
+    sheriff = board.day_flow.sheriff
+    return BoundaryPolicy(
+        last_words_enabled=words.enabled,
+        eligible_death_causes=tuple(sorted(words.eligible_death_causes)),
+        before_reveal=words.before_reveal,
+        night_death_policy=words.night_death_policy,
+        day_death_policy=words.day_death_policy,
+        sheriff_enabled=sheriff.enabled,
+        badge_transfer_enabled=sheriff.transfer_enabled,
+        badge_transfer_on_death=sheriff.transfer_on_death,
+    )
+
+
+def player_field_values_from_board(
+    board: BoardDefinition,
+    *,
+    role_ids: Sequence[str],
+    chat_group_ids: Sequence[str],
+) -> PlayerFieldValues:
+    """Derive the closed identity vocabularies from frozen board dependencies."""
+
+    return PlayerFieldValues(
+        role_ids=tuple(sorted(set(role_ids))),
+        faction_ids=tuple(sorted(board.factions)),
+        victory_group_ids=tuple(
+            sorted(set(board.factions).union(board.victory.role_groups.values()))
+        ),
+        chat_group_ids=tuple(sorted(set(chat_group_ids))),
+    )
 
 
 def compile_execution_definition(package: KnowledgePackage) -> CompiledExecution | None:
@@ -92,13 +180,29 @@ def compile_execution_definition(package: KnowledgePackage) -> CompiledExecution
         # initialization, which depends on the knowledge service/compiler.
         from werewolf.game.actions import ActionDefinition, load_action_registry
 
-        execution = ExecutionPackage.model_validate(raw["execution"])
+        execution_raw = raw["execution"]
+        if not isinstance(execution_raw, Mapping):
+            raise _error("execution.yaml execution must be a mapping")
+        execution_input = dict(execution_raw)
+        if "player_field_values" in execution_input:
+            if execution_input["player_field_values"] is not None:
+                raise _error("player_field_values is derived from the frozen knowledge package")
+            del execution_input["player_field_values"]
+        if "window_metadata" in execution_input:
+            window_metadata_input = execution_input["window_metadata"]
+            if not isinstance(window_metadata_input, (list, tuple)) or window_metadata_input:
+                raise _error("window_metadata is derived from the frozen board definition")
+            del execution_input["window_metadata"]
+        if "boundary_policy" in execution_input:
+            if execution_input["boundary_policy"] is not None:
+                raise _error("boundary_policy is derived from the frozen board definition")
+            del execution_input["boundary_policy"]
+        execution = ExecutionPackage.model_validate(execution_input)
         additions_raw = raw["action_definitions"]
         if not isinstance(additions_raw, Sequence) or isinstance(additions_raw, str | bytes):
             raise _error("execution.yaml action_definitions must be a list")
         additions = tuple(ActionDefinition.model_validate(item) for item in additions_raw)
         merged = merge_action_registries(load_action_registry(), additions)
-        validate_execution_package(execution, merged)
     except ExecutionCompilerError:
         raise
     except (ActionRegistryCompilationError, TypeError, ValueError, ValidationError) as exc:
@@ -108,6 +212,57 @@ def compile_execution_definition(package: KnowledgePackage) -> CompiledExecution
         raise _error("execution.yaml board_id disagrees with the pinned board")
     if execution.board_version != package.board_ref.version:
         raise _error("execution.yaml board_version disagrees with the pinned board")
+    window_metadata = execution_windows_from_board(package.board.model)
+    window_ids = {window.window_id for window in window_metadata}
+    has_player_field_changes = any(
+        effect.effect_type == "PLAYER_FIELD_SET"
+        for skill in execution.skills
+        for effect in (*skill.effects, *skill.pass_effects)
+    )
+    if has_player_field_changes:
+        board = package.board.model
+        chat_group_ids = {
+            role.model.team
+            for role in package.roles.values()
+            if getattr(
+                role.model.team_visibility.channel, "value", role.model.team_visibility.channel
+            )
+            == "TEAM"
+        }
+        player_field_values = player_field_values_from_board(
+            board,
+            role_ids=tuple(package.roles),
+            chat_group_ids=tuple(chat_group_ids),
+        )
+        execution = execution.model_copy(update={"player_field_values": player_field_values})
+    has_window_features = (
+        _requires_frozen_window_metadata(window_metadata)
+        or bool(execution.window_settlement_groups)
+        or _has_window_disclosure_hook(execution, window_ids)
+        or any(
+            skill.window_ids
+            or skill.hook_ids
+            or skill.trigger is not None
+            or any(effect.effect_type == "FLOW" for effect in (*skill.effects, *skill.pass_effects))
+            for skill in execution.skills
+        )
+    )
+    boundary_policy: BoundaryPolicy | None = None
+    if has_window_features:
+        boundary_policy = boundary_policy_from_board(package.board.model)
+        execution = execution.model_copy(
+            update={
+                "window_metadata": window_metadata,
+                "boundary_policy": boundary_policy,
+            }
+        )
+    validate_execution_package(
+        execution,
+        merged,
+        available_windows=window_metadata,
+        expected_boundary_policy=(boundary_policy if has_window_features else None),
+        expected_player_field_values=(player_field_values if has_player_field_changes else None),
+    )
     _validate_package_literals(execution, package)
 
     canonical_source = _canonical_json(_canonicalize(raw))
@@ -132,6 +287,9 @@ def validate_execution_package(
     registry: ActionRegistry,
     *,
     role_ids: set[str] | None = None,
+    available_windows: Sequence[ExecutionWindow] | None = None,
+    expected_boundary_policy: BoundaryPolicy | None = None,
+    expected_player_field_values: PlayerFieldValues | None = None,
 ) -> None:
     """Validate executable references and their frozen action contract.
 
@@ -147,8 +305,150 @@ def validate_execution_package(
     if not isinstance(execution, ExecutionPackage):
         raise TypeError("execution must be an ExecutionPackage")
 
-    validate_execution_actions(execution, registry)
-    validate_package_expressions(execution)
+    try:
+        validate_execution_actions(execution, registry)
+        validate_package_expressions(execution)
+    except ExecutionCompilerError:
+        raise
+    except (ActionRegistryCompilationError, TypeError, ValueError) as exc:
+        raise _error(str(exc)) from exc
+    window_ids = {item.window_id for item in available_windows or ()}
+    supported_disclosure_hooks = (
+        {phase.value for phase in GamePhase} | _DAY_SPEECH_HOOKS | window_ids
+    )
+    disclosures = tuple(
+        disclosure for skill in execution.skills for disclosure in skill.disclosures
+    ) + tuple(
+        disclosure
+        for interaction in execution.interactions
+        for disclosure in interaction.disclosures
+    )
+    for disclosure in disclosures:
+        if disclosure.hook is not None and disclosure.hook not in supported_disclosure_hooks:
+            raise _error(f"disclosure {disclosure.disclosure_id!r} has an unsupported hook")
+    has_player_field_changes = any(
+        effect.effect_type == "PLAYER_FIELD_SET"
+        for skill in execution.skills
+        for effect in (*skill.effects, *skill.pass_effects)
+    )
+    if has_player_field_changes:
+        if execution.player_field_values is None:
+            raise _error("PLAYER_FIELD_SET requires frozen player field values")
+        if (
+            expected_player_field_values is not None
+            and execution.player_field_values != expected_player_field_values
+        ):
+            raise _error("execution player field values disagree with frozen dependencies")
+    elif execution.player_field_values is not None:
+        raise _error("player field values require a PLAYER_FIELD_SET effect")
+    if available_windows is not None:
+        available_window_ids = tuple(item.window_id for item in available_windows)
+        window_ids = set(available_window_ids)
+        if len(window_ids) != len(available_window_ids):
+            raise _error("frozen board window IDs must be unique")
+        orders = tuple(item.order for item in available_windows)
+        if orders != tuple(range(1, len(available_windows) + 1)):
+            raise _error("frozen board window order must be contiguous starting at 1")
+        position = {item.window_id: item.order for item in available_windows}
+        for window in available_windows:
+            for dependency in window.depends_on:
+                if dependency not in position:
+                    raise _error(
+                        f"frozen board window {window.window_id!r} has an unknown dependency"
+                    )
+                if position[dependency] >= window.order:
+                    raise _error(
+                        f"frozen board window {window.window_id!r} has a cyclic or forward "
+                        "dependency"
+                    )
+        for skill in execution.skills:
+            unknown = sorted(set(skill.window_ids) - window_ids)
+            if unknown:
+                raise _error(
+                    f"skill {skill.skill_id!r} references unknown board windows: "
+                    + ", ".join(unknown)
+                )
+    elif (
+        any(
+            skill.window_ids
+            or skill.hook_ids
+            or skill.trigger is not None
+            or any(effect.effect_type == "FLOW" for effect in (*skill.effects, *skill.pass_effects))
+            for skill in execution.skills
+        )
+        or execution.window_settlement_groups
+    ):
+        raise _error("window bindings require the frozen board window context")
+    requires_frozen_window_metadata = (
+        available_windows is not None and _requires_frozen_window_metadata(available_windows)
+    )
+    if available_windows is not None and execution.window_metadata:
+        if tuple(execution.window_metadata) != tuple(available_windows):
+            raise _error("execution window metadata disagrees with the frozen board")
+    elif available_windows is not None and (
+        requires_frozen_window_metadata
+        or (
+            any(
+                skill.window_ids
+                or skill.hook_ids
+                or skill.trigger is not None
+                or any(
+                    effect.effect_type == "FLOW" for effect in (*skill.effects, *skill.pass_effects)
+                )
+                for skill in execution.skills
+            )
+            or execution.window_settlement_groups
+            or _has_window_disclosure_hook(execution, window_ids)
+        )
+    ):
+        raise _error("B window features require frozen execution window metadata")
+    has_window_features = (
+        requires_frozen_window_metadata
+        or bool(execution.window_settlement_groups)
+        or _has_window_disclosure_hook(execution, window_ids)
+        or any(
+            skill.window_ids
+            or skill.hook_ids
+            or skill.trigger is not None
+            or any(effect.effect_type == "FLOW" for effect in (*skill.effects, *skill.pass_effects))
+            for skill in execution.skills
+        )
+    )
+    if has_window_features and execution.boundary_policy is None:
+        raise _error("B window features require a frozen boundary policy")
+    if (
+        expected_boundary_policy is not None
+        and execution.boundary_policy != expected_boundary_policy
+    ):
+        raise _error("execution boundary policy disagrees with the frozen board")
+    if expected_boundary_policy is None and execution.boundary_policy is not None:
+        raise _error("execution boundary policy requires the frozen board context")
+    if execution.window_settlement_groups:
+        if available_windows is None:
+            raise _error("window settlement groups require the frozen board window context")
+        available_window_ids = tuple(item.window_id for item in available_windows)
+        mapped_windows = set(execution.window_settlement_groups)
+        if mapped_windows != set(available_window_ids):
+            missing = sorted(set(available_window_ids) - mapped_windows)
+            unknown = sorted(mapped_windows - set(available_window_ids))
+            details = []
+            if missing:
+                details.append("missing " + ", ".join(missing))
+            if unknown:
+                details.append("unknown " + ", ".join(unknown))
+            raise _error("window settlement groups must cover board windows: " + "; ".join(details))
+        if any(not group_id for group_id in execution.window_settlement_groups.values()):
+            raise _error("window settlement group IDs must be non-empty")
+        closed_groups: set[str] = set()
+        previous_group: str | None = None
+        for window_id in available_window_ids:
+            group_id = execution.window_settlement_groups[window_id]
+            if group_id != previous_group:
+                if group_id in closed_groups:
+                    raise _error("windows in one settlement group must be contiguous")
+                if previous_group is not None:
+                    closed_groups.add(previous_group)
+                previous_group = group_id
 
     skill_ids = [skill.skill_id for skill in execution.skills]
     if len(skill_ids) != len(set(skill_ids)):
@@ -199,8 +499,6 @@ def validate_execution_package(
             raise _error(f"skill {skill.skill_id!r} has no ability grants")
         if skill.mode == "HOST" and skill.grants:
             raise _error(f"host skill {skill.skill_id!r} must not grant player abilities")
-        if skill.mode == "AUTOMATIC":
-            raise _error("automatic skill mode is unsupported in language version 1")
         if not skill.timing:
             raise _error(f"skill {skill.skill_id!r} must declare at least one timing")
         if len(skill.timing) != len(set(skill.timing)):

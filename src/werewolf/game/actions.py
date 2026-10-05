@@ -33,6 +33,7 @@ TargetPolicy = Literal[
     "candidate",
     "none",
 ]
+RuleHook = Literal["DAY_SPEECH_BEFORE", "DAY_SPEECH_AFTER"]
 
 
 def _as_tuple(value: object) -> object:
@@ -153,20 +154,37 @@ class ActionWindow(_ActionModel):
     game_id: NonEmptyId
     session_epoch: NonNegativeInt
     phase: GamePhase
-    allowed_seats: tuple[SeatNo, ...] = Field(min_length=1)
+    allowed_seats: tuple[SeatNo, ...] = ()
     allowed_role_ids: tuple[NonEmptyId, ...] = ()
-    allowed_action_codes: tuple[ActionCode, ...] = Field(min_length=1)
+    allowed_action_codes: tuple[ActionCode, ...] = ()
     forbidden_action_combinations: tuple[tuple[ActionCode, ...], ...] = ()
     min_actions: Annotated[int, Field(ge=0, le=32, strict=True)] = 1
     max_actions: Annotated[int, Field(ge=0, le=32, strict=True)] = 1
     allow_duplicate_action_codes: bool = False
     allow_pass: bool = False
     opened_at: datetime | None = None
+    # Collection is a separate boundary from final settlement.  A window
+    # marked complete rejects further submissions, while remaining open
+    # until every window in its settlement group is ready to commit.
+    collection_complete_at: datetime | None = None
     closed_at: datetime | None = None
+    # Windows that observe the same provisional action facts share one
+    # atomic settlement group.  This is durable coordinator metadata, not a
+    # player-facing context field.
+    settlement_group_id: NonEmptyId | None = None
+    # The package-level window identity remains stable across rounds even
+    # when the physical ActionWindow ID is unique for each activation.
+    logical_window_id: NonEmptyId | None = None
+    # The frozen scheduler supplies the next logical night window.  The
+    # manager persists it as a workflow return reference if triggers interrupt
+    # between independently committed settlement groups.
+    next_window_id: NonEmptyId | None = None
+    hook_id: RuleHook | None = None
     dependency_receipt_ids: tuple[NonEmptyId, ...] = ()
     dependencies_satisfied: bool = True
     visible_context: dict[str, JsonValue] = Field(default_factory=dict)
     allow_concurrent: bool = False
+    collection_only: bool = False
     max_submissions_per_seat: Annotated[int, Field(ge=1, le=64, strict=True)] = 1
     submitted_request_ids: tuple[NonEmptyId, ...] = ()
     submitted_request_fingerprints: dict[NonEmptyId, Fingerprint] = Field(default_factory=dict)
@@ -186,7 +204,7 @@ class ActionWindow(_ActionModel):
             return tuple(tuple(item) for item in value)
         return _as_tuple(value)
 
-    @field_validator("opened_at", "closed_at", mode="before")
+    @field_validator("opened_at", "collection_complete_at", "closed_at", mode="before")
     @classmethod
     def timestamps_are_aware(cls, value: object) -> object:
         if value is None:
@@ -210,13 +228,44 @@ class ActionWindow(_ActionModel):
                 raise ValueError("forbidden action combinations must not repeat codes")
         if self.min_actions > self.max_actions:
             raise ValueError("min_actions must not exceed max_actions")
+        if self.collection_only:
+            if (
+                self.allowed_seats
+                or self.allowed_action_codes
+                or self.min_actions != 0
+                or self.max_actions != 0
+                or self.allow_pass
+            ):
+                raise ValueError(
+                    "collection-only windows require empty seats/codes, zero actions, and no pass"
+                )
+        elif not self.allowed_seats or not self.allowed_action_codes:
+            raise ValueError("interactive windows require allowed seats and action codes")
         if self.opened_at and self.closed_at and self.closed_at < self.opened_at:
             raise ValueError("closed_at must not precede opened_at")
+        if (
+            self.opened_at
+            and self.collection_complete_at
+            and self.collection_complete_at < self.opened_at
+        ):
+            raise ValueError("collection_complete_at must not precede opened_at")
+        if (
+            self.collection_complete_at
+            and self.closed_at
+            and self.closed_at < self.collection_complete_at
+        ):
+            raise ValueError("closed_at must not precede collection_complete_at")
         return self
 
     @property
     def is_open(self) -> bool:
         return self.closed_at is None
+
+    @property
+    def accepts_submissions(self) -> bool:
+        """Whether the collection side of this window still accepts input."""
+
+        return self.closed_at is None and self.collection_complete_at is None
 
 
 class ActionRequest(_ActionModel):

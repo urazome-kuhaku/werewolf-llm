@@ -308,6 +308,9 @@ class ClassicPlayRunner:
         await self.command("night open")
         while True:
             result = await self.command("night team next")
+            team = result.get("team")
+            if isinstance(team, Mapping) and team.get("status") == "skipped":
+                break
             night = result.get("night")
             # The authoritative queue is persisted by the serial scheduler.
             # Read it directly after the command so a stale/partial progress
@@ -326,6 +329,9 @@ class ClassicPlayRunner:
         await self.command("night open")
         while self.shell.state.phase is GamePhase.NIGHT_ACTION:
             result = await self.command("night action next")
+            action = result.get("action")
+            if isinstance(action, Mapping) and action.get("status") == "skipped":
+                break
             night = result.get("night")
             window = night.get("window") if isinstance(night, Mapping) else None
             submitted = night.get("submitted_seats") if isinstance(night, Mapping) else None
@@ -337,10 +343,164 @@ class ClassicPlayRunner:
             ):
                 break
         await self.command("night advance")
+        # A settlement group may close before the coarse night phase changes.
+        # Its confirmed facts enter the manager-owned occurrence queue at that
+        # boundary, which must drain before the next window is opened.
+        await self._drain_pending_rule_work()
 
     async def _night_resolve(self) -> None:
         await self.command("night open")
         await self.command("night auto-resolve")
+        await self._drain_pending_rule_work()
+
+    def _has_pending_rule_work(self) -> bool:
+        """Return whether the persisted workflow has work for TriggerFlow."""
+
+        manager = getattr(self.shell, "manager", None)
+        if manager is None or manager.execution_package is None:
+            return False
+        state = self.shell.state
+        cursor = state.rule_workflow_cursor
+        if cursor is not None and cursor.status in {"COLLECTING", "ERROR"}:
+            return False
+        if cursor is not None and (
+            cursor.status in {"DRAINING", "WAITING_CHOICE", "WAITING_BOUNDARY", "RETURN_READY"}
+            or cursor.active_occurrence_id is not None
+            or cursor.pending_boundary_id is not None
+            or cursor.pending_flow_action is not None
+        ):
+            return True
+        if any(
+            item.status in {"QUEUED", "READY", "WAITING_CHOICE"}
+            for item in state.rule_trigger_queue
+        ):
+            return True
+        return any(item.is_pending for item in state.rule_boundaries)
+
+    def _rule_workflow_managed(self) -> bool:
+        """Return whether durable state belongs to the generic rule workflow."""
+
+        manager = getattr(self.shell, "manager", None)
+        if manager is None or manager.execution_package is None:
+            return False
+        state = self.shell.state
+        cursor = state.rule_workflow_cursor
+        return bool(
+            (cursor is not None and cursor.status != "IDLE")
+            or any(
+                item.status in {"QUEUED", "READY", "WAITING_CHOICE"}
+                for item in state.rule_trigger_queue
+            )
+            or any(item.is_pending for item in state.rule_boundaries)
+        )
+
+    def _pending_rule_boundary(self) -> object | None:
+        state = self.shell.state
+        cursor = state.rule_workflow_cursor
+        boundary_id = cursor.pending_boundary_id if cursor is not None else None
+        if isinstance(boundary_id, str):
+            boundary = next(
+                (item for item in state.rule_boundaries if item.boundary_id == boundary_id),
+                None,
+            )
+            if boundary is not None and boundary.is_pending:
+                return boundary
+        return next((item for item in state.rule_boundaries if item.is_pending), None)
+
+    async def _complete_rule_boundary(self, boundary: object) -> None:
+        """Complete only the host work named by one manager-owned boundary."""
+
+        boundary_id = getattr(boundary, "boundary_id", None)
+        if not isinstance(boundary_id, str):
+            raise PlayRunnerError("rule workflow returned a malformed boundary")
+
+        if getattr(boundary, "last_words_required", False) and getattr(
+            boundary, "last_words_completed_seats", ()
+        ) != getattr(boundary, "last_words_seats", ()):
+            await self._last_words()
+            current = next(
+                (
+                    item
+                    for item in self.shell.state.rule_boundaries
+                    if item.boundary_id == boundary_id
+                ),
+                None,
+            )
+            if current is None or current.last_words_completed_seats != current.last_words_seats:
+                raise PlayRunnerError(
+                    f"last-words flow did not complete rule boundary {boundary_id}"
+                )
+
+        current = next(
+            (item for item in self.shell.state.rule_boundaries if item.boundary_id == boundary_id),
+            None,
+        )
+        if current is None:
+            raise PlayRunnerError(f"rule boundary disappeared: {boundary_id}")
+        if current.sheriff_badge_required and not current.sheriff_badge_completed:
+            await self.command("sheriff badge open")
+            await self.command("sheriff badge next")
+            await self.command("sheriff badge resolve")
+            await self.command("sheriff badge finish")
+            current = next(
+                (
+                    item
+                    for item in self.shell.state.rule_boundaries
+                    if item.boundary_id == boundary_id
+                ),
+                None,
+            )
+            if current is None or not current.sheriff_badge_completed:
+                raise PlayRunnerError(
+                    f"sheriff badge flow did not complete rule boundary {boundary_id}"
+                )
+
+        if current.is_pending:
+            raise PlayRunnerError(f"rule boundary remains pending: {boundary_id}")
+
+    async def _drain_rule_workflow(self) -> None:
+        """Drain generic occurrences and their audited death boundaries."""
+
+        step_limit = 512
+        for _ in range(step_limit):
+            state = self.shell.state
+            cursor = state.rule_workflow_cursor
+            cursor_status = cursor.status if cursor is not None else "IDLE"
+            if cursor_status == "COLLECTING":
+                raise PlayRunnerError("rule workflow is still collecting an action window")
+            if cursor_status == "ERROR":
+                error_code = cursor.error_code if cursor is not None else "unknown"
+                raise PlayRunnerError(f"rule workflow failed: {error_code}")
+            if not self._has_pending_rule_work():
+                return
+
+            before_revision = state.state_revision
+            await self.command("trigger auto-resolve")
+
+            cursor = self.shell.state.rule_workflow_cursor
+            cursor_status = cursor.status if cursor is not None else "IDLE"
+            if cursor_status == "COLLECTING":
+                raise PlayRunnerError("rule workflow is still collecting an action window")
+            if cursor_status == "ERROR":
+                error_code = cursor.error_code if cursor is not None else "unknown"
+                raise PlayRunnerError(f"rule workflow failed: {error_code}")
+
+            boundary = self._pending_rule_boundary()
+            if boundary is not None:
+                await self._complete_rule_boundary(boundary)
+                continue
+            if not self._has_pending_rule_work():
+                return
+            if self.shell.state.state_revision == before_revision:
+                raise PlayRunnerError("rule workflow made no durable progress")
+
+        raise PlayRunnerError("rule workflow exceeded the runner progress budget")
+
+    async def _drain_pending_rule_work(self) -> None:
+        """Drain only work pinned in the manager-owned workflow state."""
+
+        if self.shell.state.phase is not GamePhase.TRIGGER_ACTION and self._has_pending_rule_work():
+            await self._drain_rule_workflow()
 
     async def _day_announce(self) -> None:
         # A completed night can already satisfy a unique victory condition.
@@ -437,7 +597,11 @@ class ClassicPlayRunner:
             progress = await self.command("day status")
             day = progress.get("day")
             speech = day.get("speech") if isinstance(day, Mapping) else None
-            if isinstance(speech, Mapping) and speech.get("queue") == []:
+            if (
+                self.shell.state.phase is GamePhase.DAY_SPEECH
+                and isinstance(speech, Mapping)
+                and speech.get("queue") == []
+            ):
                 await self.command("day speech close")
             return
         if phase is GamePhase.VOTE_PK_SPEECH:
@@ -508,6 +672,10 @@ class ClassicPlayRunner:
             status = await self.command(f"last-words next {seat}")
 
     async def _trigger(self) -> None:
+        if self._rule_workflow_managed():
+            await self._drain_rule_workflow()
+            return
+
         await self.command("trigger open")
         pending = await self.command("trigger pending")
         trigger = pending.get("trigger")

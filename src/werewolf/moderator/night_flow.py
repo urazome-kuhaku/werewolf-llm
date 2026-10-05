@@ -384,6 +384,14 @@ class ModeratorNightFlow:
                             max_actions=0,
                             allow_pass=True,
                         )
+                    else:
+                        action_configs[board_window.window_id] = NightWindowConfig(
+                            allowed_seats=(),
+                            allowed_action_codes=(),
+                            min_actions=0,
+                            max_actions=0,
+                            collection_only=True,
+                        )
                     continue
                 if board_window.phase is not GamePhase.NIGHT_ACTION:
                     continue
@@ -392,11 +400,14 @@ class ModeratorNightFlow:
                     if not player.alive:
                         continue
                     eligible.extend(
-                        self._manager._rule_skill_instances(
+                        (instance, skill)
+                        for instance, skill in self._manager._rule_skill_instances(
                             state,
                             seat,
                             board_window.phase.value,
+                            logical_window_id=board_window.window_id,
                         )
+                        if not skill.window_ids or board_window.window_id in skill.window_ids
                     )
                 chat_group_coordinators: dict[tuple[str, str], int] = {}
                 for instance, skill in eligible:
@@ -441,6 +452,13 @@ class ModeratorNightFlow:
                 if allow_pass:
                     codes.add(299)
                 if not seats or not codes:
+                    action_configs[board_window.window_id] = NightWindowConfig(
+                        allowed_seats=(),
+                        allowed_action_codes=(),
+                        min_actions=0,
+                        max_actions=0,
+                        collection_only=True,
+                    )
                     continue
                 ordered_seats = tuple(
                     sorted(
@@ -561,7 +579,10 @@ class ModeratorNightFlow:
         for board_window in sorted(candidates, key=lambda item: item.order):
             physical_id = self._physical_window_id(board_window.window_id, state.round_no)
             raw = state.action_windows.get(physical_id)
-            if raw is None or _load_window(raw).closed_at is None:
+            if raw is None or (
+                _load_window(raw).closed_at is None
+                and _load_window(raw).collection_complete_at is None
+            ):
                 return board_window
         raise ModeratorNightError("all night windows for the current phase are closed")
 
@@ -574,7 +595,7 @@ class ModeratorNightFlow:
         if raw is None:
             raise ModeratorNightError("open the current night window first")
         window = _load_window(raw)
-        if window.closed_at is not None:
+        if window.closed_at is not None or window.collection_complete_at is not None:
             raise ModeratorNightError("the current night action window is closed")
         return window
 
@@ -778,6 +799,14 @@ class ModeratorNightFlow:
 
         self._refresh_configuration(self._manager.state)
         window = self._current_team_window()
+        if window.collection_only:
+            return {
+                "status": "skipped",
+                "reason": "no_authorized_actor",
+                "window_id": window.window_id,
+                "team_queue": [],
+                "phase": self.state.phase.value,
+            }
         state = self.state
         if state.serial_turn is not None:
             if self._is_plan_turn(state):
@@ -1427,6 +1456,7 @@ class ModeratorNightFlow:
                 seat,
                 window.phase.value,
                 allowed_codes=set(window.allowed_action_codes),
+                logical_window_id=window.logical_window_id,
             )
             rule_target_sets: dict[int, tuple[int, ...]] = {}
             for instance, skill in active_rule_skills:
@@ -1589,6 +1619,13 @@ class ModeratorNightFlow:
     async def action_next(self, seat: int | None = None) -> dict[str, object]:
         self._refresh_configuration(self._manager.state)
         window = self._current_action_window()
+        if window.collection_only:
+            return {
+                "status": "skipped",
+                "reason": "no_authorized_actor",
+                "window_id": window.window_id,
+                "phase": self.state.phase.value,
+            }
         selected = self._choose_seat(window, seat)
         if self._manager.execution_package is not None:
             try:
@@ -1837,6 +1874,16 @@ class ModeratorNightFlow:
         """
 
         self._refresh_configuration(self._manager.state)
+        if self._manager.execution_package is not None:
+            if args:
+                raise ModeratorNightError(
+                    "executable packages settle manager-recomputed rule requests; "
+                    "night resolve does not accept a resolution file"
+                )
+            try:
+                return await self.coordinator.advance_from_current_window(now=self._clock())
+            except NightCoordinatorError as exc:
+                raise ModeratorNightError(str(exc)) from exc
         if len(args) > 1:
             raise ModeratorNightError(
                 "night resolve syntax: night resolve <json-file>; omit the file only "
@@ -1879,30 +1926,8 @@ class ModeratorNightFlow:
         self._refresh_configuration(self._manager.state)
         try:
             if self._manager.execution_package is not None:
-                action_board_windows = [
-                    item
-                    for item in self._board.night_windows
-                    if item.phase is GamePhase.NIGHT_ACTION
-                ]
-                if len(action_board_windows) != 1:
-                    raise ModeratorNightError(
-                        "ACTION_WINDOW_AMBIGUOUS: V1 rule execution requires one action window"
-                    )
-                physical_id = self._physical_window_id(
-                    action_board_windows[0].window_id,
-                    self.state.round_no,
-                )
-                raw_window = self.state.action_windows.get(physical_id)
-                if raw_window is None:
-                    raise ModeratorNightError("WINDOW_NOT_OPEN: night action window is missing")
-                action_window = _load_window(raw_window)
-                resolutions = _rule_engine_acknowledgements(
-                    self.state,
-                    action_window.window_id,
-                    now=self._clock(),
-                )
-            else:
-                resolutions = build_classic_night_resolutions(self.state, self._board)
+                return await self.coordinator.advance_from_current_window(now=self._clock())
+            resolutions = build_classic_night_resolutions(self.state, self._board)
             return await self.coordinator.resolve(resolutions, now=self._clock())
         except (NightCoordinatorError, ValueError, TypeError) as exc:
             raise ModeratorNightError(str(exc)) from exc

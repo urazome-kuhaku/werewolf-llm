@@ -10,6 +10,7 @@ from types import MappingProxyType
 
 from werewolf.domain.enums import GamePhase
 
+from .events import GameEvent
 from .state import GameState, utc_now
 
 
@@ -131,6 +132,10 @@ def transition_phase(
     # A phase-only replacement must thaw those fields before strict Pydantic
     # validation, otherwise an already installed ActionWindow prevents a
     # perfectly valid phase transition.
+    data["events"] = tuple(
+        event if isinstance(event, GameEvent) else json.loads(json.dumps(event))
+        for event in state.events
+    )
     for field_name in (
         "action_windows",
         "action_requests",

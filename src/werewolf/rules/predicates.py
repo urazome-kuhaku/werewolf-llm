@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 
+from pydantic import BaseModel
+
 from werewolf.rules.models import (
     BooleanExpr,
     CompareExpr,
@@ -14,6 +16,8 @@ from werewolf.rules.models import (
     MapExpr,
     PlayerObservation,
     RefExpr,
+    RelationExistsExpr,
+    RelationValue,
     SelectorExpr,
     SkillSpec,
     StateDeclaration,
@@ -49,8 +53,21 @@ def _member(item: object, name: str) -> object:
             "source_request_id": item.source_request_id,
             "actor_seat": item.actor_seat,
             "target_seat": item.target_seat,
+            "death_cause": item.death_cause,
             "tags": item.tags,
             "data": item.data,
+        }
+    elif isinstance(item, RelationValue):
+        mapping = {
+            "relation_id": item.relation_id,
+            "relation_type": item.relation_type,
+            "source_seat": item.source_seat,
+            "target_seat": item.target_seat,
+            "source_skill_id": item.source_skill_id,
+            "source_request_id": item.source_request_id,
+            "source_ability_instance_id": item.source_ability_instance_id,
+            "expires_at_round": item.expires_at_round,
+            "expires_at_hook": item.expires_at_hook,
         }
     else:
         mapping = getattr(item, "__dict__", None)
@@ -88,6 +105,12 @@ def _member(item: object, name: str) -> object:
 def _resolve_ref(expression: RefExpr, context: Mapping[str, object]) -> object:
     source = expression.source
     name = expression.name
+    if source == "source_fact":
+        allowed = {"fact_type", "target_seat", "actor_seat", "tags", "death_cause"}
+        if name not in allowed:
+            raise ValueError(f"source fact reference is not allowed: {name}")
+        fact = context.get("source_fact")
+        return None if fact is None else _member(fact, name)
     if source == "actor":
         allowed = {"seat", "alive", "role_id", "faction_id", "victory_group_id"}
         if name not in allowed and not name.startswith("resource:"):
@@ -101,7 +124,15 @@ def _resolve_ref(expression: RefExpr, context: Mapping[str, object]) -> object:
         target = context.get("target")
         return None if target is None else _member(target, name)
     if source == "request":
-        allowed = {"action_code", "passed", "target_count", "actor_seat"}
+        allowed = {
+            "action_code",
+            "passed",
+            "target_count",
+            "actor_seat",
+            "window_id",
+            "logical_window_id",
+            "hook_id",
+        }
         if name not in allowed and not name.startswith("parameter:"):
             raise ValueError(f"request reference is not allowed: {name}")
         return _member(context.get("request"), name)
@@ -242,6 +273,33 @@ def evaluate_expr(
                 nested["item"] = item
                 mapped.append(visit(expr.value, nested, depth + 1))
             return tuple(mapped)
+        if isinstance(expr, RelationExistsExpr):
+            observation = current.get("observation")
+            relations = getattr(observation, "relations", ())
+            if not isinstance(relations, (tuple, list)) or len(relations) > 10_000:
+                raise ValueError("relation input exceeds its finite execution budget")
+            source_seat = (
+                visit(expr.source_seat, current, depth + 1)
+                if expr.source_seat is not None
+                else None
+            )
+            target_seat = (
+                visit(expr.target_seat, current, depth + 1)
+                if expr.target_seat is not None
+                else None
+            )
+            for endpoint in (source_seat, target_seat):
+                if endpoint is not None and (
+                    not isinstance(endpoint, int) or isinstance(endpoint, bool)
+                ):
+                    raise ValueError("relation endpoints must resolve to seats")
+            return any(
+                relation.relation_type == expr.relation_type
+                and (source_seat is None or relation.source_seat == source_seat)
+                and (target_seat is None or relation.target_seat == target_seat)
+                for relation in relations
+                if isinstance(relation, RelationValue)
+            )
         raise ValueError("unsupported expression node")
 
     return visit(expression, context, _depth)
@@ -352,6 +410,9 @@ def infer_expr_type(
             ("request", "passed"): "bool",
             ("request", "target_count"): "int",
             ("request", "actor_seat"): "seat",
+            ("request", "window_id"): "nullable_str",
+            ("request", "logical_window_id"): "nullable_str",
+            ("request", "hook_id"): "nullable_str",
             ("observation", "round_number"): "int",
             ("observation", "group_id"): "str",
             ("observation", "timing"): "str",
@@ -363,6 +424,10 @@ def infer_expr_type(
             ("item", "victory_group_id"): "nullable_str",
             ("item", "actor_seat"): "seat",
             ("item", "target_seat"): "nullable_seat",
+            ("item", "source_seat"): "seat",
+            ("item", "relation_type"): "str",
+            ("item", "expires_at_round"): "int",
+            ("item", "expires_at_hook"): "nullable_str",
             ("item", "fact_type"): "str",
             ("item", "tags"): "str_list",
             ("item", "round_number"): "int",
@@ -375,6 +440,18 @@ def infer_expr_type(
             ("item", "deceased"): "bool",
             ("item", "cause_effect_ids"): "str_list",
         }
+        if source == "source_fact":
+            source_fact_fields: dict[str, ValueType] = {
+                "fact_type": "str",
+                "target_seat": "nullable_seat",
+                "actor_seat": "nullable_seat",
+                "tags": "str_list",
+                "death_cause": "nullable_str",
+            }
+            try:
+                return source_fact_fields[field]
+            except KeyError as exc:
+                raise ValueError(f"unknown or untyped reference: {source}.{field}") from exc
         if source == "skill_state":
             state_declaration = next(
                 (
@@ -547,6 +624,21 @@ def infer_expr_type(
         if item_type == "str":
             return "str_list"
         return "json"
+    if isinstance(expression, RelationExistsExpr):
+        if expression.source_seat is None and expression.target_seat is None:
+            raise ValueError("relation_exists must constrain at least one endpoint")
+        for endpoint in (expression.source_seat, expression.target_seat):
+            if endpoint is None:
+                continue
+            endpoint_type = infer_expr_type(
+                endpoint,
+                skill=skill,
+                state_declarations=state_declarations,
+                item_source=item_source,
+            )
+            if endpoint_type != "seat":
+                raise ValueError("relation_exists endpoints must be seat values")
+        return "bool"
     raise ValueError("unsupported expression type")
 
 
@@ -573,6 +665,90 @@ def _validate_selector(
         )
 
 
+def _validate_relation_references(value: object, relation_types: set[str]) -> None:
+    if isinstance(value, RelationExistsExpr):
+        if value.relation_type not in relation_types:
+            raise ValueError(
+                f"relation expression references undeclared type {value.relation_type!r}"
+            )
+        _validate_relation_references(value.source_seat, relation_types)
+        _validate_relation_references(value.target_seat, relation_types)
+    elif isinstance(value, BaseModel):
+        for field_name in type(value).model_fields:
+            _validate_relation_references(getattr(value, field_name), relation_types)
+    elif isinstance(value, Mapping):
+        for nested in value.values():
+            _validate_relation_references(nested, relation_types)
+    elif isinstance(value, (tuple, list)):
+        for nested in value:
+            _validate_relation_references(nested, relation_types)
+
+
+def _validate_typed_payload(effect: object) -> None:
+    """Reject ignored or composite payloads instead of silently dropping them."""
+
+    from werewolf.rules.models import EffectSpec
+
+    if not isinstance(effect, EffectSpec):
+        return
+    typed_fields = {
+        "player_field": effect.player_field,
+        "resource_id": effect.resource_id,
+        "delta": effect.delta,
+        "relation_type": effect.relation_type,
+        "relation_source": effect.relation_source,
+        "relation_target": effect.relation_target,
+        "relation_expiry_policy": effect.relation_expiry_policy,
+        "grant_skill_id": effect.grant_skill_id,
+        "grant_id": effect.grant_id,
+        "flow_action": effect.flow_action,
+    }
+    payloads = {name for name, value in typed_fields.items() if value is not None}
+    allowed = {
+        "PLAYER_FIELD_SET": {"player_field"},
+        "RESOURCE_DELTA": {"resource_id", "delta"},
+        "RELATION_ADD": {
+            "relation_type",
+            "relation_source",
+            "relation_target",
+            "relation_expiry_policy",
+        },
+        "RELATION_REMOVE": {"relation_type", "relation_source", "relation_target"},
+        "ABILITY_GRANT": {"grant_skill_id", "grant_id"},
+        "ABILITY_REVOKE": {"grant_skill_id", "grant_id"},
+        "FLOW": {"flow_action"},
+    }
+    typed_operation = effect.effect_type in allowed
+    if typed_operation and payloads != allowed[effect.effect_type]:
+        raise ValueError(f"{effect.effect_type} has missing or unrelated typed payload fields")
+    if not typed_operation and payloads:
+        raise ValueError(f"{effect.effect_type} cannot carry typed payload fields")
+    if effect.effect_type == "PLAYER_FIELD_SET" and effect.state_key is not None:
+        raise ValueError("PLAYER_FIELD_SET cannot carry state_key")
+    if effect.effect_type == "PLAYER_FIELD_SET" and effect.fact_type is not None:
+        raise ValueError("PLAYER_FIELD_SET cannot carry fact_type")
+    if effect.effect_type == "RESOURCE_DELTA" and (
+        effect.value is not None or effect.state_key is not None or effect.fact_type is not None
+    ):
+        raise ValueError("RESOURCE_DELTA cannot carry value, state_key, or fact_type")
+    if effect.effect_type in {"RELATION_ADD", "RELATION_REMOVE"} and (
+        effect.value is not None or effect.state_key is not None or effect.fact_type is not None
+    ):
+        raise ValueError("relation operations cannot carry value, state_key, or fact_type")
+    if effect.effect_type in {"ABILITY_GRANT", "ABILITY_REVOKE"} and (
+        effect.value is not None or effect.state_key is not None or effect.fact_type is not None
+    ):
+        raise ValueError("ability operations cannot carry value, state_key, or fact_type")
+    if effect.effect_type == "FLOW" and (
+        effect.target is not None
+        or effect.value is not None
+        or effect.state_key is not None
+        or effect.fact_type is not None
+        or effect.authorized_targets
+    ):
+        raise ValueError("FLOW cannot carry target, value, state_key, fact_type, or authorization")
+
+
 def validate_package_expressions(package: object) -> None:
     """Validate every declared reference and expression type in a package."""
 
@@ -591,6 +767,13 @@ def validate_package_expressions(package: object) -> None:
         raise ValueError("skill ids must be unique in an execution package")
     if len({item.interaction_id for item in package.interactions}) != len(package.interactions):
         raise ValueError("interaction ids must be unique")
+    relation_types = [item.relation_type for item in package.relation_declarations]
+    if len(relation_types) != len(set(relation_types)):
+        raise ValueError("relation types must be unique in an execution package")
+    resource_ids = [item.resource_id for item in package.resource_declarations]
+    if len(resource_ids) != len(set(resource_ids)):
+        raise ValueError("resource IDs must be unique in an execution package")
+    _validate_relation_references(package, set(relation_types))
     for declaration in package.state_declarations:
         if not _literal_matches_type(declaration.initial, declaration.value_type):
             raise ValueError(
@@ -601,8 +784,37 @@ def validate_package_expressions(package: object) -> None:
             raise ValueError(f"skill {skill.skill_id} references an undeclared action code")
         if skill.mode == "PLAYER" and not skill.grants:
             raise ValueError(f"player skill {skill.skill_id} requires at least one declared grant")
+        if skill.mode == "AUTOMATIC" and not skill.grants:
+            raise ValueError(f"automatic skill {skill.skill_id} requires a declared ability grant")
         if skill.mode == "HOST" and skill.grants:
             raise ValueError(f"host skill {skill.skill_id} cannot grant player abilities")
+        if len(skill.window_ids) != len(set(skill.window_ids)):
+            raise ValueError(f"skill {skill.skill_id} has duplicate window IDs")
+        if len(skill.hook_ids) != len(set(skill.hook_ids)):
+            raise ValueError(f"skill {skill.skill_id} has duplicate hook IDs")
+        trigger = skill.trigger
+        if skill.mode == "AUTOMATIC":
+            if trigger is None or trigger.mode != "AUTOMATIC":
+                raise ValueError("AUTOMATIC skills require an AUTOMATIC trigger")
+        elif trigger is not None and trigger.mode == "AUTOMATIC":
+            raise ValueError("AUTOMATIC triggers require AUTOMATIC skill mode")
+        if trigger is not None:
+            if not trigger.fact_types:
+                raise ValueError(f"skill {skill.skill_id} trigger requires fact_types")
+            if len(trigger.fact_types) != len(set(trigger.fact_types)):
+                raise ValueError(f"skill {skill.skill_id} trigger fact_types must be unique")
+            if trigger.mode == "PLAYER_CHOICE" and skill.mode != "PLAYER":
+                raise ValueError("PLAYER_CHOICE triggers require PLAYER skill mode")
+            if (
+                trigger.condition is not None
+                and infer_expr_type(
+                    trigger.condition,
+                    skill=skill,
+                    state_declarations=package.state_declarations,
+                )
+                != "bool"
+            ):
+                raise ValueError(f"skill {skill.skill_id} trigger condition must be bool")
         if skill.targets.min_targets > skill.targets.max_targets:
             raise ValueError(f"skill {skill.skill_id} has invalid target bounds")
         if skill.targets.max_targets > 16:
@@ -622,6 +834,7 @@ def validate_package_expressions(package: object) -> None:
         if len(parameter_names) != len(set(parameter_names)):
             raise ValueError(f"skill {skill.skill_id} has duplicate parameter names")
         for effect in skill.effects:
+            _validate_typed_payload(effect)
             if (
                 effect.condition is not None
                 and infer_expr_type(
@@ -676,6 +889,8 @@ def validate_package_expressions(package: object) -> None:
                     )
             if effect.effect_type == "FACT" and effect.fact_type is None:
                 raise ValueError(f"effect {effect.effect_id} requires fact_type")
+            if effect.effect_type == "FACT" and effect.fact_type == "DEATH_CONFIRMED":
+                raise ValueError("DEATH_CONFIRMED is reserved for confirmed mortality outcomes")
             if effect.effect_type == "DAMAGE" and effect.target is None:
                 raise ValueError(f"damage effect {effect.effect_id} requires a target")
             vote_value = effect.value
@@ -697,6 +912,100 @@ def validate_package_expressions(package: object) -> None:
                     target, skill=skill, state_declarations=package.state_declarations
                 ) not in {"seat", "json"}:
                     raise ValueError(f"effect {effect.effect_id} has invalid authorized target")
+            if effect.effect_type == "PLAYER_FIELD_SET":
+                if effect.player_field is None or effect.value is None:
+                    raise ValueError("PLAYER_FIELD_SET requires player_field and value")
+                if package.player_field_values is None:
+                    raise ValueError("PLAYER_FIELD_SET requires compiler-bound player field values")
+                field_types: dict[str, ValueType] = {
+                    "role_id": "str",
+                    "faction_id": "str",
+                    "victory_group_id": "nullable_str",
+                    "chat_group_ids": "str_list",
+                }
+                expected_field_type = field_types[effect.player_field]
+                if not _assignable(value_type or "json", expected_field_type):
+                    raise ValueError(f"PLAYER_FIELD_SET value must have type {expected_field_type}")
+            elif effect.effect_type == "RESOURCE_DELTA":
+                if effect.resource_id is None or effect.delta is None:
+                    raise ValueError("RESOURCE_DELTA requires resource_id and delta")
+                if effect.resource_id not in set(resource_ids):
+                    raise ValueError(
+                        f"RESOURCE_DELTA uses undeclared resource {effect.resource_id!r}"
+                    )
+                if (
+                    infer_expr_type(
+                        effect.delta,
+                        skill=skill,
+                        state_declarations=package.state_declarations,
+                    )
+                    != "int"
+                ):
+                    raise ValueError("RESOURCE_DELTA delta must be int")
+            elif effect.effect_type in {"RELATION_ADD", "RELATION_REMOVE"}:
+                if (
+                    effect.relation_type is None
+                    or effect.relation_source is None
+                    or effect.relation_target is None
+                ):
+                    raise ValueError("relation effects require type and both endpoints")
+                if effect.relation_type not in set(relation_types):
+                    raise ValueError(
+                        f"relation effect references undeclared type {effect.relation_type!r}"
+                    )
+                for endpoint in (effect.relation_source, effect.relation_target):
+                    if (
+                        infer_expr_type(
+                            endpoint,
+                            skill=skill,
+                            state_declarations=package.state_declarations,
+                        )
+                        != "seat"
+                    ):
+                        raise ValueError("relation endpoints must be seat values")
+                if effect.effect_type == "RELATION_ADD" and effect.relation_expiry_policy is None:
+                    raise ValueError("RELATION_ADD requires relation_expiry_policy")
+                if (
+                    effect.effect_type == "RELATION_REMOVE"
+                    and effect.relation_expiry_policy is not None
+                ):
+                    raise ValueError("RELATION_REMOVE cannot declare an expiry policy")
+            elif effect.effect_type in {"ABILITY_GRANT", "ABILITY_REVOKE"}:
+                if effect.grant_skill_id is None or effect.grant_id is None:
+                    raise ValueError("ability grant/revoke requires grant_skill_id and grant_id")
+                granted_skill = next(
+                    (item for item in package.skills if item.skill_id == effect.grant_skill_id),
+                    None,
+                )
+                if granted_skill is None:
+                    raise ValueError(
+                        f"ability effect references unknown skill {effect.grant_skill_id!r}"
+                    )
+                if effect.grant_id not in {item.grant_id for item in granted_skill.grants}:
+                    raise ValueError(f"ability effect references unknown grant {effect.grant_id!r}")
+            elif effect.effect_type == "FLOW":
+                if effect.flow_action is None or effect.condition is None:
+                    raise ValueError("FLOW requires flow_action and condition")
+                if effect.flow_action == "RESUME_HOOK" and not skill.hook_ids:
+                    raise ValueError("RESUME_HOOK requires a skill bound to a day hook")
+            if effect.effect_type == "STATE_SET" and effect.state_key is not None:
+                state_declaration = next(
+                    item
+                    for item in package.state_declarations
+                    if item.skill_id == skill.skill_id and item.key == effect.state_key
+                )
+                if state_declaration.scope == "SEAT" and effect.target is not None:
+                    target_type = infer_expr_type(
+                        effect.target,
+                        skill=skill,
+                        state_declarations=package.state_declarations,
+                    )
+                    if target_type != "seat":
+                        raise ValueError("SEAT state target must be a seat value")
+                if state_declaration.scope == "GAME" and effect.target is not None:
+                    raise ValueError("GAME-scoped state cannot declare a target")
+                if state_declaration.scope == "ABILITY" and effect.target is not None:
+                    raise ValueError("ABILITY-scoped state is bound to the source instance")
         for disclosure in skill.disclosures:
             if (
                 disclosure.condition is not None
@@ -715,6 +1024,7 @@ def validate_package_expressions(package: object) -> None:
             for value in disclosure.values.values():
                 infer_expr_type(value, skill=skill, state_declarations=package.state_declarations)
         for effect in skill.pass_effects:
+            _validate_typed_payload(effect)
             if effect.effect_type not in {"STATE_SET", "FACT"}:
                 raise ValueError("PASS effects may only update declared state or emit facts")
             if (
@@ -750,84 +1060,166 @@ def validate_package_expressions(package: object) -> None:
                     raise ValueError("PASS state update value does not match declared state type")
             if effect.effect_type == "FACT" and effect.fact_type is None:
                 raise ValueError("PASS fact effect requires fact_type")
+            if effect.effect_type == "FACT" and effect.fact_type == "DEATH_CONFIRMED":
+                raise ValueError("DEATH_CONFIRMED is reserved for confirmed mortality outcomes")
     for interaction in package.interactions:
+        if interaction.effects and interaction.rule_type != "REPLACE_DEATH":
+            raise ValueError("interaction effects are supported only for REPLACE_DEATH")
+        for effect in interaction.effects:
+            if effect.effect_type in {
+                "PLAYER_FIELD_SET",
+                "RESOURCE_DELTA",
+                "RELATION_ADD",
+                "RELATION_REMOVE",
+                "ABILITY_GRANT",
+                "ABILITY_REVOKE",
+                "FLOW",
+            }:
+                raise ValueError("typed B effects are supported only on skill declarations")
+            _validate_typed_payload(effect)
+            if effect.effect_type == "FACT" and effect.fact_type == "DEATH_CONFIRMED":
+                raise ValueError("DEATH_CONFIRMED is reserved for confirmed mortality outcomes")
+        source_skills = tuple(
+            skill
+            for skill in package.skills
+            if any(
+                effect.effect_type == "DAMAGE"
+                and (
+                    not interaction.damage_tags
+                    or bool(set(effect.tags).intersection(interaction.damage_tags))
+                )
+                for effect in skill.effects
+            )
+        )
+        if interaction.effects and not source_skills:
+            raise ValueError(
+                f"interaction {interaction.interaction_id} effects require a matching damage source"
+            )
+        context_skills = source_skills or package.skills[:1]
         if interaction.when is not None:
-            # Interactions use the same finite expression language.  A synthetic
-            # package-wide context is represented by the first skill when present.
             item_context = (
                 "post_death" if interaction.rule_type == "EMIT_POST_DEATH_FACT" else "effect_intent"
             )
-            if (
-                package.skills
-                and infer_expr_type(
-                    interaction.when,
-                    skill=package.skills[0],
-                    state_declarations=package.state_declarations,
-                    item_source=item_context,
-                )
-                != "bool"
-            ):
-                raise ValueError(f"interaction {interaction.interaction_id} condition must be bool")
-        if package.skills:
-            skill = package.skills[0]
-            for effect in interaction.effects:
+            for skill in context_skills:
                 if (
-                    effect.condition is not None
-                    and infer_expr_type(
-                        effect.condition,
-                        skill=skill,
-                        state_declarations=package.state_declarations,
-                        item_source="effect_intent",
-                    )
-                    != "bool"
-                ):
-                    raise ValueError(
-                        f"interaction effect {effect.effect_id} condition must be bool"
-                    )
-                target_type = None
-                if effect.target is not None:
-                    target_type = infer_expr_type(
-                        effect.target,
-                        skill=skill,
-                        state_declarations=package.state_declarations,
-                        item_source="effect_intent",
-                    )
-                value_type = None
-                if effect.value is not None:
-                    value_type = infer_expr_type(
-                        effect.value,
-                        skill=skill,
-                        state_declarations=package.state_declarations,
-                        item_source="effect_intent",
-                    )
-                if effect.effect_type == "CONSUME_ABILITY":
-                    if effect.target is None or target_type != "seat":
-                        raise ValueError(f"effect {effect.effect_id} target must be a seat")
-                    if effect.value is None:
-                        raise ValueError(f"effect {effect.effect_id} requires an ability ID value")
-                    if value_type != "str":
-                        raise ValueError(f"effect {effect.effect_id} ability ID value must be str")
-            for disclosure in interaction.disclosures:
-                if (
-                    disclosure.condition is not None
-                    and infer_expr_type(
-                        disclosure.condition,
-                        skill=skill,
-                        state_declarations=package.state_declarations,
-                        item_source="disclosure",
-                    )
-                    != "bool"
-                ):
-                    raise ValueError(
-                        f"interaction disclosure {disclosure.disclosure_id} condition must be bool"
-                    )
-                for value in disclosure.values.values():
                     infer_expr_type(
-                        value,
+                        interaction.when,
                         skill=skill,
                         state_declarations=package.state_declarations,
-                        item_source="disclosure",
+                        item_source=item_context,
                     )
+                    != "bool"
+                ):
+                    raise ValueError(
+                        f"interaction {interaction.interaction_id} condition must be bool"
+                    )
+        if source_skills:
+            for effect in interaction.effects:
+                for skill in source_skills:
+                    if (
+                        effect.condition is not None
+                        and infer_expr_type(
+                            effect.condition,
+                            skill=skill,
+                            state_declarations=package.state_declarations,
+                            item_source="effect_intent",
+                        )
+                        != "bool"
+                    ):
+                        raise ValueError(
+                            f"interaction effect {effect.effect_id} condition must be bool"
+                        )
+                    target_type = None
+                    if effect.target is not None:
+                        target_type = infer_expr_type(
+                            effect.target,
+                            skill=skill,
+                            state_declarations=package.state_declarations,
+                            item_source="effect_intent",
+                        )
+                    value_type = None
+                    if effect.value is not None:
+                        value_type = infer_expr_type(
+                            effect.value,
+                            skill=skill,
+                            state_declarations=package.state_declarations,
+                            item_source="effect_intent",
+                        )
+                    for authorized_target in effect.authorized_targets:
+                        if infer_expr_type(
+                            authorized_target,
+                            skill=skill,
+                            state_declarations=package.state_declarations,
+                            item_source="effect_intent",
+                        ) not in {"seat", "json"}:
+                            raise ValueError(
+                                f"interaction effect {effect.effect_id} has invalid authorization"
+                            )
+                    if effect.effect_type == "CONSUME_ABILITY":
+                        if effect.target is None or target_type != "seat":
+                            raise ValueError(f"effect {effect.effect_id} target must be a seat")
+                        if effect.value is None:
+                            raise ValueError(
+                                f"effect {effect.effect_id} requires an ability ID value"
+                            )
+                        if value_type != "str":
+                            raise ValueError(
+                                f"effect {effect.effect_id} ability ID value must be str"
+                            )
+                    if effect.effect_type == "STATE_SET":
+                        if effect.state_key is None or effect.value is None:
+                            raise ValueError(
+                                f"interaction state effect {effect.effect_id} "
+                                "requires key and value"
+                            )
+                        interaction_declaration = next(
+                            (
+                                item
+                                for item in package.state_declarations
+                                if item.skill_id == skill.skill_id and item.key == effect.state_key
+                            ),
+                            None,
+                        )
+                        if interaction_declaration is None:
+                            raise ValueError(
+                                f"interaction effect {effect.effect_id} writes undeclared state"
+                            )
+                        if not _assignable(
+                            value_type or "json", interaction_declaration.value_type
+                        ):
+                            raise ValueError(
+                                f"interaction state effect {effect.effect_id} has wrong value type"
+                            )
+                        if interaction_declaration.scope == "SEAT" and effect.target is not None:
+                            if target_type != "seat":
+                                raise ValueError("SEAT state target must be a seat value")
+                        if interaction_declaration.scope == "GAME" and effect.target is not None:
+                            raise ValueError("GAME-scoped state cannot declare a target")
+                        if interaction_declaration.scope == "ABILITY" and effect.target is not None:
+                            raise ValueError("ABILITY-scoped state is bound to the source instance")
+            for skill in context_skills:
+                for disclosure in interaction.disclosures:
+                    if (
+                        disclosure.condition is not None
+                        and infer_expr_type(
+                            disclosure.condition,
+                            skill=skill,
+                            state_declarations=package.state_declarations,
+                            item_source="disclosure",
+                        )
+                        != "bool"
+                    ):
+                        raise ValueError(
+                            f"interaction disclosure {disclosure.disclosure_id} condition "
+                            "must be bool"
+                        )
+                    for value in disclosure.values.values():
+                        infer_expr_type(
+                            value,
+                            skill=skill,
+                            state_declarations=package.state_declarations,
+                            item_source="disclosure",
+                        )
     if any(
         effect.effect_type == "DAMAGE"
         for skill in package.skills

@@ -52,6 +52,7 @@ class NightWindowConfig:
     max_actions: int = 1
     allow_pass: bool = False
     visible_context: Mapping[str, JsonValue] = field(default_factory=dict)
+    collection_only: bool = False
 
     def __post_init__(self) -> None:
         if len(set(self.allowed_seats)) != len(self.allowed_seats):
@@ -62,11 +63,16 @@ class NightWindowConfig:
             raise ValueError("allowed_role_ids must not contain duplicates")
         if len(set(self.allowed_action_codes)) != len(self.allowed_action_codes):
             raise ValueError("allowed_action_codes must not contain duplicates")
-        if not self.allowed_action_codes:
+        if self.collection_only:
+            if self.allowed_seats or self.allowed_action_codes or self.allow_pass:
+                raise ValueError("collection-only windows cannot authorize seats, actions, or PASS")
+            if self.min_actions != 0 or self.max_actions != 0:
+                raise ValueError("collection-only windows require zero actions")
+        elif not self.allowed_action_codes:
             raise ValueError("allowed_action_codes must not be empty")
         if not 0 <= self.min_actions <= self.max_actions <= 32:
             raise ValueError("min_actions/max_actions must be between 0 and 32")
-        if self.max_actions == 0 and not self.allow_pass:
+        if not self.collection_only and self.max_actions == 0 and not self.allow_pass:
             raise ValueError("zero-action windows must allow_pass")
 
 
@@ -165,6 +171,40 @@ class NightCoordinator:
     def _physical_window_id_for(self, board_window: NightWindow, state: GameState) -> str:
         return self._physical_window_id(board_window.window_id, state)
 
+    def _settlement_group_id_for(
+        self,
+        board_window: NightWindow,
+        state: GameState,
+    ) -> str | None:
+        execution = self._manager.execution_package
+        if execution is None:
+            return None
+        groups = execution.window_settlement_groups
+        if not groups:
+            return f"night:{state.round_no}"
+        static_group = groups.get(board_window.window_id)
+        if not isinstance(static_group, str) or not static_group:
+            raise NightCoordinatorError(
+                "WINDOW_GROUP_MISSING",
+                f"frozen package has no settlement group for {board_window.window_id!r}",
+            )
+        return f"night:{state.round_no}:{static_group}"
+
+    def _static_settlement_group_for(self, board_window: NightWindow) -> str | None:
+        execution = self._manager.execution_package
+        if execution is None:
+            return None
+        groups = execution.window_settlement_groups
+        return groups.get(board_window.window_id) if groups else "night"
+
+    def _group_members(self, board_window: NightWindow) -> tuple[NightWindow, ...]:
+        group_id = self._static_settlement_group_for(board_window)
+        if group_id is None:
+            return ()
+        return tuple(
+            item for item in self._ordered() if self._static_settlement_group_for(item) == group_id
+        )
+
     def _current_board_window(self, state: GameState) -> NightWindow:
         for board_window in self._ordered():
             # The action collection window intentionally remains open while
@@ -176,7 +216,13 @@ class NightCoordinator:
             if raw is None:
                 return board_window
             stored = _load_window(raw)
-            if stored.closed_at is None:
+            # Executable windows separate collection from final settlement.
+            # Once a window has stopped accepting requests, the next window in
+            # the same night can open while the shared settlement group stays
+            # provisional.  Legacy/manual windows still advance only after
+            # their ordinary close boundary.
+            collected = stored.collection_complete_at is not None
+            if stored.closed_at is None and not collected:
                 return board_window
         raise NightCoordinatorError("NIGHT_COMPLETE", "all board night windows are closed")
 
@@ -188,6 +234,14 @@ class NightCoordinator:
             raise NightCoordinatorError(
                 "WINDOW_CONFIG_MISSING",
                 f"action window {board_window.window_id!r} has no role authorization config",
+            )
+        if board_window.phase is GamePhase.NIGHT_RESOLVE:
+            return NightWindowConfig(
+                allowed_seats=(),
+                allowed_action_codes=(),
+                min_actions=0,
+                max_actions=0,
+                collection_only=True,
             )
         # Team chat visibility comes from the board's frozen visible_to role
         # IDs.  Resolve is a moderator boundary and has no player action.
@@ -205,6 +259,14 @@ class NightCoordinator:
         else:
             seats = tuple(seat for seat, player in sorted(state.players.items()) if player.alive)
         if not seats:
+            if self._manager.execution_package is not None:
+                return NightWindowConfig(
+                    allowed_seats=(),
+                    allowed_action_codes=(),
+                    min_actions=0,
+                    max_actions=0,
+                    collection_only=True,
+                )
             raise NightCoordinatorError(
                 "NO_ELIGIBLE_SEATS", "night window has no eligible live seats"
             )
@@ -234,7 +296,7 @@ class NightCoordinator:
         now: datetime | None = None,
     ) -> ActionWindow:
         config = self._config_for(board_window, state)
-        if not config.allowed_seats:
+        if not config.allowed_seats and not config.collection_only:
             raise NightCoordinatorError("NO_ELIGIBLE_SEATS", "night window has no authorized seats")
         unknown = tuple(seat for seat in config.allowed_seats if seat not in state.players)
         if unknown:
@@ -249,9 +311,13 @@ class NightCoordinator:
                 raise NightCoordinatorError(
                     "ROLE_NOT_ALLOWED", f"night seats are not authorized: {unauthorized}"
                 )
-        if board_window.phase is GamePhase.NIGHT_ACTION:
-            self._validate_action_config(state, config)
-        epoch = self._session_epoch(state, config.allowed_seats)
+        if board_window.phase is GamePhase.NIGHT_ACTION and not config.collection_only:
+            self._validate_action_config(
+                state,
+                config,
+                logical_window_id=board_window.window_id,
+            )
+        epoch = self._session_epoch(state, config.allowed_seats) if config.allowed_seats else 0
         visible = dict(config.visible_context)
         visible.update(
             {
@@ -263,11 +329,20 @@ class NightCoordinator:
             }
         )
         physical_window_id = self._physical_window_id_for(board_window, state)
+        ordered = self._ordered()
+        position = next(
+            index for index, item in enumerate(ordered) if item.window_id == board_window.window_id
+        )
+        next_window_id = ordered[position + 1].window_id if position + 1 < len(ordered) else None
         return ActionWindow(
             window_id=physical_window_id,
             game_id=state.game_id,
             session_epoch=epoch,
             phase=board_window.phase,
+            collection_only=config.collection_only,
+            logical_window_id=board_window.window_id,
+            settlement_group_id=self._settlement_group_id_for(board_window, state),
+            next_window_id=next_window_id,
             allowed_seats=tuple(config.allowed_seats),
             allowed_role_ids=tuple(config.allowed_role_ids),
             allowed_action_codes=tuple(config.allowed_action_codes),
@@ -281,7 +356,13 @@ class NightCoordinator:
             allow_concurrent=board_window.parallel,
         )
 
-    def _validate_action_config(self, state: GameState, config: NightWindowConfig) -> None:
+    def _validate_action_config(
+        self,
+        state: GameState,
+        config: NightWindowConfig,
+        *,
+        logical_window_id: str,
+    ) -> None:
         """Validate an action window against per-seat setup grants.
 
         ``allowed_action_codes`` is a window union, while authorization is
@@ -291,6 +372,8 @@ class NightCoordinator:
         submitting seat.
         """
 
+        if config.collection_only:
+            return
         if 299 in config.allowed_action_codes and not config.allow_pass:
             raise NightCoordinatorError(
                 "PASS_NOT_ALLOWED", "PASS may only appear in a window that allows pass"
@@ -313,6 +396,7 @@ class NightCoordinator:
                     seat,
                     GamePhase.NIGHT_ACTION.value,
                     allowed_codes=action_codes,
+                    logical_window_id=logical_window_id,
                 )
                 active_codes = {skill.action_code for _instance, skill in active}
                 grant_union.update(active_codes)
@@ -388,6 +472,7 @@ class NightCoordinator:
         if existing_raw is not None:
             existing = _load_window(existing_raw)
             if existing.closed_at is None:
+                await self._publish_due_window_disclosures(board_window, existing, now=now)
                 return NightWindowProgress(
                     board_window_id=board_window.window_id,
                     phase=board_window.phase,
@@ -404,7 +489,10 @@ class NightCoordinator:
                     f"night window {board_window.window_id!r} depends on {dependency!r}",
                 )
             dependency_window = _load_window(dependency_raw)
-            dependency_complete = dependency_window.closed_at is not None
+            dependency_complete = (
+                dependency_window.closed_at is not None
+                or dependency_window.collection_complete_at is not None
+            )
             if not dependency_complete and dependency_window.phase is GamePhase.NIGHT_ACTION:
                 dependency_complete = self._action_submissions_complete(state, dependency_window)
             if not dependency_complete:
@@ -415,6 +503,7 @@ class NightCoordinator:
         window = self._build_action_window(state, board_window, now=now)
         committed = await self._manager.commit_action_window(window, now=now)
         installed = _load_window(committed.action_windows[physical_window_id])
+        await self._publish_due_window_disclosures(board_window, installed, now=now)
         return NightWindowProgress(
             board_window_id=board_window.window_id,
             phase=board_window.phase,
@@ -422,6 +511,34 @@ class NightCoordinator:
             dependencies=tuple(board_window.depends_on),
             action_window=installed,
         )
+
+    async def _publish_due_window_disclosures(
+        self,
+        board_window: NightWindow,
+        action_window: ActionWindow,
+        *,
+        now: datetime | None,
+    ) -> None:
+        """Deliver declarations due as this frozen phase/window becomes active."""
+
+        if self._manager.execution_package is None:
+            return
+        try:
+            state = await self._manager.snapshot()
+            await self._manager.publish_due_rule_disclosures(
+                board_window.phase.value,
+                expected_revision=state.state_revision,
+                now=now,
+            )
+            state = await self._manager.snapshot()
+            await self._manager.publish_due_rule_disclosures(
+                action_window.logical_window_id or board_window.window_id,
+                logical_window_id=action_window.logical_window_id or board_window.window_id,
+                expected_revision=state.state_revision,
+                now=now,
+            )
+        except (EventCommitError, ResolutionError, TypeError, ValueError) as exc:
+            raise NightCoordinatorError("DISCLOSURE_PUBLISH_FAILED", str(exc)) from exc
 
     @staticmethod
     def _window_requests(state: GameState, window_id: str) -> dict[str, dict[str, JsonValue]]:
@@ -454,7 +571,54 @@ class NightCoordinator:
         """
 
         state = await self._manager.snapshot()
-        board_window = self._current_board_window(state)
+        try:
+            board_window = self._current_board_window(state)
+        except NightCoordinatorError as exc:
+            # Recover a crash after the final current-phase window was marked
+            # collection-complete but before the phase edge was persisted.
+            if exc.code != "NIGHT_COMPLETE" or self._manager.execution_package is None:
+                raise
+            current_phase_windows = tuple(
+                item for item in self._ordered() if item.phase is state.phase
+            )
+            if not current_phase_windows or any(
+                not self._collection_complete_for(
+                    state,
+                    self._physical_window_id_for(item, state),
+                )
+                for item in current_phase_windows
+            ):
+                raise
+            last = max(current_phase_windows, key=lambda item: item.order)
+            ordered = self._ordered()
+            position = next(
+                index for index, item in enumerate(ordered) if item.window_id == last.window_id
+            )
+            group_members = self._group_members(last)
+            group_complete = bool(group_members) and group_members[-1].window_id == last.window_id
+            if group_complete:
+                group_id = self._settlement_group_id_for(last, state)
+                if group_id is None:
+                    raise NightCoordinatorError(
+                        "WINDOW_GROUP_MISSING", "settlement group is missing"
+                    )
+                timestamp = now or datetime.now(UTC)
+                try:
+                    state = await self._manager.commit_rule_group(
+                        group_id,
+                        expected_revision=state.state_revision,
+                        now=timestamp,
+                    )
+                    await self._manager.advance_rule_workflow(
+                        expected_revision=state.state_revision,
+                        now=timestamp,
+                    )
+                    return await self._manager.snapshot()
+                except (ResolutionError, EventCommitError, ValueError) as exc:
+                    raise NightCoordinatorError("RULE_GROUP_REJECTED", str(exc)) from exc
+            if position + 1 >= len(ordered):
+                raise NightCoordinatorError("NIGHT_COMPLETE", "board has no next night phase")
+            return await self._manager.commit_phase_transition(ordered[position + 1].phase, now=now)
         if expected_window_id is not None and board_window.window_id != expected_window_id:
             raise NightCoordinatorError(
                 "WINDOW_MISMATCH", "current board window differs from the request"
@@ -466,31 +630,105 @@ class NightCoordinator:
                 "WINDOW_NOT_OPEN", "current board window has not been opened"
             )
         window = _load_window(raw)
-        if window.closed_at is not None:
+        if window.closed_at is not None or window.collection_complete_at is not None:
             raise NightCoordinatorError("WINDOW_CLOSED", "current board window is already closed")
-        if board_window.phase is GamePhase.NIGHT_TEAM_CHAT:
-            try:
-                state = await self._manager.close_action_window(
-                    physical_window_id,
-                    expected_revision=state.state_revision,
-                    now=now,
+        if board_window.phase is GamePhase.NIGHT_ACTION:
+            if not self._action_submissions_complete(state, window):
+                raise NightCoordinatorError(
+                    "SUBMISSIONS_INCOMPLETE",
+                    "every authorized seat must submit before resolution",
                 )
-            except EventCommitError as exc:
-                raise NightCoordinatorError("WINDOW_CLOSE_FAILED", str(exc)) from exc
-        if board_window.phase is GamePhase.NIGHT_ACTION and not self._action_submissions_complete(
-            state, window
-        ):
-            raise NightCoordinatorError(
-                "SUBMISSIONS_INCOMPLETE", "every authorized seat must submit before resolution"
-            )
         ordered = self._ordered()
         position = next(
             index for index, item in enumerate(ordered) if item.window_id == board_window.window_id
         )
+        if position + 1 >= len(ordered) and self._manager.execution_package is None:
+            raise NightCoordinatorError("NIGHT_COMPLETE", "board has no next night phase")
+        if self._manager.execution_package is None:
+            if board_window.phase is GamePhase.NIGHT_TEAM_CHAT:
+                try:
+                    state = await self._manager.close_action_window(
+                        physical_window_id,
+                        expected_revision=state.state_revision,
+                        now=now,
+                    )
+                except EventCommitError as exc:
+                    raise NightCoordinatorError("WINDOW_CLOSE_FAILED", str(exc)) from exc
+            return await self._manager.commit_phase_transition(
+                ordered[position + 1].phase,
+                now=now,
+            )
+
+        timestamp = now or datetime.now(UTC)
+        try:
+            state = await self._manager.complete_rule_window(
+                physical_window_id,
+                expected_revision=state.state_revision,
+                now=timestamp,
+            )
+        except EventCommitError as exc:
+            raise NightCoordinatorError("WINDOW_COMPLETE_FAILED", str(exc)) from exc
+
+        members = self._group_members(board_window)
+        group_is_complete = bool(members) and members[-1].window_id == board_window.window_id
+        if group_is_complete:
+            group_id = self._settlement_group_id_for(board_window, state)
+            if group_id is None:
+                raise NightCoordinatorError("WINDOW_GROUP_MISSING", "settlement group is missing")
+            try:
+                state = await self._manager.commit_rule_group(
+                    group_id,
+                    request_ids=None,
+                    expected_revision=state.state_revision,
+                    now=timestamp,
+                )
+                step = await self._manager.advance_rule_workflow(
+                    expected_revision=state.state_revision,
+                    now=timestamp,
+                )
+                state = await self._manager.snapshot()
+            except (ResolutionError, EventCommitError, ValueError) as exc:
+                raise NightCoordinatorError("RULE_GROUP_REJECTED", str(exc)) from exc
+            if step.kind in {"AUTOMATIC", "PLAYER_CHOICE"} or step.queue_pending:
+                # The manager has pinned the occurrence/window and current
+                # workflow phase.  ModeratorTriggerFlow will drain it through
+                # the regular ActionTurnScheduler boundary.
+                return state
+            # ``advance_rule_workflow`` is the phase restore authority.  Its
+            # RETURN/IDLE result has already written the persisted coarse
+            # phase and, when applicable, the next logical window cursor.
+            return state
+
+        # Same-group windows stay provisional through collection.  A different
+        # group commits only after its last window is collected, after which
+        # the durable cursor may pause on a trigger and return to this exact
+        # next logical board window.
+        if state.phase is not board_window.phase:
+            return state
         if position + 1 >= len(ordered):
             raise NightCoordinatorError("NIGHT_COMPLETE", "board has no next night phase")
-        next_phase = ordered[position + 1].phase
-        return await self._manager.commit_phase_transition(next_phase, now=now)
+        next_board_window = ordered[position + 1]
+        if next_board_window.phase is board_window.phase:
+            try:
+                await self._manager.advance_rule_workflow(
+                    expected_revision=state.state_revision,
+                    now=timestamp,
+                )
+                return await self._manager.snapshot()
+            except (ResolutionError, EventCommitError, ValueError) as exc:
+                raise NightCoordinatorError("RULE_WORKFLOW_REJECTED", str(exc)) from exc
+        return await self._manager.commit_phase_transition(
+            next_board_window.phase,
+            now=timestamp,
+        )
+
+    @staticmethod
+    def _collection_complete_for(state: GameState, window_id: str) -> bool:
+        raw = state.action_windows.get(window_id)
+        if raw is None:
+            return False
+        window = _load_window(raw)
+        return window.closed_at is not None or window.collection_complete_at is not None
 
     async def confirm_night(
         self,
@@ -505,6 +743,14 @@ class NightCoordinator:
         state = await self._manager.snapshot()
         if state.phase is not GamePhase.NIGHT_RESOLVE:
             raise NightCoordinatorError("PHASE_NOT_ALLOWED", "night effects require NIGHT_RESOLVE")
+        if self._manager.execution_package is not None:
+            if resolutions:
+                raise NightCoordinatorError(
+                    "RULE_RESOLUTION_UNAVAILABLE",
+                    "executable packages settle manager-recomputed rule requests, "
+                    "not supplied rulings",
+                )
+            return await self.advance_from_current_window(now=now)
         action_ids = [
             item.window_id for item in self._ordered() if item.phase is GamePhase.NIGHT_ACTION
         ]

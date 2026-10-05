@@ -20,7 +20,12 @@ from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import ValidationError
 
-from werewolf.rules.compiler import validate_execution_package
+from werewolf.rules.compiler import (
+    boundary_policy_from_board,
+    execution_windows_from_board,
+    player_field_values_from_board,
+    validate_execution_package,
+)
 from werewolf.rules.models import ExecutionPackage
 
 from .board import BoardDefinition
@@ -350,10 +355,38 @@ def _load_executable_artifact(
         action_registry = ActionRegistry.model_validate(value.get("action_registry"))
         if execution.board_id != board.board_id or execution.board_version != board.version:
             raise _RuntimePayloadError("executable board reference disagrees with package")
+        has_player_field_changes = any(
+            effect.effect_type == "PLAYER_FIELD_SET"
+            for skill in execution.skills
+            for effect in (*skill.effects, *skill.pass_effects)
+        )
+        expected_player_field_values = None
+        if has_player_field_changes:
+            chat_group_ids = {
+                profile.base_role.team
+                for profile in effective_roles.values()
+                if isinstance(profile.base_role, RoleDefinition)
+                if getattr(
+                    profile.base_role.team_visibility.channel,
+                    "value",
+                    profile.base_role.team_visibility.channel,
+                )
+                == "TEAM"
+            }
+            expected_player_field_values = player_field_values_from_board(
+                board,
+                role_ids=tuple(effective_roles),
+                chat_group_ids=tuple(chat_group_ids),
+            )
         validate_execution_package(
             execution,
             action_registry,
             role_ids=set(effective_roles),
+            available_windows=execution_windows_from_board(board),
+            expected_boundary_policy=(
+                boundary_policy_from_board(board) if execution.boundary_policy is not None else None
+            ),
+            expected_player_field_values=expected_player_field_values,
         )
     except _RuntimePayloadError:
         raise

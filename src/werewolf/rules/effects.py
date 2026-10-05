@@ -8,19 +8,25 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from werewolf.rules.models import (
+    AbilityUpdate,
     DisclosureProjection,
     DomainFact,
     EffectIntent,
     EffectSpec,
     ExecutionPackage,
+    FlowUpdate,
     InteractionRule,
     MortalityOutcome,
+    PlayerFieldUpdate,
     PlayerObservation,
+    RelationUpdate,
     RequestDisposition,
     ResolvedEffect,
+    ResourceUpdate,
     RuleObservation,
     SkillRequest,
     SkillSpec,
+    StateDeclaration,
     StateUpdate,
 )
 from werewolf.rules.predicates import evaluate_expr, evaluate_predicate
@@ -32,6 +38,11 @@ class EffectResolution:
     intents: tuple[EffectIntent, ...]
     effects: tuple[ResolvedEffect, ...]
     state_updates: tuple[StateUpdate, ...]
+    player_updates: tuple[PlayerFieldUpdate, ...]
+    resource_updates: tuple[ResourceUpdate, ...]
+    relation_updates: tuple[RelationUpdate, ...]
+    ability_updates: tuple[AbilityUpdate, ...]
+    flow_updates: tuple[FlowUpdate, ...]
     mortality: tuple[MortalityOutcome, ...]
     outcomes: tuple[DomainFact, ...]
     facts: tuple[DomainFact, ...]
@@ -78,6 +89,7 @@ def _context(
     request: SkillRequest | None,
     skill: SkillSpec | None,
     item: object | None = None,
+    state_declarations: Sequence[StateDeclaration] = (),
 ) -> dict[str, object]:
     request_mapping: dict[str, object] = {}
     if request is not None:
@@ -88,21 +100,52 @@ def _context(
             "actor_seat": request.actor_seat,
             "target_count": len(request.targets),
             "parameters": request.parameters,
+            "window_id": request.window_id,
+            "logical_window_id": request.logical_window_id,
+            "hook_id": request.hook_id,
         }
-    state = (
+    state = {
+        declaration.key: declaration.initial
+        for declaration in state_declarations
+        if declaration.skill_id == intent.skill_id
+    }
+    state.update(
+        {
+            item.key: item.value
+            for item in observation.state_values
+            if item.skill_id == intent.skill_id
+            and (
+                item.scope == "GAME"
+                or (item.scope == "SEAT" and item.seat == intent.actor_seat)
+                or (
+                    item.scope == "ABILITY"
+                    and item.ability_instance_id == intent.ability_instance_id
+                )
+            )
+        }
+    )
+    state.update(
         {
             item.key: item.value
             for item in observation.skill_state
-            if request is not None and item.ability_instance_id == request.ability_instance_id
+            if item.ability_instance_id == intent.ability_instance_id
+            and item.skill_id == intent.skill_id
         }
-        if request is not None
-        else {}
     )
     return {
         "observation": observation,
         "actor": _player(observation, intent.actor_seat),
         "target": _player(observation, intent.target_seat),
         "request": request_mapping,
+        "source_fact": next(
+            (
+                fact
+                for fact in observation.facts
+                if fact.fact_id
+                == (request.source_fact_id if request is not None else intent.source_fact_id)
+            ),
+            None,
+        ),
         "request_targets": tuple(
             player
             for seat in (sorted(request.targets) if request is not None else ())
@@ -121,6 +164,7 @@ def _matches_rule(
     observation: RuleObservation,
     request_by_id: Mapping[str, SkillRequest],
     skill_by_id: Mapping[str, SkillSpec],
+    state_declarations: Sequence[StateDeclaration] = (),
     item: object | None = None,
 ) -> bool:
     if not _tags_match(damage.tags, rule.damage_tags):
@@ -133,6 +177,7 @@ def _matches_rule(
         request=request,
         skill=skill,
         item=damage if item is None else item,
+        state_declarations=state_declarations,
     )
     return evaluate_predicate(rule.when, context)
 
@@ -144,10 +189,17 @@ def _target_values(
     source: EffectIntent,
     request: SkillRequest | None,
     skill: SkillSpec | None,
+    state_declarations: Sequence[StateDeclaration] = (),
 ) -> tuple[int | None, ...]:
     if spec.target is None:
         return (source.target_seat,)
-    context = _context(observation=observation, intent=source, request=request, skill=skill)
+    context = _context(
+        observation=observation,
+        intent=source,
+        request=request,
+        skill=skill,
+        state_declarations=state_declarations,
+    )
     value = evaluate_expr(spec.target, context)
     if value is None:
         return (None,)
@@ -163,10 +215,17 @@ def _value(
     source: EffectIntent,
     request: SkillRequest | None,
     skill: SkillSpec | None,
+    state_declarations: Sequence[StateDeclaration] = (),
 ) -> object:
     if spec.value is None:
         return None
-    context = _context(observation=observation, intent=source, request=request, skill=skill)
+    context = _context(
+        observation=observation,
+        intent=source,
+        request=request,
+        skill=skill,
+        state_declarations=state_declarations,
+    )
     return _json_value(evaluate_expr(spec.value, context))
 
 
@@ -177,23 +236,51 @@ def _interaction_effects(
     observation: RuleObservation,
     request_by_id: Mapping[str, SkillRequest],
     skill_by_id: Mapping[str, SkillSpec],
+    state_declarations: Sequence[StateDeclaration] = (),
 ) -> tuple[EffectIntent, ...]:
     request = request_by_id.get(candidate.source_request_id)
     skill = skill_by_id.get(candidate.skill_id)
     generated: list[EffectIntent] = []
     for spec in rule.effects:
-        context = _context(observation=observation, intent=candidate, request=request, skill=skill)
+        context = _context(
+            observation=observation,
+            intent=candidate,
+            request=request,
+            skill=skill,
+            state_declarations=state_declarations,
+        )
         if not evaluate_predicate(spec.condition, context):
             continue
+        state_declaration = (
+            next(
+                (
+                    declaration
+                    for declaration in state_declarations
+                    if declaration.skill_id == candidate.skill_id
+                    and declaration.key == spec.state_key
+                ),
+                None,
+            )
+            if spec.effect_type == "STATE_SET" and spec.state_key is not None
+            else None
+        )
+        if spec.effect_type == "STATE_SET" and state_declaration is None:
+            raise ValueError("interaction STATE_SET writes undeclared state")
         target_values = _target_values(
             spec,
             observation=observation,
             source=candidate,
             request=request,
             skill=skill,
+            state_declarations=state_declarations,
         )
         value = _value(
-            spec, observation=observation, source=candidate, request=request, skill=skill
+            spec,
+            observation=observation,
+            source=candidate,
+            request=request,
+            skill=skill,
+            state_declarations=state_declarations,
         )
         authorized = set(candidate.authorized_targets)
         for authorized_expr in spec.authorized_targets:
@@ -225,6 +312,22 @@ def _interaction_effects(
                     state_key=spec.state_key,
                     fact_type=spec.fact_type,
                     authorized_targets=tuple(sorted(authorized)),
+                    state_scope=(
+                        state_declaration.scope if state_declaration is not None else None
+                    ),
+                    state_ability_instance_id=(
+                        candidate.ability_instance_id
+                        if state_declaration is not None and state_declaration.scope == "ABILITY"
+                        else None
+                    ),
+                    state_expiry_policy=(
+                        state_declaration.expiry_policy if state_declaration is not None else None
+                    ),
+                    trigger_occurrence_id=candidate.trigger_occurrence_id,
+                    source_fact_id=candidate.source_fact_id,
+                    window_id=candidate.window_id,
+                    logical_window_id=candidate.logical_window_id,
+                    hook_id=candidate.hook_id,
                 )
             )
     return tuple(generated)
@@ -276,6 +379,7 @@ def resolve_effects(
                 observation=observation,
                 request_by_id=request_by_id,
                 skill_by_id=skill_by_id,
+                state_declarations=package.state_declarations,
             ):
                 replaced.add(candidate.effect_id)
                 activation_by_key[(rule.interaction_id, candidate.effect_id)] = (
@@ -291,11 +395,46 @@ def resolve_effects(
                     observation=observation,
                     request_by_id=request_by_id,
                     skill_by_id=skill_by_id,
+                    state_declarations=package.state_declarations,
                 ):
                     generated_by_id[effect.effect_id] = effect
 
     generated = tuple(generated_by_id[key] for key in sorted(generated_by_id))
     all_intents.extend(generated)
+    relation_keys: set[tuple[str, int, int]] = set()
+    ability_keys: set[tuple[int, str, str]] = set()
+    flow_count = 0
+    for intent in all_intents:
+        if intent.effect_type in {"RELATION_ADD", "RELATION_REMOVE"}:
+            if (
+                intent.relation_type is None
+                or intent.relation_source_seat is None
+                or intent.relation_target_seat is None
+            ):
+                raise ValueError("relation operation requires type and endpoints")
+            relation_key = (
+                intent.relation_type,
+                intent.relation_source_seat,
+                intent.relation_target_seat,
+            )
+            if relation_key in relation_keys:
+                raise ValueError("simultaneous conflicting relation operations")
+            relation_keys.add(relation_key)
+        elif intent.effect_type in {"ABILITY_GRANT", "ABILITY_REVOKE"}:
+            if (
+                intent.target_seat is None
+                or intent.grant_skill_id is None
+                or intent.grant_id is None
+            ):
+                raise ValueError("ability operation requires target, skill, and grant")
+            ability_key = (intent.target_seat, intent.grant_skill_id, intent.grant_id)
+            if ability_key in ability_keys:
+                raise ValueError("simultaneous conflicting ability operations")
+            ability_keys.add(ability_key)
+        elif intent.effect_type == "FLOW":
+            flow_count += 1
+    if flow_count > 1:
+        raise ValueError("multiple FLOW effects in one resolution group are ambiguous")
     by_target: dict[int, list[EffectIntent]] = {}
     for item in all_intents:
         if item.target_seat is not None:
@@ -321,6 +460,7 @@ def resolve_effects(
                 observation=observation,
                 request_by_id=request_by_id,
                 skill_by_id=skill_by_id,
+                state_declarations=package.state_declarations,
             ):
                 continue
             for counter in by_target.get(candidate.target_seat or 0, ()):
@@ -367,6 +507,7 @@ def resolve_effects(
                 observation=observation,
                 request_by_id=request_by_id,
                 skill_by_id=skill_by_id,
+                state_declarations=package.state_declarations,
             )
         ]
         if not matching_rules:
@@ -415,6 +556,7 @@ def resolve_effects(
                     ),
                     fact_type="DEATH_CONFIRMED",
                     target_seat=target,
+                    death_cause=death_cause,
                     tags=(death_cause,),
                     data={"death_cause": death_cause, "source_request_ids": list(source_ids)},
                 )
@@ -432,6 +574,17 @@ def resolve_effects(
     facts: list[DomainFact] = []
     resolved: list[ResolvedEffect] = []
     state_updates: list[StateUpdate] = []
+    player_updates: list[PlayerFieldUpdate] = []
+    resource_updates: list[ResourceUpdate] = []
+    relation_updates: list[RelationUpdate] = []
+    ability_updates: list[AbilityUpdate] = []
+    flow_updates: list[FlowUpdate] = []
+    relation_ids = {item.relation_id for item in observation.relations}
+    existing_abilities = {
+        (item.actor_seat, item.skill_id, item.grant_id)
+        for item in observation.ability_instances
+        if item.enabled
+    }
     for intent in sorted(
         all_intents, key=lambda item: (item.source_rule_id, item.source_request_id, item.effect_id)
     ):
@@ -441,10 +594,10 @@ def resolve_effects(
             observed_seats = {player.seat for player in observation.players}
             if intent.target_seat not in observed_seats:
                 raise ValueError("CONSUME_ABILITY target is absent from the observation")
-            key = (intent.target_seat, intent.value)
-            if key in consumed_abilities:
+            consumed_key = (intent.target_seat, intent.value)
+            if consumed_key in consumed_abilities:
                 raise ValueError("duplicate CONSUME_ABILITY target and ability ID")
-            consumed_abilities.add(key)
+            consumed_abilities.add(consumed_key)
         applied = True
         reason: str | None = None
         if intent.effect_type == "DAMAGE":
@@ -475,11 +628,21 @@ def resolve_effects(
                 raise ValueError("STATE_SET intent requires a state key")
             state_updates.append(
                 StateUpdate(
-                    ability_instance_id=intent.ability_instance_id,
+                    ability_instance_id=(
+                        intent.state_ability_instance_id
+                        if intent.state_scope == "ABILITY"
+                        else None
+                    ),
+                    seat=intent.target_seat if intent.state_scope == "SEAT" else None,
+                    scope=intent.state_scope or "ABILITY",
                     skill_id=intent.skill_id,
                     key=intent.state_key,
                     value=intent.value,
                     source_request_id=intent.source_request_id,
+                    source_rule_id=intent.source_rule_id,
+                    source_ability_instance_id=intent.ability_instance_id,
+                    expiry_policy=intent.state_expiry_policy or "NEVER",
+                    authorized_targets=intent.authorized_targets,
                 )
             )
         elif intent.effect_type == "SET_CAN_VOTE":
@@ -490,6 +653,139 @@ def resolve_effects(
                 raise ValueError("CONSUME_ABILITY requires a target seat and non-empty ability ID")
         elif intent.effect_type == "FACT":
             facts.append(_fact_from_intent(intent, observation=observation))
+        elif intent.effect_type == "PLAYER_FIELD_SET":
+            if intent.target_seat is None or intent.player_field is None:
+                raise ValueError("PLAYER_FIELD_SET requires target, field, and value")
+            player_updates.append(
+                PlayerFieldUpdate(
+                    seat=intent.target_seat,
+                    player_field=intent.player_field,
+                    value=intent.value,
+                    source_request_id=intent.source_request_id,
+                    source_rule_id=intent.source_rule_id,
+                    source_skill_id=intent.skill_id,
+                    source_ability_instance_id=intent.ability_instance_id,
+                    authorized_targets=intent.authorized_targets,
+                )
+            )
+        elif intent.effect_type == "RESOURCE_DELTA":
+            if intent.target_seat is None or intent.resource_id is None or intent.delta is None:
+                raise ValueError("RESOURCE_DELTA requires target, resource, and delta")
+            resource_updates.append(
+                ResourceUpdate(
+                    seat=intent.target_seat,
+                    resource_id=intent.resource_id,
+                    delta=intent.delta,
+                    source_request_id=intent.source_request_id,
+                    source_rule_id=intent.source_rule_id,
+                    source_skill_id=intent.skill_id,
+                    source_ability_instance_id=intent.ability_instance_id,
+                    authorized_targets=intent.authorized_targets,
+                )
+            )
+        elif intent.effect_type in {"RELATION_ADD", "RELATION_REMOVE"}:
+            if (
+                intent.relation_type is None
+                or intent.relation_source_seat is None
+                or intent.relation_target_seat is None
+            ):
+                raise ValueError("relation operation requires type and both endpoints")
+            relation_id = _stable_id(
+                "relation",
+                intent.relation_type,
+                intent.relation_source_seat,
+                intent.relation_target_seat,
+            )
+            exists = relation_id in relation_ids
+            applied = (intent.effect_type == "RELATION_ADD" and not exists) or (
+                intent.effect_type == "RELATION_REMOVE" and exists
+            )
+            if not applied:
+                reason = "already_exists" if exists else "not_found"
+            else:
+                if intent.effect_type == "RELATION_ADD":
+                    relation_ids.add(relation_id)
+                else:
+                    relation_ids.remove(relation_id)
+                relation_updates.append(
+                    RelationUpdate(
+                        operation="ADD" if intent.effect_type == "RELATION_ADD" else "REMOVE",
+                        relation_id=relation_id,
+                        relation_type=intent.relation_type,
+                        source_seat=intent.relation_source_seat,
+                        target_seat=intent.relation_target_seat,
+                        expiry_policy=intent.relation_expiry_policy,
+                        source_request_id=intent.source_request_id,
+                        source_rule_id=intent.source_rule_id,
+                        source_skill_id=intent.skill_id,
+                        source_ability_instance_id=intent.ability_instance_id,
+                        authorized_targets=intent.authorized_targets,
+                    )
+                )
+        elif intent.effect_type in {"ABILITY_GRANT", "ABILITY_REVOKE"}:
+            if (
+                intent.target_seat is None
+                or intent.grant_skill_id is None
+                or intent.grant_id is None
+            ):
+                raise ValueError("ability update requires target, skill, and grant")
+            ability_grant_key = (intent.target_seat, intent.grant_skill_id, intent.grant_id)
+            if intent.effect_type == "ABILITY_GRANT":
+                if ability_grant_key in existing_abilities:
+                    applied = False
+                    reason = "already_granted"
+                else:
+                    existing_abilities.add(ability_grant_key)
+                    granted_id = intent.granted_ability_instance_id
+                    if not granted_id:
+                        raise ValueError("ABILITY_GRANT requires a stable granted instance ID")
+                    ability_updates.append(
+                        AbilityUpdate(
+                            operation="GRANT",
+                            target_seat=intent.target_seat,
+                            skill_id=intent.grant_skill_id,
+                            grant_id=intent.grant_id,
+                            ability_instance_id=granted_id,
+                            source_request_id=intent.source_request_id,
+                            source_rule_id=intent.source_rule_id,
+                            source_skill_id=intent.skill_id,
+                            source_ability_instance_id=intent.ability_instance_id,
+                            authorized_targets=intent.authorized_targets,
+                        )
+                    )
+            elif ability_grant_key not in existing_abilities:
+                applied = False
+                reason = "not_granted"
+            else:
+                existing_abilities.remove(ability_grant_key)
+                ability_updates.append(
+                    AbilityUpdate(
+                        operation="REVOKE",
+                        target_seat=intent.target_seat,
+                        skill_id=intent.grant_skill_id,
+                        grant_id=intent.grant_id,
+                        source_request_id=intent.source_request_id,
+                        source_rule_id=intent.source_rule_id,
+                        source_skill_id=intent.skill_id,
+                        source_ability_instance_id=intent.ability_instance_id,
+                        authorized_targets=intent.authorized_targets,
+                    )
+                )
+        elif intent.effect_type == "FLOW":
+            if intent.flow_action is None:
+                raise ValueError("FLOW intent requires a typed action")
+            flow_updates.append(
+                FlowUpdate(
+                    action=intent.flow_action,
+                    window_id=intent.window_id,
+                    logical_window_id=intent.logical_window_id,
+                    hook_id=intent.hook_id,
+                    source_request_id=intent.source_request_id,
+                    source_rule_id=intent.source_rule_id,
+                    source_skill_id=intent.skill_id,
+                    source_ability_instance_id=intent.ability_instance_id,
+                )
+            )
         resolved.append(
             ResolvedEffect(
                 effect_id=intent.effect_id,
@@ -499,8 +795,41 @@ def resolve_effects(
                 reason=reason,
                 source_request_id=intent.source_request_id,
                 source_rule_id=intent.source_rule_id,
+                skill_id=intent.skill_id,
+                ability_instance_id=intent.ability_instance_id,
+                actor_seat=intent.actor_seat,
                 value=intent.value,
                 tags=intent.tags,
+                authorized_targets=intent.authorized_targets,
+                player_field=intent.player_field,
+                resource_id=intent.resource_id,
+                delta=intent.delta,
+                relation_type=intent.relation_type,
+                relation_id=(
+                    _stable_id(
+                        "relation",
+                        intent.relation_type,
+                        intent.relation_source_seat,
+                        intent.relation_target_seat,
+                    )
+                    if intent.effect_type in {"RELATION_ADD", "RELATION_REMOVE"}
+                    else intent.relation_id
+                ),
+                relation_source_seat=intent.relation_source_seat,
+                relation_target_seat=intent.relation_target_seat,
+                relation_expiry_policy=intent.relation_expiry_policy,
+                grant_skill_id=intent.grant_skill_id,
+                grant_id=intent.grant_id,
+                granted_ability_instance_id=intent.granted_ability_instance_id,
+                state_scope=intent.state_scope,
+                state_ability_instance_id=intent.state_ability_instance_id,
+                state_expiry_policy=intent.state_expiry_policy,
+                flow_action=intent.flow_action,
+                trigger_occurrence_id=intent.trigger_occurrence_id,
+                source_fact_id=intent.source_fact_id,
+                window_id=intent.window_id,
+                logical_window_id=intent.logical_window_id,
+                hook_id=intent.hook_id,
             )
         )
 
@@ -540,6 +869,7 @@ def resolve_effects(
                     "tags": tuple(sorted(causal_tags)),
                     "deceased": True,
                 },
+                state_declarations=package.state_declarations,
             )
             context["target"] = target_player
             if not evaluate_predicate(rule.when, context):
@@ -578,9 +908,22 @@ def resolve_effects(
         state_updates=tuple(
             sorted(
                 state_updates,
-                key=lambda item: (item.ability_instance_id, item.key, item.source_request_id),
+                key=lambda item: (
+                    item.scope,
+                    item.skill_id,
+                    item.ability_instance_id or "",
+                    item.seat or 0,
+                    item.key,
+                    item.source_request_id,
+                    item.source_rule_id,
+                ),
             )
         ),
+        player_updates=tuple(player_updates),
+        resource_updates=tuple(resource_updates),
+        relation_updates=tuple(relation_updates),
+        ability_updates=tuple(ability_updates),
+        flow_updates=tuple(flow_updates),
         mortality=tuple(mortality),
         outcomes=tuple(outcomes),
         facts=tuple(sorted(facts, key=lambda item: (item.fact_type, item.fact_id))),
@@ -603,12 +946,45 @@ def _projection_context(
     request: SkillRequest,
     skill: SkillSpec,
     target_seat: int | None,
+    state_declarations: Sequence[StateDeclaration] = (),
     item: object | None = None,
 ) -> dict[str, object]:
+    state: dict[str, object] = {
+        declaration.key: declaration.initial
+        for declaration in state_declarations
+        if declaration.skill_id == skill.skill_id
+    }
+    state.update(
+        {
+            value.key: value.value
+            for value in observation.state_values
+            if value.skill_id == skill.skill_id
+            and (
+                value.scope == "GAME"
+                or (value.scope == "SEAT" and value.seat == request.actor_seat)
+                or (
+                    value.scope == "ABILITY"
+                    and value.ability_instance_id == request.ability_instance_id
+                )
+            )
+        }
+    )
+    state.update(
+        {
+            value.key: value.value
+            for value in observation.skill_state
+            if value.ability_instance_id == request.ability_instance_id
+            and value.skill_id == skill.skill_id
+        }
+    )
     return {
         "observation": observation,
         "actor": _player(observation, request.actor_seat),
         "target": _player(observation, target_seat),
+        "source_fact": next(
+            (fact for fact in observation.facts if fact.fact_id == request.source_fact_id),
+            None,
+        ),
         "request": {
             "request_id": request.request_id,
             "action_code": request.action_code,
@@ -616,15 +992,16 @@ def _projection_context(
             "actor_seat": request.actor_seat,
             "target_count": len(request.targets),
             "parameters": request.parameters,
+            "window_id": request.window_id,
+            "logical_window_id": request.logical_window_id,
+            "hook_id": request.hook_id,
         },
         "request_targets": tuple(
-            player for seat in request.targets if (player := _player(observation, seat)) is not None
+            player
+            for seat in sorted(request.targets)
+            if (player := _player(observation, seat)) is not None
         ),
-        "skill_state": {
-            state.key: state.value
-            for state in observation.skill_state
-            if state.ability_instance_id == request.ability_instance_id
-        },
+        "skill_state": state,
         "skill": skill,
         "item": item,
     }
@@ -694,6 +1071,7 @@ def _build_projection(
     skill: SkillSpec,
     observation: RuleObservation,
     target_seat: int | None,
+    state_declarations: Sequence[StateDeclaration] = (),
     death_cause: str | None = None,
     item: object | None = None,
 ) -> DisclosureProjection | None:
@@ -702,6 +1080,7 @@ def _build_projection(
         request=request,
         skill=skill,
         target_seat=target_seat,
+        state_declarations=state_declarations,
         item=item,
     )
     if not evaluate_predicate(getattr(disclosure, "condition"), context):
@@ -765,6 +1144,7 @@ def project_disclosures(
                 skill=skill,
                 observation=observation,
                 target_seat=target_seat,
+                state_declarations=package.state_declarations,
             )
             if projection is not None:
                 projections.append(projection)
@@ -792,6 +1172,7 @@ def project_disclosures(
                 skill=skill,
                 observation=observation,
                 target_seat=activation.target_seat,
+                state_declarations=package.state_declarations,
                 death_cause=activation.death_cause,
                 item=item,
             )

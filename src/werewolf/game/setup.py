@@ -30,7 +30,7 @@ from werewolf.knowledge.board import BoardDefinition
 from werewolf.knowledge.compiler import CompiledKnowledgePackage
 from werewolf.knowledge.preview import experimental_preview_enabled
 from werewolf.knowledge.refs import VersionedRef
-from werewolf.knowledge.role import Faction, RoleDefinition, TriggerMode, TriggerType
+from werewolf.knowledge.role import Faction, RoleDefinition, TriggerType
 from werewolf.rules.models import ExecutionPackage, PlayerObservation, RuleObservation
 from werewolf.rules.selectors import select_seats
 
@@ -380,17 +380,12 @@ def build_ability_instances(
                 "ACTIVE",
             )
         for trigger_grant in player.granted_trigger_abilities:
-            # Automatic triggers never open player request windows. Keep them
-            # in GrantedTriggerAbility state for the authoritative lifecycle
-            # reducer, but only materialize player-choice triggers as
-            # requestable execution instances.
-            if trigger_grant.trigger.mode is TriggerMode.PLAYER_CHOICE:
-                legacy_grants[(seat, trigger_grant.action_code)] = (
-                    trigger_grant.ability_id,
-                    int(trigger_grant.consumed),
-                    trigger_grant.consumed,
-                    "TRIGGER",
-                )
+            legacy_grants[(seat, trigger_grant.action_code)] = (
+                trigger_grant.ability_id,
+                int(trigger_grant.consumed),
+                trigger_grant.consumed,
+                "TRIGGER",
+            )
 
     instances: list[AbilityInstanceState] = []
     for skill in execution_package.skills:
@@ -410,6 +405,8 @@ def build_ability_instances(
                 uses_consumed = legacy[1] if legacy is not None else 0
                 consumed = legacy[2] if legacy is not None else False
                 grant_kind = legacy[3] if legacy is not None else "ACTIVE"
+                if skill.trigger is not None:
+                    grant_kind = "TRIGGER"
                 instances.append(
                     AbilityInstanceState(
                         ability_instance_id=f"seat-{seat}-{ability_grant.grant_id}",
@@ -424,7 +421,10 @@ def build_ability_instances(
                     )
                 )
     instance_codes = {(item.actor_seat, item.action_code) for item in instances}
-    missing_legacy = set(legacy_grants) - instance_codes
+    # Action code 0 is a legacy read-only/control binding rather than an
+    # executable skill. PASS is likewise a shared action, not a synthetic
+    # grant. Neither one needs a per-skill instance in the frozen package.
+    missing_legacy = {item for item in set(legacy_grants) - instance_codes if item[1] != 0}
     if missing_legacy:
         missing = sorted(f"{seat}:{code}" for seat, code in missing_legacy)
         raise RoleAssignmentError(

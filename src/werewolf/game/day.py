@@ -468,14 +468,31 @@ class DayCoordinator:
             raise DayCoordinatorError(
                 "PHASE_NOT_ALLOWED", f"speech requires {expected_phase.value}"
             )
+        if (
+            not is_pk
+            and state.current_queue == ()
+            and self._ordinary_speech_already_committed(state)
+        ):
+            raise DayCoordinatorError(
+                "SPEECH_COMPLETE", "ordinary speech queue for this round is already exhausted"
+            )
         if queue is None:
-            seats = tuple(seat for seat, player in sorted(state.players.items()) if player.alive)
-            sheriff = self._board.day_flow.sheriff
-            sheriff_seat = state.sheriff_seat
-            if sheriff.final_speech and sheriff_seat in seats:
-                seats = tuple(seat for seat in seats if seat != sheriff_seat) + (sheriff_seat,)
-            if is_pk and self._pk_candidates:
-                seats = self._pk_candidates
+            if state.current_queue:
+                # A hook or process restart may resume partway through an
+                # already-installed ordinary queue.  Reuse that persisted
+                # suffix instead of reconstructing and installing the full
+                # seat order a second time.
+                seats = tuple(state.current_queue)
+            else:
+                seats = tuple(
+                    seat for seat, player in sorted(state.players.items()) if player.alive
+                )
+                sheriff = self._board.day_flow.sheriff
+                sheriff_seat = state.sheriff_seat
+                if sheriff.final_speech and sheriff_seat in seats:
+                    seats = tuple(seat for seat in seats if seat != sheriff_seat) + (sheriff_seat,)
+                if is_pk and self._pk_candidates:
+                    seats = self._pk_candidates
         else:
             seats = tuple(queue.seats if isinstance(queue, TurnQueue) else queue)
         if not seats:
@@ -514,12 +531,43 @@ class DayCoordinator:
             state = await self._manager.snapshot()
             if state.phase not in {GamePhase.DAY_SPEECH, GamePhase.VOTE_PK_SPEECH}:
                 raise DayCoordinatorError("PHASE_NOT_ALLOWED", "no speech phase is active")
+            if (
+                state.phase is GamePhase.DAY_SPEECH
+                and state.current_queue == ()
+                and self._ordinary_speech_already_committed(state)
+            ):
+                raise DayCoordinatorError(
+                    "SPEECH_COMPLETE", "ordinary speech queue for this round is already exhausted"
+                )
             await self.open_speech(is_pk=state.phase is GamePhase.VOTE_PK_SPEECH)
         assert self._speech_scheduler is not None
         try:
             return await self._speech_scheduler.run_next()
         except SerialTurnError as exc:
             raise DayCoordinatorError("SPEECH_FAILED", str(exc)) from exc
+
+    @staticmethod
+    def _ordinary_speech_already_committed(state: GameState) -> bool:
+        """Recognize an exhausted ordinary queue after moderator restart."""
+
+        for raw_event in state.events:
+            event = raw_event
+            if isinstance(raw_event, Mapping):
+                try:
+                    event = GameEvent.model_validate_json(json.dumps(raw_event))
+                except (TypeError, ValueError):
+                    continue
+            if (
+                isinstance(event, GameEvent)
+                and event.event_type is EventType.SPEECH
+                and event.phase is GamePhase.DAY_SPEECH
+                and event.round_no == state.round_no
+                and getattr(event.payload, "speaker_seat", None) is not None
+                and isinstance(event.correlation_id, str)
+                and "-last-words-" not in event.correlation_id
+            ):
+                return True
+        return False
 
     async def retry_speech(self) -> SerialSpeechResult:
         if self._speech_scheduler is None:

@@ -36,6 +36,7 @@ class _LastWordsSource:
     source_id: str
     seats: tuple[int, ...]
     phase: GamePhase
+    rule_boundary_id: str | None = None
 
 
 _COMPLETION_RE = re.compile(r"^source=([^;]+);seat=([1-9][0-9]*)$")
@@ -83,12 +84,67 @@ def _source_for(state: GameState, board: BoardDefinition) -> _LastWordsSource | 
     policy = board.day_flow.last_words
     if not policy.enabled:
         return None
+    if state.execution_identity is not None:
+        eligible_phases = {
+            GamePhase.DAY_RESOLVE,
+            GamePhase.DAY_ANNOUNCE,
+            GamePhase.DAY_SPEECH,
+            GamePhase.SHERIFF_ELECTION_SPEECH,
+            GamePhase.SHERIFF_ELECTION,
+            GamePhase.SHERIFF_ELECTION_PK_SPEECH,
+            GamePhase.SHERIFF_ELECTION_PK,
+            GamePhase.SHERIFF_TRANSFER,
+        }
+        if state.phase not in eligible_phases:
+            return None
+        cursor = state.rule_workflow_cursor
+        boundary = None
+        if cursor is not None and cursor.status != "IDLE" and cursor.pending_boundary_id:
+            pointed = next(
+                (
+                    item
+                    for item in state.rule_boundaries
+                    if item.boundary_id == cursor.pending_boundary_id
+                ),
+                None,
+            )
+            if pointed is not None and pointed.is_pending:
+                boundary = pointed
+            elif pointed is not None:
+                # A just-completed boundary can remain in the cursor until
+                # the workflow advances. If another typed boundary is already
+                # pending in the same source chain, that boundary owns the
+                # next eligible speech turn.
+                boundary = next(
+                    (item for item in state.rule_boundaries if item.is_pending),
+                    pointed,
+                )
+        if boundary is None:
+            boundary = next((item for item in state.rule_boundaries if item.is_pending), None)
+        if boundary is not None:
+            pending = tuple(
+                seat
+                for seat in boundary.last_words_seats
+                if seat not in boundary.last_words_completed_seats
+            )
+            if boundary.last_words_required and pending:
+                return _LastWordsSource(
+                    boundary.boundary_id,
+                    pending,
+                    state.phase,
+                    rule_boundary_id=boundary.boundary_id,
+                )
+            # This boundary owns last words for the current death workflow.
+            # Once its spoken seats are complete, do not rediscover those same
+            # deaths through legacy exile/night sources before the workflow
+            # returns and clears its pending boundary cursor.
+            return None
     if state.phase in {GamePhase.DAY_RESOLVE, GamePhase.TRIGGER_ACTION}:
-        pending = state.pending_resolution
-        if state.phase is GamePhase.TRIGGER_ACTION and isinstance(pending, dict):
-            if pending.get("operation") == "DAY_EXILE":
+        pending_resolution = state.pending_resolution
+        if state.phase is GamePhase.TRIGGER_ACTION and isinstance(pending_resolution, dict):
+            if pending_resolution.get("operation") == "DAY_EXILE":
                 return _exile_source(state, board)
-            if pending.get("operation") == "NIGHT_RESOLUTION":
+            if pending_resolution.get("operation") == "NIGHT_RESOLUTION":
                 seats = _night_death_seats(state, board)
                 return (
                     _LastWordsSource(f"night-r{state.round_no}", seats, state.phase)
@@ -140,6 +196,12 @@ class LastWordsFlow:
         return self._manager.state
 
     def _completed(self, source_id: str) -> set[int]:
+        boundary = next(
+            (item for item in self.state.rule_boundaries if item.boundary_id == source_id),
+            None,
+        )
+        if boundary is not None:
+            return set(boundary.last_words_completed_seats)
         completed: set[int] = set()
         for audit in self.state.moderator_audit:
             if not isinstance(audit, dict) or audit.get("operation") != "LAST_WORDS_COMPLETE":
@@ -178,7 +240,9 @@ class LastWordsFlow:
         source, pending = self._current()
         state = self.state
         queue = (
-            list(state.current_queue)
+            [seat for seat in source.seats if seat not in self._completed(source.source_id)]
+            if source is not None and source.rule_boundary_id is not None
+            else list(state.current_queue)
             if self._source_id is not None and state.current_queue is not None
             else []
         )
@@ -209,6 +273,7 @@ class LastWordsFlow:
                 state.phase is not source.phase
                 or "-last-words-s" not in active.logical_request_id
                 or active.seat not in pending
+                or active.rule_boundary_id != source.rule_boundary_id
             ):
                 raise LastWordsError("LAST_WORDS_TURN_CONFLICT: another serial turn is active")
             self._source_id = source.source_id
@@ -219,10 +284,11 @@ class LastWordsFlow:
                     timeout_seconds=self._timeout_seconds,
                     phase=state.phase,
                     logical_label="last-words",
+                    rule_boundary_id=source.rule_boundary_id,
                 )
             return
         current_queue = state.current_queue
-        if current_queue is not None and current_queue != ():
+        if source.rule_boundary_id is None and current_queue is not None and current_queue != ():
             if tuple(current_queue) != pending:
                 raise LastWordsError("LAST_WORDS_QUEUE_CONFLICT: another serial queue is active")
         self._scheduler = SerialTurnScheduler(
@@ -231,9 +297,12 @@ class LastWordsFlow:
             timeout_seconds=self._timeout_seconds,
             phase=source.phase,
             logical_label="last-words",
+            rule_boundary_id=source.rule_boundary_id,
         )
         current_queue = state.current_queue
-        if current_queue in (None, ()):
+        if source.rule_boundary_id is not None:
+            await self._scheduler.start()
+        elif current_queue in (None, ()):
             await self._scheduler.start(TurnQueue(pending))
         self._source_id = source.source_id
 
@@ -244,12 +313,17 @@ class LastWordsFlow:
         await self._ensure_scheduler(source, pending)
         assert self._scheduler is not None
         current = await self._manager.snapshot()
-        if not current.current_queue:
+        current_head = (
+            pending[0]
+            if source.rule_boundary_id is not None
+            else current.current_queue[0]
+            if current.current_queue
+            else None
+        )
+        if current_head is None:
             raise LastWordsError("LAST_WORDS_COMPLETE: the last words queue is exhausted")
-        if seat is not None and seat != current.current_queue[0]:
-            raise LastWordsError(
-                f"SEAT_NOT_AT_HEAD: last words seat {current.current_queue[0]} is next"
-            )
+        if seat is not None and seat != current_head:
+            raise LastWordsError(f"SEAT_NOT_AT_HEAD: last words seat {current_head} is next")
         try:
             result = await self._scheduler.run_next()
         except SerialTurnError as exc:
