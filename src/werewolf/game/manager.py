@@ -10500,10 +10500,26 @@ class GameManager:
                     raise EventCommitError(
                         f"VICTORY_BLOCKED: seat {seat} still has an in-flight delivery cursor"
                     )
+            if isinstance(state.sheriff_badge, Mapping) and state.sheriff_badge.get(
+                "status"
+            ) == "OPEN":
+                raise EventCommitError("VICTORY_BLOCKED: a sheriff badge choice is still pending")
+            if self._execution_package is not None and self._rules is not None:
+                if board.victory.mode == "declarative" and state.execution_identity != (
+                    self._rules.identity
+                ):
+                    raise EventCommitError(
+                        "VICTORY_BLOCKED: execution identity does not match the manager package"
+                    )
 
             # This call also verifies that ``board`` is a published,
             # human-reviewed, frozen ruleset matching the game state.
-            evaluation = evaluate_victory(state, board, role_groups=role_groups)
+            evaluation = evaluate_victory(
+                state,
+                board,
+                role_groups=role_groups,
+                execution_package=self._execution_package,
+            )
             candidate_sides = tuple(dict.fromkeys(evaluation.candidate_sides))
 
             if evaluation.status == "ONGOING":
@@ -10527,6 +10543,17 @@ class GameManager:
                         "VICTORY_INVALID: moderator winner does not match the evaluator"
                     )
                 selected_winner = evaluation.winner
+                target_phase = GamePhase.FINISHED
+            elif evaluation.status == "DRAW":
+                if evaluation.winner is not None or len(candidate_sides) < 2:
+                    raise EventCommitError(
+                        "VICTORY_INVALID: DRAW evaluation requires multiple top-priority sides"
+                    )
+                if moderator_winner is not None:
+                    raise EventCommitError(
+                        "VICTORY_INVALID: a declared draw cannot be rewritten by the moderator"
+                    )
+                selected_winner = None
                 target_phase = GamePhase.FINISHED
             elif evaluation.status == "PENDING_MODERATOR":
                 if moderator_winner is None:
@@ -10555,7 +10582,22 @@ class GameManager:
                 raise EventCommitError(f"PHASE_INVALID: {exc}") from exc
 
             data = _state_data(candidate)
-            if selected_winner is None:
+            if evaluation.status == "DRAW":
+                data["winner"] = {
+                    "status": "DRAW",
+                    "side": None,
+                    "condition": None,
+                    "candidates": [
+                        {"side": item.side, "condition": item.condition}
+                        for item in evaluation.candidates
+                    ],
+                    "reasons": list(evaluation.reasons),
+                    "resolved_by": "evaluator",
+                    "base_revision": revision,
+                    "committed_revision": candidate.state_revision,
+                    "created_at": commit_time.isoformat(),
+                }
+            elif selected_winner is None:
                 data["winner"] = None
             else:
                 selected_candidate = next(
@@ -10693,6 +10735,17 @@ class GameManager:
             _revision_check(state, revision)
             if state.phase is not GamePhase.DAY_ANNOUNCE:
                 raise EventCommitError("PHASE_MISMATCH: night victory check requires DAY_ANNOUNCE")
+            if state.run_status in {
+                RunStatus.PAUSED,
+                RunStatus.FAILED,
+                RunStatus.CLOSED,
+            }:
+                raise EventCommitError(
+                    "VICTORY_BLOCKED: night victory check is unavailable while game is "
+                    f"{state.run_status.value}"
+                )
+            if state.current_queue:
+                raise EventCommitError("VICTORY_BLOCKED: a serial turn queue is still active")
             if state.pending_resolution is not None or state.serial_turn is not None:
                 raise EventCommitError("VICTORY_BLOCKED: an action is still pending")
             if self._rule_work_blocks_lifecycle(state):
@@ -10701,36 +10754,102 @@ class GameManager:
                 )
             if state.winner is not None:
                 raise EventCommitError("VICTORY_ALREADY_RECORDED: winner is already present")
-            evaluation = evaluate_victory(state, board, role_groups=role_groups)
+            if self._execution_package is not None and self._rules is not None:
+                if board.victory.mode == "declarative" and state.execution_identity != (
+                    self._rules.identity
+                ):
+                    raise EventCommitError(
+                        "VICTORY_BLOCKED: execution identity does not match the manager package"
+                    )
+            if isinstance(state.sheriff_badge, Mapping) and state.sheriff_badge.get(
+                "status"
+            ) == "OPEN":
+                raise EventCommitError(
+                    "VICTORY_BLOCKED: a sheriff badge choice is still pending"
+                )
+            active_request_statuses = {
+                "OPEN",
+                "REQUESTED",
+                "SUBMITTING",
+                "IN_FLIGHT",
+                "PENDING",
+            }
+            for request_id, raw_request in state.action_requests.items():
+                if not isinstance(raw_request, Mapping):
+                    raise EventCommitError(
+                        f"VICTORY_BLOCKED: action request {request_id!r} is malformed"
+                    )
+                status = raw_request.get("status")
+                if not isinstance(status, str) or status.upper() in active_request_statuses:
+                    raise EventCommitError(
+                        f"VICTORY_BLOCKED: action request {request_id!r} is still active"
+                    )
+            for window_id, raw_window in state.action_windows.items():
+                try:
+                    window = _load_action_window(raw_window)
+                except ValueError as exc:
+                    raise EventCommitError(
+                        f"VICTORY_BLOCKED: action window {window_id!r} is malformed"
+                    ) from exc
+                if window.is_open:
+                    raise EventCommitError(
+                        f"VICTORY_BLOCKED: action window {window_id!r} is still open"
+                    )
+            if any(player.current_request_id is not None for player in state.players.values()):
+                raise EventCommitError("VICTORY_BLOCKED: a player has an active action request")
+            if any(
+                cursor.in_flight_request_id is not None or cursor.in_flight_event_ids
+                for cursor in state.delivery_cursors.values()
+            ):
+                raise EventCommitError("VICTORY_BLOCKED: a delivery cursor is still in flight")
+            evaluation = evaluate_victory(
+                state,
+                board,
+                role_groups=role_groups,
+                execution_package=self._execution_package,
+            )
             candidates = tuple(dict.fromkeys(evaluation.candidate_sides))
             if evaluation.status == "ONGOING":
                 if evaluation.winner is not None or candidates:
                     raise EventCommitError("VICTORY_INVALID: ongoing evaluation has a candidate")
                 return state
-            # Ambiguous board outcomes continue through the normal daytime
-            # boundary where the moderator may choose a candidate explicitly.
-            if evaluation.status != "WINNER":
+            # Moderator-pending outcomes continue through the ordinary
+            # victory boundary. A declared DRAW is already terminal and is
+            # committed here just like an unambiguous winner.
+            if evaluation.status not in {"WINNER", "DRAW"}:
                 return state
-            if evaluation.winner is None or candidates != (evaluation.winner,):
+            if evaluation.status == "WINNER" and (
+                evaluation.winner is None or candidates != (evaluation.winner,)
+            ):
                 raise EventCommitError(
                     "VICTORY_INVALID: winner boundary is not uniquely identified"
                 )
-            selected = next(
-                item for item in evaluation.candidates if item.side == evaluation.winner
+            if evaluation.status == "DRAW" and (
+                evaluation.winner is not None or len(candidates) < 2
+            ):
+                raise EventCommitError(
+                    "VICTORY_INVALID: DRAW boundary requires multiple top-priority sides"
+                )
+            selected = (
+                next(item for item in evaluation.candidates if item.side == evaluation.winner)
+                if evaluation.status == "WINNER"
+                else None
             )
             data = _state_data(state)
             commit_revision = revision + 1
             data["phase"] = GamePhase.FINISHED
             data["winner"] = {
-                "status": "WINNER",
-                "side": selected.side,
-                "condition": selected.condition,
+                "status": evaluation.status,
+                "side": selected.side if selected is not None else None,
+                "condition": selected.condition if selected is not None else None,
                 "candidates": [
                     {"side": item.side, "condition": item.condition}
                     for item in evaluation.candidates
                 ],
                 "reasons": list(evaluation.reasons),
-                "resolved_by": "night_boundary",
+                "resolved_by": (
+                    "night_boundary" if evaluation.status == "WINNER" else "evaluator"
+                ),
                 "base_revision": revision,
                 "committed_revision": commit_revision,
                 "created_at": timestamp.isoformat(),
@@ -10740,7 +10859,7 @@ class GameManager:
                 {
                     "operation": "NIGHT_VICTORY_CHECK",
                     "status": evaluation.status,
-                    "winner": selected.side,
+                    "winner": selected.side if selected is not None else None,
                     "candidates": [
                         {"side": item.side, "condition": item.condition}
                         for item in evaluation.candidates
@@ -10763,7 +10882,7 @@ class GameManager:
                     reference = await snapshot_writer(candidate_state)
                 except Exception as exc:
                     raise EventCommitError(
-                        "VICTORY_SNAPSHOT_FAILED: night winner could not be snapshotted"
+                        "VICTORY_SNAPSHOT_FAILED: night result could not be snapshotted"
                     ) from exc
                 required = {
                     "snapshot_id",

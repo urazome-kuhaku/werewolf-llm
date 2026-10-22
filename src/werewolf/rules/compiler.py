@@ -18,7 +18,6 @@ from werewolf.domain.victory_rules import (
     VictoryExpr,
     VictoryGameState,
     VictoryLiteral,
-    VictoryProgram,
 )
 from werewolf.knowledge.package_loader import KnowledgePackage
 from werewolf.knowledge.refs import VersionedRef

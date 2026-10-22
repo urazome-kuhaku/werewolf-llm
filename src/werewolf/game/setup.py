@@ -316,6 +316,14 @@ def build_role_assignment_plan(
             f"expected {dict(board.factions)!r}, got {faction_counts!r}"
         )
 
+    victory_definition = getattr(board, "victory", None)
+    victory_program = getattr(victory_definition, "program", None)
+    victory_groups = getattr(victory_program, "player_groups", {})
+    if victory_program is not None and set(victory_groups) != set(binding_ids):
+        raise RoleAssignmentError(
+            "declarative victory player groups must cover every bound role exactly"
+        )
+
     random_source = random.Random(seed)
     random_source.shuffle(role_records)
     players = {
@@ -323,11 +331,7 @@ def build_role_assignment_plan(
             seat=seat,
             role_id=role_id,
             faction_id=faction_id,
-            victory_group_id=(
-                board.victory.program.player_groups[role_id]
-                if board.victory.program is not None
-                else faction_id
-            ),
+            victory_group_id=victory_groups.get(role_id, faction_id),
             chat_group_ids=chat_groups_by_role.get(role_id, ()),
             skill_resources=resources,
             granted_abilities=active_abilities,

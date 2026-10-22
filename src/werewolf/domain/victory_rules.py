@@ -2,13 +2,76 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Literal, TypeAlias, get_origin
+from collections.abc import Iterable
+from typing import Annotated, Literal, NoReturn, Protocol, TypeAlias, TypeVar, get_origin, overload
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 
 Identifier = Annotated[str, Field(min_length=1, max_length=128, strict=True)]
 VictoryCount = Annotated[int, Field(ge=0, le=64, strict=True)]
 VictoryPriority = Annotated[int, Field(ge=-1_000_000, le=1_000_000, strict=True)]
+_T = TypeVar("_T")
+_KT = TypeVar("_KT")
+_VT_co = TypeVar("_VT_co", covariant=True)
+
+
+class _SupportsKeysAndGetItem(Protocol[_KT, _VT_co]):
+    def keys(self) -> Iterable[_KT]: ...
+
+    def __getitem__(self, key: _KT, /) -> _VT_co: ...
+
+
+class _FrozenStringMap(dict[str, str]):
+    """A JSON-serializable role map that rejects in-place mutation."""
+
+    @staticmethod
+    def _immutable() -> NoReturn:
+        raise TypeError("victory program mappings are immutable")
+
+    def __setitem__(self, key: str, value: str) -> None:
+        del key, value
+        self._immutable()
+
+    def __delitem__(self, key: str) -> None:
+        del key
+        self._immutable()
+
+    def clear(self) -> None:
+        self._immutable()
+
+    @overload
+    def pop(self, key: str, /) -> str: ...
+
+    @overload
+    def pop(self, key: str, default: str, /) -> str: ...
+
+    @overload
+    def pop(self, key: str, default: _T, /) -> str | _T: ...
+
+    def pop(self, key: str, default: object = None, /) -> object:
+        del key, default
+        self._immutable()
+
+    def popitem(self) -> NoReturn:
+        self._immutable()
+
+    def setdefault(self, key: str, default: str = "") -> NoReturn:
+        del key, default
+        self._immutable()
+
+    def update(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        self._immutable()
+
+    @overload  # type: ignore[override,misc]
+    def __ior__(self, value: _SupportsKeysAndGetItem[str, str], /) -> _FrozenStringMap: ...
+
+    @overload
+    def __ior__(self, value: Iterable[tuple[str, str]], /) -> _FrozenStringMap: ...
+
+    def __ior__(self, value: object, /) -> _FrozenStringMap:  # type: ignore[misc]
+        del value
+        self._immutable()
 
 
 class VictoryRuleModel(BaseModel):
@@ -132,7 +195,7 @@ class VictoryProgram(VictoryRuleModel):
         object.__setattr__(
             self,
             "player_groups",
-            dict(sorted(self.player_groups.items())),
+            _FrozenStringMap(sorted(self.player_groups.items())),
         )
         object.__setattr__(
             self,

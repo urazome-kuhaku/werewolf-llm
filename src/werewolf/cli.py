@@ -15,7 +15,11 @@ from werewolf.cli_support.diagnostics import (
     verify_archive_path,
 )
 from werewolf.cli_support.play_setup import PlaySetupError, build_play_setup
+from werewolf.cli_support.scenario_cli import execute_scenario
+from werewolf.domain.scenario import ScenarioError
 from werewolf.knowledge.preview import experimental_preview
+from werewolf.moderator.play_runner import PlayRunnerError
+from werewolf.moderator.scenario_runner import ScenarioRunError
 
 app = typer.Typer(
     name="werewolf",
@@ -28,11 +32,13 @@ rules_app = typer.Typer(help="Published rules diagnostics.", no_args_is_help=Tru
 pi_app = typer.Typer(help="Pi runtime diagnostics.", no_args_is_help=True)
 archive_app = typer.Typer(help="Game archive diagnostics.", no_args_is_help=True)
 play_app = typer.Typer(help="Experimental playable game setup.", no_args_is_help=True)
+scenario_app = typer.Typer(help="Run declarative scenario gates.", no_args_is_help=True)
 app.add_typer(config_app, name="config")
 app.add_typer(rules_app, name="rules")
 app.add_typer(pi_app, name="pi")
 app.add_typer(archive_app, name="archive")
 app.add_typer(play_app, name="play")
+app.add_typer(scenario_app, name="scenario")
 
 
 def _report_or_exit(
@@ -240,6 +246,36 @@ def play_run(
         typer.echo(f"play run failed: {str(exc)[:500]}", err=True)
         raise typer.Exit(code=1) from None
     typer.echo(json_report(summary))
+
+
+@scenario_app.command("run")
+def scenario_run(
+    config_file: Annotated[Path, typer.Option("--config", help="Playable game.yaml.")],
+    scenario_file: Annotated[Path, typer.Option("--scenario", help="Closed YAML/JSON scenario.")],
+    output_path: Annotated[Path, typer.Option("--output", help="Report file or output directory.")],
+    experimental_preview_enabled: Annotated[
+        bool,
+        typer.Option(
+            "--experimental-preview",
+            help="Run an explicitly marked pending-review candidate package.",
+        ),
+    ] = False,
+) -> None:
+    """Run one data-only scenario through real player sessions and the game manager."""
+
+    try:
+        report = execute_scenario(
+            config_file,
+            scenario_file,
+            output_path,
+            experimental_preview_enabled=experimental_preview_enabled,
+        )
+    except (ScenarioError, ScenarioRunError, PlayRunnerError, OSError, ValueError) as exc:
+        typer.echo(f"scenario run failed: {str(exc)[:500]}", err=True)
+        raise typer.Exit(code=1) from None
+    typer.echo(json_report(report))
+    if report.get("status") != "PASS":
+        raise typer.Exit(code=1)
 
 
 @app.command()

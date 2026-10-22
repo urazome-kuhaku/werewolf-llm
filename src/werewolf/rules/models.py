@@ -11,7 +11,7 @@ import hashlib
 import json
 import unicodedata
 from collections.abc import Iterable
-from typing import Annotated, Any, Literal, Never, Self, SupportsIndex, TypeAlias, get_origin
+from typing import Annotated, Any, Literal, Never, Self, SupportsIndex, TypeAlias, cast, get_origin
 
 from pydantic import (
     BaseModel,
@@ -494,7 +494,7 @@ class ExecutionPackage(RuleModel):
 
     @model_serializer(mode="wrap")
     def serialize_legacy_shape(self, handler: Any) -> dict[str, object]:
-        data = handler(self)
+        data = cast(dict[str, object], handler(self))
         if self.victory_program is None:
             data.pop("victory_program", None)
         return data

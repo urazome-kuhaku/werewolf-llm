@@ -1180,6 +1180,35 @@ class ModeratorShell:
             "requires_moderator": bool(getattr(evaluation, "requires_moderator", False)),
         }
 
+    @staticmethod
+    def _committed_victory_payload(state: GameState) -> dict[str, object]:
+        """Serialize the authoritative result written by the manager."""
+
+        winner = state.winner
+        if not isinstance(winner, Mapping):
+            return {"status": "UNKNOWN", "winner": None, "candidate_sides": []}
+        raw_candidates = winner.get("candidates")
+        candidates = (
+            [
+                {"side": item["side"], "condition": item["condition"]}
+                for item in raw_candidates
+                if isinstance(item, Mapping)
+                and isinstance(item.get("side"), str)
+                and isinstance(item.get("condition"), str)
+            ]
+            if isinstance(raw_candidates, (list, tuple))
+            else []
+        )
+        raw_reasons = winner.get("reasons")
+        return {
+            "status": winner.get("status", "UNKNOWN"),
+            "winner": winner.get("side"),
+            "candidate_sides": list(dict.fromkeys(item["side"] for item in candidates)),
+            "candidates": candidates,
+            "reasons": list(raw_reasons) if isinstance(raw_reasons, (list, tuple)) else [],
+            "requires_moderator": False,
+        }
+
     def _evaluate_victory(self) -> dict[str, object]:
         manager, board = self._require_victory_runtime()
         try:
@@ -1187,6 +1216,7 @@ class ModeratorShell:
                 manager.state,
                 board,
                 role_groups=self._victory_role_groups(),
+                execution_package=manager.execution_package,
             )
         except (TypeError, ValueError) as exc:
             raise ModeratorError(str(exc)) from exc
@@ -1264,10 +1294,11 @@ class ModeratorShell:
                 )
             except (EventCommitError, TypeError, ValueError) as exc:
                 raise ModeratorError(str(exc)) from exc
-            victory = self._evaluate_victory()
-            if committed.winner is not None:
-                victory["status"] = "WINNER"
-                victory["winner"] = committed.winner.get("side")
+            victory = (
+                self._committed_victory_payload(committed)
+                if committed.winner is not None
+                else self._evaluate_victory()
+            )
             payload = self._status_payload(private=False)
             payload["victory"] = victory
             return payload
@@ -1302,13 +1333,11 @@ class ModeratorShell:
         except (EventCommitError, TypeError, ValueError) as exc:
             raise ModeratorError(str(exc)) from exc
 
-        victory = self._evaluate_victory()
-        if committed.winner is not None:
-            # A moderator-resolved PENDING result is now a committed winner;
-            # do not expose the stale pure-evaluation status in the command
-            # response.
-            victory["status"] = "WINNER"
-            victory["winner"] = committed.winner.get("side")
+        victory = (
+            self._committed_victory_payload(committed)
+            if committed.winner is not None
+            else self._evaluate_victory()
+        )
         payload = self._status_payload(private=False)
         payload["victory"] = victory
         return payload

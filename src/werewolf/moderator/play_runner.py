@@ -172,6 +172,8 @@ class ClassicPlayRunner:
         max_rounds: int = 20,
         output: PublicProgress | None = None,
         sheriff_candidates: tuple[int, ...] | None = None,
+        runtime_factory: Callable[..., object] | None = None,
+        command_budget: int | None = None,
     ) -> None:
         if type(max_rounds) is not int or max_rounds < 1 or max_rounds > 10_000:
             raise ValueError("max_rounds must be an integer between 1 and 10000")
@@ -179,10 +181,19 @@ class ClassicPlayRunner:
         self.max_rounds = max_rounds
         self.output = output
         self.sheriff_candidates = sheriff_candidates
-        self.shell = ModeratorShell(self.config_path)
+        if command_budget is not None and (
+            type(command_budget) is not int or not 1 <= command_budget <= 100_000
+        ):
+            raise ValueError("command_budget must be an integer between 1 and 100000")
+        self.command_budget = command_budget
+        self.command_count = 0
+        self.shell = ModeratorShell(self.config_path, runtime_factory=runtime_factory)
         self._public_event_ids: set[int] = set()
 
     async def command(self, line: str) -> Mapping[str, object]:
+        if self.command_budget is not None and self.command_count >= self.command_budget:
+            raise PlayRunnerError("moderator command budget exhausted")
+        self.command_count += 1
         try:
             result = await self.shell.execute(line)
         except ModeratorError as exc:
@@ -720,6 +731,8 @@ async def run_game(
     experimental_preview: bool = False,
     output: PublicProgress | None = None,
     sheriff_candidates: tuple[int, ...] | None = None,
+    runtime_factory: Callable[..., object] | None = None,
+    command_budget: int | None = None,
 ) -> dict[str, object]:
     """Run one complete game through the production moderator shell."""
 
@@ -728,6 +741,8 @@ async def run_game(
         max_rounds=max_rounds,
         output=output,
         sheriff_candidates=sheriff_candidates,
+        runtime_factory=runtime_factory,
+        command_budget=command_budget,
     ).run(experimental_preview_enabled=experimental_preview)
 
 

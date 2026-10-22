@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, Sequence
 from datetime import date
-from typing import Annotated, Any, Literal, Self
+from typing import Annotated, Any, Literal, Self, cast
 
 from pydantic import (
     AliasChoices,
@@ -20,8 +20,8 @@ from pydantic import (
     Field,
     StringConstraints,
     field_validator,
-    model_validator,
     model_serializer,
+    model_validator,
 )
 
 from werewolf.domain.enums import GamePhase
@@ -168,7 +168,7 @@ class VictoryDefinition(_StrictBoardModel):
 
     @model_serializer(mode="wrap")
     def serialize_legacy_shape(self, handler: Any) -> dict[str, object]:
-        data = handler(self)
+        data = cast(dict[str, object], handler(self))
         if self.program is None:
             data.pop("program", None)
         return data
