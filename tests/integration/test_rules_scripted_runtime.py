@@ -37,7 +37,7 @@ from werewolf.knowledge.package_loader import KnowledgePackageLoader
 from werewolf.knowledge.role import TargetKind, TargetRule, UsageLimit
 from werewolf.knowledge.service import KnowledgeService
 from werewolf.moderator.night_flow import ModeratorNightFlow
-from werewolf.moderator.shell import ModeratorError, ModeratorShell
+from werewolf.moderator.shell import ModeratorShell
 from werewolf.persistence import GameArchiveStore, GameSnapshotStore
 from werewolf.rules.compiler import validate_execution_package
 from werewolf.rules.models import ExecutionPackage
@@ -821,7 +821,7 @@ def _write_declarative_victory_package(published_root: Path) -> None:
     assert isinstance(execution, dict)
     execution["state_declarations"] = [
         {
-            "skill_id": "victory-state",
+            "skill_id": NOVEL_SKILL_ID,
             "key": "draw_gate",
             "value_type": "bool",
             "initial": True,
@@ -878,12 +878,64 @@ async def test_experimental_declarative_draw_runs_through_gateway_and_archives_c
         await shell.next()
         assert shell.manager is not None
         assert shell.state.phase is GamePhase.NIGHT_TEAM_CHAT
-        shell.manager._state = shell.state.model_copy(update={"phase": GamePhase.VICTORY_CHECK})
 
-        with pytest.raises(ModeratorError, match="declared draw cannot be rewritten"):
-            await shell.execute("victory check wolf")
-        assert shell.state.phase is GamePhase.VICTORY_CHECK
-        checked = await shell.execute("victory check")
+        await shell.execute("night open")
+        await shell.execute("night team next")
+        await shell.execute("night advance")
+        assert shell.state.phase is GamePhase.NIGHT_ACTION
+        assert shell.session_service is not None
+        oracle_seat = next(
+            seat
+            for seat, player in shell.state.players.items()
+            if player.role_id == SOURCE_ORACLE_ROLE_ID
+        )
+        oracle_runtime = cast(DemoRuntime, shell.session_service.runtimes[oracle_seat])
+        skill_status = await oracle_runtime._read_skill_status()
+        novel_ability = next(
+            item for item in skill_status["abilities"] if item["skill_id"] == NOVEL_SKILL_ID
+        )
+        assert novel_ability["target_rule"]["max_targets"] == 1
+        assert novel_ability["parameters"][0]["choices"] == ["strike"]
+
+        await shell.execute("night open")
+        action_window = next(
+            ActionWindow.model_validate_json(json.dumps(raw))
+            for raw in shell.state.action_windows.values()
+            if isinstance(raw, dict) and raw.get("phase") == GamePhase.NIGHT_ACTION.value
+        )
+        assert action_window.allowed_seats == (oracle_seat,)
+        assert NOVEL_ACTION_CODE in action_window.allowed_action_codes
+        action_result = await shell.execute(f"night action next {oracle_seat}")
+        assert action_result is not None
+        stored_request = next(
+            payload
+            for payload in shell.state.action_requests.values()
+            if isinstance(payload, dict) and payload.get("seat") == oracle_seat
+        )
+        action = stored_request["actions"][0]
+        assert action["action_code"] == NOVEL_ACTION_CODE
+        assert len(action["targets"]) == 1
+        assert action["parameters"] == {"mode": "strike"}
+        assert oracle_runtime.requests
+
+        await shell.execute("night advance")
+        await shell.execute("night open")
+        await shell.execute("night auto-resolve")
+        assert shell.state.phase is GamePhase.DAY_ANNOUNCE
+        assert shell.state.ability_instances[0].uses_consumed == 1
+        assert shell.state.rule_ledger[0].history_updates[0].targets == tuple(
+            sorted(action["targets"])
+        )
+        confirmed_request = shell.state.action_requests[stored_request["request_id"]]
+        assert confirmed_request["status"] == "CONFIRMED"
+        assert confirmed_request["actions"][0]["action_code"] == NOVEL_ACTION_CODE
+        refreshed_skill_status = await oracle_runtime._read_skill_status()
+        assert any(
+            item["skill_id"] == NOVEL_SKILL_ID
+            for item in refreshed_skill_status["abilities"]
+        )
+
+        checked = await shell.execute("victory night-check")
         assert checked is not None
         assert checked["victory"]["status"] == "DRAW"  # type: ignore[index]
         assert checked["victory"]["winner"] is None  # type: ignore[index]

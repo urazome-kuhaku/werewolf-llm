@@ -73,6 +73,12 @@ class _ScenarioPlayRunner(ClassicPlayRunner):
             pre_state=pre_state,
             post_state=post_state,
         )
+        if self.shell.manager is not None:
+            if line.strip().lower() == "start":
+                self._scenario_evidence.initial_granted_skill_ids.update(
+                    item.skill_id for item in self.shell.state.ability_instances
+                )
+            self._scenario_evidence.confirm_player_steps(self.shell.state)
         return result
 
 
@@ -212,6 +218,9 @@ async def run_scenario(
                 if archive_evidence is not None
                 else None
             )
+            live_snapshot_ref = (
+                live_final_state.last_snapshot if live_final_state is not None else None
+            )
             if (
                 live_final_state is None
                 or archived_state.game_id != live_final_state.game_id
@@ -220,10 +229,22 @@ async def run_scenario(
                 or archived_state.phase != live_final_state.phase
                 or archived_state.run_status != live_final_state.run_status
                 or archived_state.winner != live_final_state.winner
-                or archived_digest != _state_digest(live_final_state)
+                or not isinstance(live_snapshot_ref, Mapping)
+                or live_snapshot_ref.get("snapshot_id")
+                != (archive_evidence.get("final_snapshot_id") if archive_evidence else None)
+                or live_snapshot_ref.get("state_revision") != archived_state.state_revision
+                or live_snapshot_ref.get("manifest_sha256")
+                != (
+                    archive_evidence.get("final_snapshot_manifest_sha256")
+                    if archive_evidence
+                    else None
+                )
+                or archived_digest != _state_digest(archived_state)
+                or _state_digest(archived_state, ignore_snapshot_reference=True)
+                != _state_digest(live_final_state, ignore_snapshot_reference=True)
             ):
                 failures.append(
-                    "archived final snapshot does not match the live final state digest"
+                    "verified archive final snapshot does not match live game identity/state"
                 )
 
     if scenario.mode is ScenarioMode.FULL_GAME:
@@ -258,6 +279,7 @@ async def run_scenario(
         state=state,
         execution_package=manager.execution_package if manager is not None else None,
         player_turns=evidence.player_turns,
+        initial_granted_skill_ids=evidence.initial_granted_skill_ids,
         enforce_mandatory_coverage=enforce_mandatory_coverage,
     )
     failures.extend(coverage_failures)
@@ -278,6 +300,11 @@ async def run_scenario(
         "execution_digest": (
             state.execution_identity.execution_digest
             if state is not None and state.execution_identity is not None
+            else None
+        ),
+        "live_state_digest_without_snapshot_reference": (
+            _state_digest(live_final_state, ignore_snapshot_reference=True)
+            if live_final_state is not None
             else None
         ),
         "game_result": game_result,
@@ -373,6 +400,7 @@ def _skill_use_evidence(
     state: GameState | None,
     execution_package: object | None,
     player_turns: list[dict[str, object]],
+    initial_granted_skill_ids: set[str],
     enforce_mandatory_coverage: bool,
 ) -> tuple[
     list[dict[str, object]],
@@ -385,6 +413,11 @@ def _skill_use_evidence(
     if state is None or execution_package is None:
         return [], [], [], [], {}, ["skill coverage requires the frozen package and game ledger"]
     skills = tuple(getattr(execution_package, "skills", ()))
+    skills_by_id = {
+        str(getattr(skill, "skill_id")): skill
+        for skill in skills
+        if isinstance(getattr(skill, "skill_id", None), str)
+    }
     skill_modes = {
         str(getattr(skill, "skill_id")): str(getattr(skill, "mode", "PLAYER"))
         for skill in skills
@@ -405,12 +438,21 @@ def _skill_use_evidence(
         ):
             continue
         receipt_id = outer.get("rule_receipt_id")
-        matching_batches = {
-            entry.batch_id
-            for entry in state.rule_ledger
-            if entry.batch_id == receipt_id and outer_id in entry.request_ids
-        }
-        if not matching_batches:
+        group_id = outer.get("rule_group_id")
+        receipts = [item for item in state.rule_receipts if item.batch_id == receipt_id]
+        batches = [item for item in state.rule_ledger if item.batch_id == receipt_id]
+        if (
+            not isinstance(receipt_id, str)
+            or not isinstance(group_id, str)
+            or len(receipts) != 1
+            or len(batches) != 1
+            or receipts[0].package_id != getattr(execution_package, "package_id", None)
+            or batches[0].package_id != getattr(execution_package, "package_id", None)
+            or receipts[0].group_id != group_id
+            or batches[0].group_id != group_id
+            or outer_id not in receipts[0].request_ids
+            or outer_id not in batches[0].request_ids
+        ):
             continue
         for disposition in dispositions:
             if not isinstance(disposition, Mapping):
@@ -491,13 +533,30 @@ def _skill_use_evidence(
         skill for skill in scenario.required_skill_ids if skill_modes.get(skill) == "AUTOMATIC"
     }
     if enforce_mandatory_coverage:
-        # Runtime ability instances include both the initial role grants and
-        # any dynamic ABILITY_GRANT instances produced during this execution.
-        actually_granted = {item.skill_id for item in state.ability_instances}
-        required_player.update(
+        # The initial set comes from the real start boundary. Dynamic grants
+        # are derived from the entire frozen package so a scenario cannot
+        # omit a trigger chain and thereby shrink the gate's required set.
+        dynamic_grants = {
+            effect.grant_skill_id
+            for skill in skills
+            for effect in (*getattr(skill, "effects", ()), *getattr(skill, "pass_effects", ()))
+            if getattr(effect, "effect_type", None) == "ABILITY_GRANT"
+            and isinstance(getattr(effect, "grant_skill_id", None), str)
+        }
+        initial_player_grants = {
             skill_id
-            for skill_id, mode in skill_modes.items()
-            if mode == "PLAYER" and skill_id in actually_granted
+            for skill_id in initial_granted_skill_ids
+            if skill_modes.get(skill_id) == "PLAYER"
+            and getattr(skills_by_id.get(skill_id), "action_code", None) != 299
+        }
+        potential_dynamic_player_grants = {
+            skill_id
+            for skill_id in dynamic_grants
+            if skill_modes.get(skill_id) == "PLAYER"
+            and getattr(skills_by_id.get(skill_id), "action_code", None) != 299
+        }
+        required_player.update(
+            initial_player_grants | potential_dynamic_player_grants
         )
         required_automatic.update(
             skill_id for skill_id, mode in skill_modes.items() if mode == "AUTOMATIC"
@@ -540,9 +599,20 @@ def _skill_use_evidence(
     coverage: dict[str, object] = {
         "actually_granted_player_skill_ids": sorted(
             {
-                item.skill_id
-                for item in state.ability_instances
-                if skill_modes.get(item.skill_id) == "PLAYER"
+                skill_id
+                for skill_id in initial_granted_skill_ids
+                if skill_modes.get(skill_id) == "PLAYER"
+            }
+        ),
+        "potential_dynamic_player_skill_ids": sorted(
+            {
+                effect.grant_skill_id
+                for skill in skills
+                for effect in (*getattr(skill, "effects", ()), *getattr(skill, "pass_effects", ()))
+                if getattr(effect, "effect_type", None) == "ABILITY_GRANT"
+                and isinstance(getattr(effect, "grant_skill_id", None), str)
+                and skill_modes.get(effect.grant_skill_id) == "PLAYER"
+                and getattr(skills_by_id.get(effect.grant_skill_id), "action_code", None) != 299
             }
         ),
         "required_player_skill_ids": sorted(required_player),
@@ -718,10 +788,13 @@ def _state_summary(state: GameState) -> dict[str, object]:
     }
 
 
-def _state_digest(state: GameState) -> str:
+def _state_digest(state: GameState, *, ignore_snapshot_reference: bool = False) -> str:
+    data = state.model_dump(mode="json")
+    if ignore_snapshot_reference:
+        data.pop("last_snapshot", None)
     raw = (
         json.dumps(
-            state.model_dump(mode="json"),
+            data,
             allow_nan=False,
             ensure_ascii=False,
             separators=(",", ":"),

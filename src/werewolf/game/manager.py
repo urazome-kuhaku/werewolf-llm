@@ -2223,6 +2223,300 @@ class GameManager:
 
         return self._state
 
+    async def assert_private_checkpoint_waiting_choice(self, state: GameState) -> None:
+        """Validate one live, receipt-backed player-choice checkpoint boundary.
+
+        Callers must pass the exact immutable state reference returned by this
+        manager. Restored checkpoints run the same semantic checks on a
+        detached manager before replacing the active manager or sessions.
+        """
+
+        async with self._lock:
+            if state is not self._state:
+                raise EventCommitError("CHECKPOINT_STALE: state is no longer manager-current")
+            cursor = state.rule_workflow_cursor
+            if (
+                state.phase is not GamePhase.TRIGGER_ACTION
+                or cursor is None
+                or cursor.status != "WAITING_CHOICE"
+                or cursor.active_occurrence_id is None
+                or cursor.steps_used >= cursor.budget_limit
+                or state.serial_turn is not None
+                or state.pending_resolution is None
+            ):
+                raise EventCommitError("CHECKPOINT_BOUNDARY: no resumable player choice is active")
+            active = tuple(
+                item
+                for item in state.rule_trigger_queue
+                if item.status == "WAITING_CHOICE" and item.mode == "PLAYER_CHOICE"
+            )
+            if len(active) != 1 or active[0].occurrence_id != cursor.active_occurrence_id:
+                raise EventCommitError("CHECKPOINT_BOUNDARY: choice occurrence is ambiguous")
+            occurrence = active[0]
+            if occurrence.window_id is None:
+                raise EventCommitError("CHECKPOINT_BOUNDARY: choice has no physical action window")
+            raw_window = state.action_windows.get(occurrence.window_id)
+            if not isinstance(raw_window, Mapping):
+                raise EventCommitError("CHECKPOINT_BOUNDARY: choice window is missing")
+            try:
+                window = _load_action_window(raw_window)
+            except (TypeError, ValueError) as exc:
+                raise EventCommitError("CHECKPOINT_BOUNDARY: choice window is malformed") from exc
+            if (
+                window.closed_at is not None
+                or window.opened_at is None
+                or window.window_id not in cursor.active_window_ids
+                or window.allowed_seats != (occurrence.actor_seat,)
+                or window.submitted_request_ids
+                or self._rule_occurrence_for_window(state, window) != occurrence
+            ):
+                raise EventCommitError("CHECKPOINT_BOUNDARY: choice window is not manager-bound")
+            package = self._execution_package
+            rules = self._rules
+            instance = next(
+                (
+                    item
+                    for item in state.ability_instances
+                    if item.ability_instance_id == occurrence.ability_instance_id
+                ),
+                None,
+            )
+            skill = (
+                next((item for item in package.skills if item.skill_id == occurrence.skill_id), None)
+                if package is not None
+                else None
+            )
+            grant = (
+                next((item for item in skill.grants if item.grant_id == instance.grant_id), None)
+                if skill is not None and instance is not None
+                else None
+            )
+            if (
+                rules is None
+                or package is None
+                or instance is None
+                or skill is None
+                or grant is None
+                or instance.action_code != skill.action_code
+                or instance.actor_seat != occurrence.actor_seat
+                or instance.skill_id != occurrence.skill_id
+                or instance.grant_kind != ("TRIGGER" if occurrence.kind == "TRIGGER" else "ACTIVE")
+                or not instance.enabled
+                or instance.consumed
+                or self._rule_instance_capacity_reason(state, instance, skill) is not None
+            ):
+                raise EventCommitError("CHECKPOINT_BOUNDARY: ability grant is inactive or detached")
+            try:
+                observation = rules.observation(
+                    state,
+                    group_id=f"checkpoint-grant:{occurrence.occurrence_id}",
+                    timing=GamePhase.TRIGGER_ACTION.value,
+                )
+                eligible_seats = select_seats(grant.actor_selector, {"observation": observation})
+            except (RuleAdapterError, TypeError, ValueError) as exc:
+                raise EventCommitError("CHECKPOINT_BOUNDARY: ability grant selector failed") from exc
+            if occurrence.actor_seat not in eligible_seats:
+                raise EventCommitError("CHECKPOINT_BOUNDARY: actor is outside its frozen grant")
+            open_windows: list[ActionWindow] = []
+            for stored in state.action_windows.values():
+                if not isinstance(stored, Mapping):
+                    raise EventCommitError("CHECKPOINT_BOUNDARY: stored action window is malformed")
+                try:
+                    candidate = _load_action_window(stored)
+                except (TypeError, ValueError) as exc:
+                    raise EventCommitError("CHECKPOINT_BOUNDARY: stored action window is malformed") from exc
+                if candidate.opened_at is not None and candidate.closed_at is None:
+                    open_windows.append(candidate)
+            if len(open_windows) != 1 or open_windows[0].window_id != occurrence.window_id:
+                raise EventCommitError("CHECKPOINT_BOUNDARY: another physical window is open")
+            if any(player.current_request_id is not None for player in state.players.values()):
+                raise EventCommitError("CHECKPOINT_BOUNDARY: player request is still active")
+            if any(
+                cursor.in_flight_request_id is not None or cursor.in_flight_event_ids
+                for cursor in state.delivery_cursors.values()
+            ):
+                raise EventCommitError("CHECKPOINT_BOUNDARY: event delivery is still in flight")
+            if any(
+                not isinstance(request, Mapping)
+                or request.get("window_id") == occurrence.window_id
+                or not isinstance(request.get("status"), str)
+                or request.get("status", "").upper()
+                in {"OPEN", "REQUESTED", "SUBMITTING", "IN_FLIGHT", "PROCESSING", "PENDING"}
+                for request in state.action_requests.values()
+            ):
+                raise EventCommitError("CHECKPOINT_BOUNDARY: physical action request is in flight")
+            pending = state.pending_resolution
+            if (
+                not isinstance(pending, Mapping)
+                or pending.get("operation") != "RULE_TRIGGER"
+                or pending.get("status") != "RULE_TRIGGER_ACTION_REQUIRED"
+                or pending.get("occurrence_id") != occurrence.occurrence_id
+                or pending.get("window_id") != occurrence.window_id
+                or pending.get("source_fact_id") != occurrence.source_fact_id
+                or pending.get("actor_seat") != occurrence.actor_seat
+            ):
+                raise EventCommitError("CHECKPOINT_BOUNDARY: manager request is detached from choice")
+            if occurrence.kind == "TRIGGER":
+                self._assert_private_checkpoint_trigger_source(state, occurrence)
+
+    def _assert_private_checkpoint_trigger_source(
+        self,
+        state: GameState,
+        occurrence: RuleTriggerOccurrence,
+    ) -> None:
+        """Verify the exact ledger, receipt, request, and use provenance."""
+
+        package = self._execution_package
+        if package is None:
+            raise EventCommitError("CHECKPOINT_SOURCE: frozen execution package is missing")
+        ledgers = tuple(
+            entry
+            for entry in state.rule_ledger
+            if entry.batch_id == occurrence.source_batch_id
+            and any(fact.fact_id == occurrence.source_fact_id for fact in entry.facts)
+        )
+        if len(ledgers) != 1:
+            raise EventCommitError("CHECKPOINT_SOURCE: source fact has no unique rule ledger")
+        ledger = ledgers[0]
+        facts = tuple(fact for fact in ledger.facts if fact.fact_id == occurrence.source_fact_id)
+        if (
+            len(facts) != 1
+            or ledger.package_id != package.package_id
+            or ledger.committed_revision != ledger.read_revision + 1
+            or ledger.committed_revision > state.state_revision
+            or ledger.round_no != state.round_no
+            or len(set(ledger.request_ids)) != len(ledger.request_ids)
+        ):
+            raise EventCommitError("CHECKPOINT_SOURCE: source ledger identity is invalid")
+        receipts = tuple(receipt for receipt in state.rule_receipts if receipt.batch_id == ledger.batch_id)
+        if len(receipts) != 1:
+            raise EventCommitError("CHECKPOINT_SOURCE: source batch lacks a unique receipt")
+        receipt = receipts[0]
+        if (
+            receipt.package_id != ledger.package_id
+            or receipt.group_id != ledger.group_id
+            or receipt.timing != ledger.timing
+            or receipt.read_revision != ledger.read_revision
+            or receipt.committed_revision != ledger.committed_revision
+            or receipt.request_ids != ledger.request_ids
+            or receipt.outcome_digest != ledger.outcome_digest
+        ):
+            raise EventCommitError("CHECKPOINT_SOURCE: source receipt does not match its ledger")
+        fact = facts[0]
+        if ledger.request_ids:
+            disposition_matches: list[tuple[ActionRequest, Mapping[str, object]]] = []
+            for request_id in ledger.request_ids:
+                raw_request = state.action_requests.get(request_id)
+                if not isinstance(raw_request, Mapping):
+                    raise EventCommitError("CHECKPOINT_SOURCE: physical source request is missing")
+                try:
+                    request = _stored_action_request(state, request_id)
+                    window = self._window_for_request(state, request)
+                except (TypeError, ValueError, ResolutionError) as exc:
+                    raise EventCommitError("CHECKPOINT_SOURCE: physical source request is malformed") from exc
+                if (
+                    raw_request.get("request_id", request_id) != request_id
+                    or raw_request.get("status") != "CONFIRMED"
+                    or raw_request.get("rule_receipt_id") != ledger.batch_id
+                    or raw_request.get("rule_group_id") != ledger.group_id
+                    or window.closed_at is None
+                    or window.settlement_group_id != ledger.group_id
+                    or window.phase.value != ledger.timing
+                    or request.session_epoch != window.session_epoch
+                    or request.session_epoch != state.players[request.seat].session_epoch
+                ):
+                    raise EventCommitError("CHECKPOINT_SOURCE: physical source request is unconfirmed")
+                rows = raw_request.get("rule_dispositions")
+                if not isinstance(rows, (list, tuple)) or not rows:
+                    raise EventCommitError("CHECKPOINT_SOURCE: request has no rule disposition proof")
+                for row in rows:
+                    if not isinstance(row, Mapping):
+                        raise EventCommitError("CHECKPOINT_SOURCE: rule disposition is malformed")
+                    disposition_matches.append((request, row))
+            if fact.source_request_id is not None:
+                matches = tuple(
+                    (request, row)
+                    for request, row in disposition_matches
+                    if row.get("skill_request_id") == fact.source_request_id
+                )
+                if len(matches) != 1:
+                    raise EventCommitError("CHECKPOINT_SOURCE: fact source request is not uniquely bound")
+                request, row = matches[0]
+                action_index = row.get("action_index")
+                action_code = row.get("action_code")
+                ability_id = row.get("ability_instance_id")
+                skill_id = row.get("skill_id")
+                status = row.get("status")
+                if (
+                    type(action_index) is not int
+                    or not 0 <= action_index < len(request.actions)
+                    or type(action_code) is not int
+                    or request.actions[action_index].action_code != action_code
+                    or not isinstance(ability_id, str)
+                    or not isinstance(skill_id, str)
+                    or status not in {"ACCEPTED", "PASSED"}
+                    or (status == "PASSED") != (action_code == 299)
+                    or (fact.actor_seat is not None and request.seat != fact.actor_seat)
+                ):
+                    raise EventCommitError("CHECKPOINT_SOURCE: source request disposition is inconsistent")
+                source_skill = next((item for item in package.skills if item.skill_id == skill_id), None)
+                source_instance = next(
+                    (
+                        item
+                        for item in state.ability_instances
+                        if item.ability_instance_id == ability_id
+                        and item.skill_id == skill_id
+                        and item.actor_seat == request.seat
+                    ),
+                    None,
+                )
+                if source_skill is None or source_instance is None or source_skill.action_code != action_code:
+                    raise EventCommitError("CHECKPOINT_SOURCE: disposition skill binding is invalid")
+                histories = tuple(
+                    use for use in ledger.history_updates if use.request_id == fact.source_request_id
+                )
+                if histories:
+                    use = histories[0]
+                    if (
+                        len(histories) != 1
+                        or use.ability_instance_id != ability_id
+                        or use.skill_id != skill_id
+                        or use.action_code != action_code
+                        or use.actor_seat != request.seat
+                        or use.disposition != status
+                    ):
+                        raise EventCommitError("CHECKPOINT_SOURCE: use history disagrees with disposition")
+                if fact.source_rule_id is not None:
+                    declared_rules = {
+                        effect.effect_id
+                        for skill in package.skills
+                        for effect in (*skill.effects, *skill.pass_effects)
+                    } | {item.interaction_id for item in package.interactions}
+                    if fact.source_rule_id not in declared_rules:
+                        raise EventCommitError("CHECKPOINT_SOURCE: fact source rule is undeclared")
+            elif fact.data.get("source_request_ids"):
+                ids = fact.data.get("source_request_ids")
+                if not isinstance(ids, (list, tuple)) or any(
+                    not any(row.get("skill_request_id") == request_id for _, row in disposition_matches)
+                    for request_id in ids
+                ):
+                    raise EventCommitError("CHECKPOINT_SOURCE: causal request IDs are not receipt-bound")
+        else:
+            automatic_occurrences = tuple(
+                item
+                for item in state.rule_trigger_queue
+                if item.mode == "AUTOMATIC"
+                and item.status == "COMPLETED"
+                and receipt.occurrence_ids == (item.occurrence_id,)
+                and ledger.group_id == f"automatic-{item.occurrence_id}"
+            )
+            if (
+                ledger.timing != GamePhase.TRIGGER_ACTION.value
+                or len(automatic_occurrences) != 1
+                or fact.source_request_id != f"automatic-{automatic_occurrences[0].occurrence_id}"
+            ):
+                raise EventCommitError("CHECKPOINT_SOURCE: virtual automatic source lacks exact completion proof")
+
     def _rule_group_requests(
         self,
         state: GameState,

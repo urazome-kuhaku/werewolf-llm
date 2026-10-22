@@ -21,6 +21,8 @@ from werewolf.domain.scenario import (
     build_host_command,
     load_scenario,
 )
+from werewolf.game.state import GameState
+from werewolf.moderator.scenario_runner import _state_digest
 from werewolf.runtime.declarative_runtime import ScenarioRunEvidence, ScenarioRuntimeError
 from werewolf.runtime.player_runtime import (
     ActionWindowView,
@@ -296,4 +298,20 @@ def test_host_step_consumption_needs_success_and_post_state_proof() -> None:
         post_state=state,
     )
     assert succeeded.required_unconsumed() == []
+
+
+def test_snapshot_reference_normalization_preserves_other_authoritative_differences() -> None:
+    now = datetime(2026, 10, 22, tzinfo=UTC)
+    archived = GameState(game_id="game-1", created_at=now, updated_at=now)
+    live = archived.model_copy(
+        update={"last_snapshot": {"snapshot_id": "final", "state_revision": 0}}
+    )
+    assert _state_digest(archived, ignore_snapshot_reference=True) == _state_digest(
+        live, ignore_snapshot_reference=True
+    )
+
+    drifted = live.model_copy(update={"day_no": 1})
+    assert _state_digest(archived, ignore_snapshot_reference=True) != _state_digest(
+        drifted, ignore_snapshot_reference=True
+    )
 

@@ -22,7 +22,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import Final, cast
+from typing import TYPE_CHECKING, Final, cast
 
 from werewolf.domain.enums import GamePhase
 from werewolf.game.actions import ActionRegistry, ActionWindow
@@ -33,6 +33,9 @@ from werewolf.knowledge.refs import VersionedRef
 from werewolf.knowledge.runtime_loader import load_runtime_knowledge_bundle_from_snapshot
 from werewolf.knowledge.snapshot import KnowledgeSnapshotBuilder
 from werewolf.rules.models import ExecutionPackage
+
+if TYPE_CHECKING:
+    from werewolf.game.manager import GameManager
 
 CHECKPOINT_SCHEMA_VERSION: Final = 1
 CHECKPOINT_DIRECTORY: Final = "checkpoints"
@@ -233,9 +236,9 @@ def _identity_from_payload(value: object) -> PrivateCheckpointIdentity:
 
 def _request_is_in_flight(raw: object) -> bool:
     if not isinstance(raw, Mapping):
-        return False
+        return True
     status = raw.get("status")
-    return isinstance(status, str) and status.upper() in _ACTIVE_REQUEST_STATUSES
+    return not isinstance(status, str) or status.upper() in _ACTIVE_REQUEST_STATUSES
 
 
 def _state_identity(
@@ -363,6 +366,13 @@ def _validate_waiting_choice(state: GameState) -> None:
         raise PrivateCheckpointBoundaryError("waiting choice already has a physical action request")
     if any(_request_is_in_flight(raw) for raw in state.action_requests.values()):
         raise PrivateCheckpointBoundaryError("game has an in-flight physical action request")
+    if any(player.current_request_id is not None for player in state.players.values()):
+        raise PrivateCheckpointBoundaryError("game has a current physical request binding")
+    if any(
+        delivery.in_flight_request_id is not None or delivery.in_flight_event_ids
+        for delivery in state.delivery_cursors.values()
+    ):
+        raise PrivateCheckpointBoundaryError("game has an in-flight event delivery")
     player = state.players.get(occurrence.actor_seat)
     if player is None or player.session_epoch != window.session_epoch:
         raise PrivateCheckpointBoundaryError(
@@ -384,7 +394,8 @@ def _validate_waiting_choice(state: GameState) -> None:
         or ability.consumed
     ):
         raise PrivateCheckpointBoundaryError("waiting choice ability binding is not active")
-    if window.allowed_action_codes != (ability.action_code,):
+    expected_codes = (ability.action_code, 299) if window.allow_pass else (ability.action_code,)
+    if window.allowed_action_codes != expected_codes:
         raise PrivateCheckpointBoundaryError(
             "waiting choice window does not match its ability action"
         )
@@ -424,8 +435,12 @@ def _validate_waiting_choice(state: GameState) -> None:
         if (
             ledger.package_id != state_execution.package_id
             or receipt.package_id != ledger.package_id
+            or receipt.group_id != ledger.group_id
+            or receipt.timing != ledger.timing
+            or receipt.read_revision != ledger.read_revision
+            or receipt.committed_revision != ledger.committed_revision
             or receipt.request_ids != ledger.request_ids
-            or not ledger.request_ids
+            or receipt.outcome_digest != ledger.outcome_digest
         ):
             raise PrivateCheckpointBoundaryError(
                 "waiting choice source receipt is detached from its ledger"
@@ -694,6 +709,19 @@ async def _validate_detached_bundle(
             raise PrivateCheckpointIdentityError(
                 "runtime action registry does not match game state"
             )
+        from werewolf.game.manager import GameManager
+
+        try:
+            detached_manager = GameManager(
+                state,
+                registry=registry,
+                execution_package=execution,
+            )
+            await detached_manager.assert_private_checkpoint_waiting_choice(state)
+        except (TypeError, ValueError) as exc:
+            raise PrivateCheckpointBoundaryError(
+                "detached manager rejected the waiting-choice source proof"
+            ) from exc
         cursor = state.rule_workflow_cursor
         if cursor is None or cursor.active_occurrence_id is None:
             raise PrivateCheckpointBoundaryError(
@@ -1062,6 +1090,7 @@ class PrivateCheckpointStore:
         self,
         state: GameState,
         *,
+        manager: GameManager,
         knowledge_snapshot_manifest: Mapping[str, object],
         frozen_files: Mapping[str, bytes],
         identity: PrivateCheckpointIdentity | None = None,
@@ -1069,6 +1098,16 @@ class PrivateCheckpointStore:
     ) -> VerifiedPrivateCheckpoint:
         """Persist one verified ``WAITING_CHOICE`` state atomically."""
 
+        from werewolf.game.manager import GameManager as _GameManager
+
+        if not isinstance(manager, _GameManager):
+            raise TypeError("manager must be the authoritative GameManager for this state")
+        try:
+            await manager.assert_private_checkpoint_waiting_choice(state)
+        except ValueError as exc:
+            raise PrivateCheckpointBoundaryError(
+                "authoritative manager rejected the waiting-choice source proof"
+            ) from exc
         manifest_identity = knowledge_snapshot_manifest.get("package_identity")
         package_payload = frozen_files.get("package.json")
         execution_raw = frozen_files.get("execution.json")

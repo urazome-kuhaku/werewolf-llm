@@ -40,6 +40,7 @@ class ScenarioRunEvidence:
     gateway_reads: list[dict[str, object]] = field(default_factory=list)
     skill_queries: dict[int, int] = field(default_factory=dict)
     runtime_stats: dict[int, dict[str, object]] = field(default_factory=dict)
+    initial_granted_skill_ids: set[str] = field(default_factory=set)
     _turn_count: int = 0
     _host_cursor: int = 0
     _reserved_step_ids: dict[str, str] = field(default_factory=dict)
@@ -196,7 +197,6 @@ class ScenarioRunEvidence:
                 ],
             }
         )
-        self.abandon_turn_selection(request.request_id)
 
     def confirm_player_steps(self, state: object) -> None:
         """Mark scripted responses consumed only when the final state proves commit."""
@@ -226,7 +226,7 @@ class ScenarioRunEvidence:
                     if isinstance(action_requests, Mapping)
                     else None
                 )
-                confirmed = _confirmed_script_action(step, turn, raw)
+                confirmed = _confirmed_script_action(step, turn, raw, state)
             elif kind == ResponseKind.SPEECH.value:
                 logical_request_id = turn.get("logical_request_id")
                 confirmed = isinstance(logical_request_id, str) and any(
@@ -249,6 +249,19 @@ class ScenarioRunEvidence:
                 )
             if confirmed:
                 self.used_step_ids.add(step_id)
+                self.abandon_turn_selection(request_id)
+            elif kind == ResponseKind.ACTION.value:
+                raw = (
+                    action_requests.get(request_id)
+                    if isinstance(action_requests, Mapping)
+                    else None
+                )
+                if isinstance(raw, Mapping) and raw.get("status") in {
+                    "CONFIRMED",
+                    "OVERRIDDEN",
+                    "CANCELLED",
+                }:
+                    self.abandon_turn_selection(request_id)
 
     def steps_report(self) -> list[dict[str, object]]:
         return [
@@ -352,6 +365,7 @@ class DeclarativeRuntime(DemoRuntime):
         self._evidence.begin_turn()
         context = self._require_context()
         self._selected_steps[request.request_id] = None
+        recorded = False
         if request.expected_kind is ResponseKind.READY:
             self._selected_steps[request.request_id] = self._evidence.select_player_step(
                 request,
@@ -393,10 +407,12 @@ class DeclarativeRuntime(DemoRuntime):
                 role_id=context.role_id or "",
                 step=self._selected_steps.get(request.request_id),
             )
+            recorded = True
             return result
         finally:
             self._active_request_id = None
-            self._evidence.abandon_turn_selection(request.request_id)
+            if not recorded:
+                self._evidence.abandon_turn_selection(request.request_id)
             self._selected_steps.pop(request.request_id, None)
 
 
@@ -407,7 +423,10 @@ def _nonnegative_int(value: object) -> int | None:
 
 
 def _confirmed_script_action(
-    step: PlayerTurnStep, turn: Mapping[str, object], raw_request: object
+    step: PlayerTurnStep,
+    turn: Mapping[str, object],
+    raw_request: object,
+    state: object,
 ) -> bool:
     if not isinstance(raw_request, Mapping) or raw_request.get("status") != "CONFIRMED":
         return False
@@ -429,6 +448,27 @@ def _confirmed_script_action(
     dispositions = raw_request.get("rule_dispositions", ())
     if not isinstance(dispositions, list | tuple):
         return False
+    receipt_id = raw_request.get("rule_receipt_id")
+    group_id = raw_request.get("rule_group_id")
+    outer_id = turn.get("request_id")
+    rule_receipts = getattr(state, "rule_receipts", ())
+    ledger = getattr(state, "rule_ledger", ())
+    package = getattr(state, "execution_identity", None)
+    if not isinstance(receipt_id, str) or not isinstance(group_id, str):
+        return False
+    matching_receipts = [item for item in rule_receipts if item.batch_id == receipt_id]
+    matching_ledgers = [item for item in ledger if item.batch_id == receipt_id]
+    if (
+        len(matching_receipts) != 1
+        or len(matching_ledgers) != 1
+        or matching_receipts[0].group_id != group_id
+        or matching_ledgers[0].group_id != group_id
+        or matching_receipts[0].package_id != getattr(package, "package_id", None)
+        or matching_ledgers[0].package_id != getattr(package, "package_id", None)
+        or outer_id not in matching_receipts[0].request_ids
+        or outer_id not in matching_ledgers[0].request_ids
+    ):
+        return False
     by_index = {
         item.get("action_index"): item
         for item in dispositions
@@ -443,7 +483,23 @@ def _confirmed_script_action(
         if (
             disposition.get("action_code") != action.get("action_code")
             or disposition.get("status") != "ACCEPTED"
+            or not isinstance(disposition.get("skill_request_id"), str)
         ):
+            return False
+        internal_id = disposition["skill_request_id"]
+        successful_uses = [
+            use
+            for use in matching_ledgers[0].history_updates
+            if use.request_id == internal_id
+            and use.skill_id == disposition.get("skill_id")
+            and use.action_code == action.get("action_code")
+            and use.actor_seat == turn.get("seat")
+            and use.ability_instance_id == disposition.get("ability_instance_id")
+            and use.successful
+            and not use.passed
+            and use.disposition == "ACCEPTED"
+        ]
+        if len(successful_uses) != 1:
             return False
     return True
 
@@ -479,6 +535,22 @@ def _host_post_state_proof(
         return None
     if post_state is None or not isinstance(post_state.get("game_id"), str):
         return None
+    if command == "new":
+        if (
+            pre_state is not None
+            or status != "ok"
+            or result.get("game_id") != post_state.get("game_id")
+            or post_state.get("phase") != "CREATED"
+            or post_state.get("run_status") != "READY"
+        ):
+            return None
+        return {
+            "status": status,
+            "game_id": post_state.get("game_id"),
+            "phase_after": post_state.get("phase"),
+            "run_status_after": post_state.get("run_status"),
+            "creation_proved": True,
+        }
     if pre_state is not None and pre_state.get("game_id") != post_state.get("game_id"):
         return None
     readonly = {

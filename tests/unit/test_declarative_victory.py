@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
+from werewolf.domain.enums import GamePhase
 from werewolf.domain.victory_rules import (
     VictoryAliveCount,
     VictoryBoolean,
@@ -12,8 +13,14 @@ from werewolf.domain.victory_rules import (
     VictoryLiteral,
     VictoryProgram,
 )
-from werewolf.game import GameManager, load_action_registry
-from werewolf.game.state import GameState, PlayerState
+from werewolf.game import EventCommitError, GameManager, load_action_registry
+from werewolf.game.state import (
+    GameState,
+    PlayerState,
+    RuleBoundary,
+    RuleReturnPoint,
+    RuleWorkflowCursor,
+)
 from werewolf.game.victory import RulesetMismatchError, evaluate_victory
 from werewolf.knowledge.board import BoardDefinition, VictoryDefinition
 from werewolf.knowledge.models import BoardRoleBinding
@@ -284,3 +291,141 @@ def test_victory_ast_rejects_unknown_expression_operations() -> None:
                 "conflict_policy": "DRAW",
             }
         )
+
+
+@pytest.mark.asyncio
+async def test_manager_commits_a_declarative_unique_winner() -> None:
+    program = _program(
+        VictoryCondition(
+            condition_id="wolf-wins",
+            side_id="wolf",
+            priority=3,
+            when=_always_true(),
+        )
+    )
+    manager = _manager(_execution(program))
+    manager._state = manager.state.model_copy(update={"phase": GamePhase.VICTORY_CHECK})
+
+    committed = await manager.commit_victory_check(_board(program), now=NOW)
+
+    assert committed.phase is GamePhase.FINISHED
+    assert committed.winner is not None
+    assert committed.winner["status"] == "WINNER"
+    assert committed.winner["side"] == "wolf"
+    assert committed.winner["resolved_by"] == "evaluator"
+
+
+@pytest.mark.asyncio
+async def test_manager_does_not_allow_moderator_to_rewrite_a_declared_draw() -> None:
+    program = _program(
+        VictoryCondition(
+            condition_id="wolf-condition",
+            side_id="wolf",
+            priority=4,
+            when=_always_true(),
+        ),
+        VictoryCondition(
+            condition_id="good-condition",
+            side_id="good",
+            priority=4,
+            when=_always_true(),
+        ),
+    )
+    manager = _manager(_execution(program))
+    manager._state = manager.state.model_copy(update={"phase": GamePhase.VICTORY_CHECK})
+    board = _board(program)
+
+    with pytest.raises(EventCommitError, match="declared draw cannot be rewritten"):
+        await manager.commit_victory_check(board, moderator_winner="wolf", now=NOW)
+
+    assert manager.state.phase is GamePhase.VICTORY_CHECK
+    assert manager.state.state_revision == 0
+    assert manager.state.winner is None
+
+    committed = await manager.commit_victory_check(board, now=NOW)
+
+    assert committed.phase is GamePhase.FINISHED
+    assert committed.winner is not None
+    assert committed.winner["status"] == "DRAW"
+    assert committed.winner["side"] is None
+
+
+@pytest.mark.asyncio
+async def test_pending_declarative_conflict_requires_an_explicit_candidate() -> None:
+    program = _program(
+        VictoryCondition(
+            condition_id="wolf-condition",
+            side_id="wolf",
+            priority=4,
+            when=_always_true(),
+        ),
+        VictoryCondition(
+            condition_id="good-condition",
+            side_id="good",
+            priority=4,
+            when=_always_true(),
+        ),
+        conflict_policy="PENDING_MODERATOR",
+    )
+    manager = _manager(_execution(program))
+    manager._state = manager.state.model_copy(update={"phase": GamePhase.VICTORY_CHECK})
+    board = _board(program)
+
+    with pytest.raises(EventCommitError, match="moderator_winner is required"):
+        await manager.commit_victory_check(board, now=NOW)
+    with pytest.raises(EventCommitError, match="explicit candidates"):
+        await manager.commit_victory_check(board, moderator_winner="neutral", now=NOW)
+
+    committed = await manager.commit_victory_check(board, moderator_winner="good", now=NOW)
+
+    assert committed.phase is GamePhase.FINISHED
+    assert committed.winner is not None
+    assert committed.winner["status"] == "WINNER"
+    assert committed.winner["side"] == "good"
+    assert committed.winner["resolved_by"] == "moderator"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocker", ["error_cursor", "pending_boundary", "badge_open"])
+async def test_manager_rejects_declarative_victory_with_unfinished_lifecycle_work(
+    blocker: str,
+) -> None:
+    program = _program(
+        VictoryCondition(
+            condition_id="wolf-wins",
+            side_id="wolf",
+            priority=3,
+            when=_always_true(),
+        )
+    )
+    manager = _manager(_execution(program))
+    updates: dict[str, object] = {"phase": GamePhase.VICTORY_CHECK}
+    if blocker == "error_cursor":
+        updates["rule_workflow_cursor"] = RuleWorkflowCursor(
+            status="ERROR",
+            error_code="RULE_WORKFLOW_BUDGET_EXHAUSTED",
+        )
+    elif blocker == "pending_boundary":
+        updates["rule_boundaries"] = (
+            RuleBoundary(
+                boundary_id="death-boundary",
+                source_group_id="resolve",
+                source_batch_id="batch-1",
+                death_fact_ids=("death-1",),
+                death_seats=(1,),
+                return_point=RuleReturnPoint(phase=GamePhase.NIGHT_RESOLVE),
+                last_words_required=True,
+                last_words_seats=(1,),
+                created_at=NOW,
+            ),
+        )
+    else:
+        updates["sheriff_badge"] = {"status": "OPEN"}
+    manager._state = manager.state.model_copy(update=updates)
+
+    with pytest.raises(EventCommitError, match="pending|choice"):
+        await manager.commit_victory_check(_board(program), now=NOW)
+
+    assert manager.state.phase is GamePhase.VICTORY_CHECK
+    assert manager.state.state_revision == 0
+    assert manager.state.winner is None
