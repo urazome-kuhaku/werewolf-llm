@@ -323,7 +323,11 @@ def build_role_assignment_plan(
             seat=seat,
             role_id=role_id,
             faction_id=faction_id,
-            victory_group_id=faction_id,
+            victory_group_id=(
+                board.victory.program.player_groups[role_id]
+                if board.victory.program is not None
+                else faction_id
+            ),
             chat_group_ids=chat_groups_by_role.get(role_id, ()),
             skill_resources=resources,
             granted_abilities=active_abilities,

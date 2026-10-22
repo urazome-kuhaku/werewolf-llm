@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, Sequence
 from datetime import date
-from typing import Annotated, Literal, Self
+from typing import Annotated, Any, Literal, Self
 
 from pydantic import (
     AliasChoices,
@@ -21,9 +21,11 @@ from pydantic import (
     StringConstraints,
     field_validator,
     model_validator,
+    model_serializer,
 )
 
 from werewolf.domain.enums import GamePhase
+from werewolf.domain.victory_rules import VictoryProgram
 
 from .models import BoardRoleBinding, ReadingPlan
 from .refs import VersionedRef
@@ -161,6 +163,15 @@ class VictoryDefinition(_StrictBoardModel):
     # host.  The board integrity validator below requires a non-empty map to
     # cover every bound role exactly once.
     role_groups: dict[LogicalId, Literal["wolf", "god", "villager"]] = Field(default_factory=dict)
+    # This is omitted when absent to preserve legacy package identities.
+    program: VictoryProgram | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_legacy_shape(self, handler: Any) -> dict[str, object]:
+        data = handler(self)
+        if self.program is None:
+            data.pop("program", None)
+        return data
 
     @field_validator("check_phases", mode="before")
     @classmethod
@@ -199,6 +210,14 @@ class VictoryDefinition(_StrictBoardModel):
     def validate_special_conditions(cls, value: list[str]) -> list[str]:
         _unique(list(value), "special_conditions")
         return value
+
+    @model_validator(mode="after")
+    def validate_program_mode(self) -> Self:
+        if self.mode == "declarative" and self.program is None:
+            raise ValueError("declarative victory mode requires a typed program")
+        if self.mode != "declarative" and self.program is not None:
+            raise ValueError("victory program requires declarative mode")
+        return self
 
     @property
     def victory_mode(self) -> str:
@@ -754,6 +773,23 @@ class BoardDefinition(_StrictBoardModel):
             if missing_role_ids:
                 raise ValueError(
                     "victory.role_groups is missing role IDs: " + ", ".join(missing_role_ids)
+                )
+
+        program = self.victory.program
+        if program is not None:
+            grouped_role_ids = set(program.player_groups)
+            bound_role_ids = set(role_ids)
+            unknown_grouped_roles = sorted(grouped_role_ids - bound_role_ids)
+            missing_grouped_roles = sorted(bound_role_ids - grouped_role_ids)
+            if unknown_grouped_roles:
+                raise ValueError(
+                    "victory.program.player_groups contains unknown role IDs: "
+                    + ", ".join(unknown_grouped_roles)
+                )
+            if missing_grouped_roles:
+                raise ValueError(
+                    "victory.program.player_groups is missing role IDs: "
+                    + ", ".join(missing_grouped_roles)
                 )
 
         all_dependencies = [binding.role_ref.format() for binding in self.role_bindings]

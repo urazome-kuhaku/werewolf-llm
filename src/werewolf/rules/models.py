@@ -11,9 +11,19 @@ import hashlib
 import json
 import unicodedata
 from collections.abc import Iterable
-from typing import Annotated, Literal, Never, Self, SupportsIndex, TypeAlias, get_origin
+from typing import Annotated, Any, Literal, Never, Self, SupportsIndex, TypeAlias, get_origin
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
+
+from werewolf.domain.victory_rules import VictoryProgram
 
 SeatNo = Annotated[int, Field(ge=1, le=64, strict=True)]
 NonNegativeInt = Annotated[int, Field(ge=0, strict=True)]
@@ -478,6 +488,16 @@ class ExecutionPackage(RuleModel):
     window_settlement_groups: dict[str, str] = Field(default_factory=dict)
     boundary_policy: BoundaryPolicy | None = None
     interactions: tuple[InteractionRule, ...] = ()
+    # Derived from the frozen board definition. Omit the absent value from
+    # legacy serialization so A/B execution identities remain unchanged.
+    victory_program: VictoryProgram | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_legacy_shape(self, handler: Any) -> dict[str, object]:
+        data = handler(self)
+        if self.victory_program is None:
+            data.pop("victory_program", None)
+        return data
 
     def model_post_init(self, __context: object) -> None:
         super().model_post_init(__context)

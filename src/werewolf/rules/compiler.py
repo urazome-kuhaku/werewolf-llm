@@ -11,6 +11,15 @@ from typing import TYPE_CHECKING, Literal, cast
 from pydantic import BaseModel, ValidationError
 
 from werewolf.domain.enums import GamePhase
+from werewolf.domain.victory_rules import (
+    VictoryAliveCount,
+    VictoryBoolean,
+    VictoryCompare,
+    VictoryExpr,
+    VictoryGameState,
+    VictoryLiteral,
+    VictoryProgram,
+)
 from werewolf.knowledge.package_loader import KnowledgePackage
 from werewolf.knowledge.refs import VersionedRef
 from werewolf.rules.predicates import validate_package_expressions
@@ -137,7 +146,15 @@ def player_field_values_from_board(
         role_ids=tuple(sorted(set(role_ids))),
         faction_ids=tuple(sorted(board.factions)),
         victory_group_ids=tuple(
-            sorted(set(board.factions).union(board.victory.role_groups.values()))
+            sorted(
+                set(board.factions)
+                .union(board.victory.role_groups.values())
+                .union(
+                    board.victory.program.player_groups.values()
+                    if board.victory.program is not None
+                    else ()
+                )
+            )
         ),
         chat_group_ids=tuple(sorted(set(chat_group_ids))),
     )
@@ -152,6 +169,8 @@ def compile_execution_definition(package: KnowledgePackage) -> CompiledExecution
     """
 
     if package.execution_definition is None:
+        if package.board.model.victory.mode == "declarative":
+            raise _error("declarative victory requires a package execution definition")
         if package.board_ref != VersionedRef(
             id="classic_12_seer_witch_hunter_idiot",
             version="1.0.0",
@@ -197,7 +216,14 @@ def compile_execution_definition(package: KnowledgePackage) -> CompiledExecution
             if execution_input["boundary_policy"] is not None:
                 raise _error("boundary_policy is derived from the frozen board definition")
             del execution_input["boundary_policy"]
+        if "victory_program" in execution_input:
+            if execution_input["victory_program"] is not None:
+                raise _error("victory_program is derived from the frozen board definition")
+            del execution_input["victory_program"]
         execution = ExecutionPackage.model_validate(execution_input)
+        execution = execution.model_copy(
+            update={"victory_program": package.board.model.victory.program}
+        )
         additions_raw = raw["action_definitions"]
         if not isinstance(additions_raw, Sequence) or isinstance(additions_raw, str | bytes):
             raise _error("execution.yaml action_definitions must be a list")
@@ -259,6 +285,7 @@ def compile_execution_definition(package: KnowledgePackage) -> CompiledExecution
     validate_execution_package(
         execution,
         merged,
+        board=package.board.model,
         available_windows=window_metadata,
         expected_boundary_policy=(boundary_policy if has_window_features else None),
         expected_player_field_values=(player_field_values if has_player_field_changes else None),
@@ -286,6 +313,7 @@ def validate_execution_package(
     execution: ExecutionPackage,
     registry: ActionRegistry,
     *,
+    board: BoardDefinition | None = None,
     role_ids: set[str] | None = None,
     available_windows: Sequence[ExecutionWindow] | None = None,
     expected_boundary_policy: BoundaryPolicy | None = None,
@@ -304,6 +332,8 @@ def validate_execution_package(
         raise TypeError("registry must be an ActionRegistry")
     if not isinstance(execution, ExecutionPackage):
         raise TypeError("execution must be an ExecutionPackage")
+
+    _validate_victory_program_binding(execution, board)
 
     try:
         validate_execution_actions(execution, registry)
@@ -537,6 +567,89 @@ def validate_execution_package(
 
     if role_ids is not None:
         _validate_execution_role_literals(execution, role_ids)
+
+
+def _validate_victory_program_binding(
+    execution: ExecutionPackage,
+    board: BoardDefinition | None,
+) -> None:
+    """Bind a typed victory program to its board and declared state schema."""
+
+    if board is None:
+        if execution.victory_program is not None:
+            raise _error("a frozen board is required for declarative victory")
+        return
+    board_program = board.victory.program
+    if board.victory.mode == "declarative":
+        if board_program is None or execution.victory_program != board_program:
+            raise _error("execution victory program disagrees with the frozen board")
+    elif board_program is not None or execution.victory_program is not None:
+        raise _error("execution victory program requires declarative board mode")
+    if board_program is None:
+        return
+
+    bound_roles = {binding.role_ref.id for binding in board.role_bindings}
+    if set(board_program.player_groups) != bound_roles:
+        raise _error("victory player_groups must cover every bound board role")
+    configured_sides = set(board.victory.winning_sides) | set(board.factions)
+    unknown_sides = sorted(
+        {condition.side_id for condition in board_program.conditions} - configured_sides
+    )
+    if unknown_sides:
+        raise _error("victory conditions reference unknown sides: " + ", ".join(unknown_sides))
+
+    faction_values = set(board.factions)
+    victory_group_values = set(board_program.player_groups.values())
+    if execution.player_field_values is not None:
+        faction_values.update(execution.player_field_values.faction_ids)
+        victory_group_values.update(execution.player_field_values.victory_group_ids)
+    state_declarations = tuple(
+        declaration
+        for declaration in execution.state_declarations
+        if declaration.scope == "GAME"
+    )
+
+    def expression_type(expression: VictoryExpr) -> str:
+        if isinstance(expression, VictoryLiteral):
+            return "bool" if type(expression.value) is bool else "int"
+        if isinstance(expression, VictoryAliveCount):
+            values = faction_values if expression.field == "faction_id" else victory_group_values
+            if expression.value not in values:
+                raise _error(
+                    f"victory count references unknown {expression.field} value "
+                    f"{expression.value!r}"
+                )
+            return "int"
+        if isinstance(expression, VictoryGameState):
+            matches = [item for item in state_declarations if item.key == expression.key]
+            if len(matches) != 1 or matches[0].value_type != "bool":
+                raise _error(
+                    f"victory state key {expression.key!r} must be declared once as GAME bool"
+                )
+            if type(matches[0].initial) is not bool:
+                raise _error(
+                    f"victory state key {expression.key!r} must have a boolean initial value"
+                )
+            return "bool"
+        if isinstance(expression, VictoryCompare):
+            left_type = expression_type(expression.left)
+            right_type = expression_type(expression.right)
+            if left_type != right_type:
+                raise _error("victory comparison operands must have the same type")
+            if expression.op not in {"eq", "ne"} and left_type != "int":
+                raise _error("ordered victory comparisons require integer operands")
+            return "bool"
+        if isinstance(expression, VictoryBoolean):
+            if any(expression_type(child) != "bool" for child in expression.values):
+                raise _error("victory boolean operators require boolean expressions")
+            return "bool"
+        raise _error("victory expression uses an unsupported node")
+
+    for condition in board_program.conditions:
+        if expression_type(condition.when) != "bool":
+            raise _error(
+                f"victory condition {condition.condition_id!r} must produce a boolean"
+            )
 
 
 def _validate_package_literals(execution: ExecutionPackage, package: KnowledgePackage) -> None:
