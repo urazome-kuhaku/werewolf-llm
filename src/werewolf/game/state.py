@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime
-from typing import Annotated, Literal, NoReturn
+from typing import Annotated, Any, Literal, NoReturn
 
 from pydantic import (
     BaseModel,
@@ -19,9 +19,11 @@ from pydantic import (
     JsonValue,
     field_serializer,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
+from werewolf.domain.admission import CatalogAdmission
 from werewolf.domain.enums import GamePhase, RunStatus
 from werewolf.knowledge.role import (
     ActionCode,
@@ -892,6 +894,7 @@ class GameState(_StrictModel):
     rule_state: tuple[RuleStateValue, ...] = ()
     # B adds typed relations and one durable trigger/workflow queue.  These
     # empty defaults preserve schema-1 A snapshots and manual legacy paths.
+    catalog_admission: CatalogAdmission | None = None
     rule_relations: tuple[RuleRelationValue, ...] = ()
     rule_deferred_disclosures: tuple[RuleDeferredDisclosure, ...] = ()
     rule_trigger_queue: tuple[RuleTriggerOccurrence, ...] = ()
@@ -938,6 +941,15 @@ class GameState(_StrictModel):
     moderator_audit: tuple[dict[str, JsonValue], ...] = ()
     winner: dict[str, JsonValue] | None = None
     last_snapshot: dict[str, JsonValue] | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_legacy_shape(self, handler: Any) -> Any:
+        """Keep old state hashes stable when no catalog admission is present."""
+
+        payload = handler(self)
+        if isinstance(payload, dict) and self.catalog_admission is None:
+            payload.pop("catalog_admission", None)
+        return payload
 
     @field_serializer(
         "action_windows",
@@ -1005,6 +1017,15 @@ class GameState(_StrictModel):
 
     @model_validator(mode="after")
     def validate_player_indexes(self) -> GameState:
+        if self.catalog_admission is not None:
+            self.catalog_admission.validate_for_game(self.game_id)
+            if self.ruleset is None or (
+                self.catalog_admission.board_id != self.ruleset.board_id
+                or self.catalog_admission.board_version != self.ruleset.version
+            ):
+                raise ValueError("catalog admission does not match the frozen board reference")
+            if self.execution_identity is None:
+                raise ValueError("catalog admission requires a frozen execution identity")
         for seat, player in self.players.items():
             if seat != player.seat:
                 raise ValueError("players mapping keys must match PlayerState.seat")

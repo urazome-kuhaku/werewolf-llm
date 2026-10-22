@@ -360,6 +360,14 @@ async def _build(
                 key=lambda item: cast(str, item["path"]),
             )
             package_paths = sorted(document.relative_path for document in package.documents)
+            if package.execution_definition is not None:
+                # execution.yaml is deliberately outside the Markdown document
+                # index, but it is still part of the candidate closure and
+                # must be named and hash-checked by publish-manifest.json.
+                package_paths.append(
+                    f"boards/{board_ref.id}/{board_ref.version}/execution.yaml"
+                )
+                package_paths.sort()
             listed_paths = [cast(str, item["path"]) for item in manifest_paths]
             if listed_paths != package_paths:
                 raise PlaySetupError(

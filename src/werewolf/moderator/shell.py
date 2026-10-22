@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import shlex
+import tempfile
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -23,11 +24,12 @@ from werewolf.game import (
     EventCommitError,
     GameManager,
     GameState,
+    PlayerState,
     RandomStateRef,
     RulesetRef,
 )
 from werewolf.game.actions import load_action_registry
-from werewolf.game.setup import build_role_assignment_plan
+from werewolf.game.setup import PlayerAssignmentPlan, build_role_assignment_plan
 from werewolf.game.victory import evaluate_victory
 from werewolf.knowledge.board import BoardDefinition
 from werewolf.knowledge.compiled_store import CompiledKnowledgeStore
@@ -47,6 +49,12 @@ from werewolf.moderator.sessions import PlayerSessionError, PlayerSessionService
 from werewolf.moderator.sheriff_flow import ModeratorSheriffError, ModeratorSheriffFlow
 from werewolf.moderator.trigger_flow import ModeratorTriggerError, ModeratorTriggerFlow
 from werewolf.persistence.archive import GameArchiveStore
+from werewolf.persistence.checkpoint import (
+    PrivateCheckpointIdentity,
+    PrivateCheckpointStore,
+    VerifiedPrivateCheckpoint,
+    load_verified_checkpoint_bundle,
+)
 from werewolf.persistence.snapshot import FrozenRulesetSnapshot, GameSnapshotStore
 
 

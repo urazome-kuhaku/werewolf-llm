@@ -1,12 +1,18 @@
 """Boundary tests for the formal published board knowledge model."""
 
+import hashlib
+import json
 from datetime import date
 
 import pytest
 from pydantic import ValidationError
 
 from werewolf.domain.enums import GamePhase
+from werewolf.domain.night_boundaries import NightBoundarySchedule
+from werewolf.game import load_action_registry
 from werewolf.knowledge.board import BoardDefinition
+from werewolf.rules.compiler import ExecutionCompilerError, validate_execution_package
+from werewolf.rules.models import ActionSpec, ExecutionPackage
 
 
 def _reading_plan(board_id: str = "fictional-board", version: str = "1.0.0") -> dict[str, object]:
@@ -110,6 +116,89 @@ def test_board_definition_parses_formal_published_document() -> None:
     assert board.reading_plan.board_ref == board.board_ref
     assert board.knife_rule.final_target_required is True
     assert board.knife_rule.plan_confirmation_required is False
+
+
+def test_optional_night_boundary_schedule_is_omitted_for_legacy_board_shape() -> None:
+    board = BoardDefinition.model_validate(_board())
+    serialized = board.model_dump(mode="json")
+
+    assert board.night_boundary_schedule is None
+    assert "night_boundary_schedule" not in serialized
+
+
+def test_optional_night_boundary_schedule_is_omitted_from_legacy_execution_identity() -> None:
+    execution = ExecutionPackage(
+        board_id="fictional-board",
+        board_version="1.0.0",
+        actions=(ActionSpec(action_code=299, action_id="PASS", allow_pass=True),),
+        skills=(),
+    )
+    serialized = execution.model_dump(mode="json")
+    old_shape = execution.model_dump(mode="json", exclude_defaults=True)
+    canonical = json.dumps(
+        old_shape,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+    assert execution.night_boundary_schedule is None
+    assert "night_boundary_schedule" not in serialized
+    assert execution.package_id == hashlib.sha256(canonical).hexdigest()
+
+
+def test_night_boundary_schedule_canonicalizes_typed_prerequisites() -> None:
+    schedule = NightBoundarySchedule(
+        prerequisites=("DAY_ANNOUNCEMENT", "FIRST_DAY_SHERIFF_ELECTION")
+    )
+
+    assert schedule.prerequisites == (
+        "FIRST_DAY_SHERIFF_ELECTION",
+        "DAY_ANNOUNCEMENT",
+    )
+    assert schedule.required_for_round(0) == schedule.prerequisites
+    assert schedule.required_for_round(1) == ("DAY_ANNOUNCEMENT",)
+
+
+@pytest.mark.parametrize(
+    "prerequisites",
+    [
+        (),
+        ("FIRST_DAY_SHERIFF_ELECTION", "FIRST_DAY_SHERIFF_ELECTION", "DAY_ANNOUNCEMENT"),
+        ("FIRST_DAY_SHERIFF_ELECTION", "DAY_ANNOUNCEMENT", "FREEFORM_RELEASE"),
+    ],
+)
+def test_night_boundary_schedule_rejects_missing_duplicate_or_unknown_prerequisites(
+    prerequisites: tuple[str, ...],
+) -> None:
+    with pytest.raises(ValidationError):
+        NightBoundarySchedule.model_validate({"prerequisites": prerequisites})
+
+
+def test_night_boundary_schedule_rejects_first_day_election_without_sheriff_enabled() -> None:
+    values = _board(
+        night_boundary_schedule={
+            "prerequisites": ["FIRST_DAY_SHERIFF_ELECTION", "DAY_ANNOUNCEMENT"]
+        }
+    )
+
+    with pytest.raises(ValidationError):
+        BoardDefinition.model_validate(values)
+
+
+def test_execution_rejects_a_schedule_that_differs_from_the_frozen_board() -> None:
+    board = BoardDefinition.model_validate(
+        _board(night_boundary_schedule={"prerequisites": ["DAY_ANNOUNCEMENT"]})
+    )
+    execution = ExecutionPackage(
+        board_id=board.board_id,
+        board_version=board.version,
+        actions=(ActionSpec(action_code=299, action_id="PASS", allow_pass=True),),
+        skills=(),
+    )
+
+    with pytest.raises(ExecutionCompilerError, match="schedule disagrees with the frozen board"):
+        validate_execution_package(execution, load_action_registry(), board=board)
 
 
 def test_board_definition_exposes_stable_board_reference() -> None:

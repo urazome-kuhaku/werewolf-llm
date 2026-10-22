@@ -602,6 +602,19 @@ class BoardDefinition(_StrictBoardModel):
             data.pop("night_boundary_schedule", None)
         return data
 
+    @model_validator(mode="after")
+    def validate_night_boundary_schedule(self) -> Self:
+        schedule = self.night_boundary_schedule
+        if (
+            schedule is not None
+            and "FIRST_DAY_SHERIFF_ELECTION" in schedule.prerequisites
+            and not self.day_flow.sheriff.enabled
+        ):
+            raise ValueError(
+                "FIRST_DAY_SHERIFF_ELECTION requires the board's sheriff election to be enabled"
+            )
+        return self
+
     @model_validator(mode="before")
     @classmethod
     def normalize_document_aliases(cls, value: object) -> object:

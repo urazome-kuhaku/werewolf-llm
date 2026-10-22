@@ -785,6 +785,27 @@ async def test_self_explosion_drains_death_work_before_cancelling_day_and_advanc
         assert finished.current_queue == ()
         assert finished.vote_state is None
         assert all(not boundary.is_pending for boundary in finished.rule_boundaries)
+        queued_flow = tuple(
+            fact
+            for ledger in finished.rule_ledger
+            for fact in ledger.facts
+            if fact.fact_type == "RULE_FLOW_QUEUED"
+            and fact.data.get("flow_action") == "ADVANCE_TO_NIGHT"
+        )
+        assert len(queued_flow) == 1
+        completed_flow = tuple(
+            audit
+            for audit in finished.moderator_audit
+            if audit.get("operation") == "RULE_FLOW_ACTION_COMPLETED"
+            and audit.get("flow_fact_id") == queued_flow[0].fact_id
+        )
+        assert len(completed_flow) == 1
+        assert completed_flow[0]["source_batch_id"] == next(
+            ledger.batch_id
+            for ledger in finished.rule_ledger
+            if queued_flow[0] in ledger.facts
+        )
+        assert completed_flow[0]["source_skill_request_id"] == queued_flow[0].source_request_id
         with pytest.raises(DayCoordinatorError, match="PHASE_NOT_ALLOWED"):
             await day.run_next_speech()
         with pytest.raises(DayCoordinatorError, match="PHASE_NOT_ALLOWED"):

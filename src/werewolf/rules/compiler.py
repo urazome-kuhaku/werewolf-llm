@@ -589,6 +589,15 @@ def _validate_victory_program_binding(
         return
     if execution.night_boundary_schedule != board.night_boundary_schedule:
         raise _error("execution night-boundary schedule disagrees with the frozen board")
+    if (
+        board.night_boundary_schedule is not None
+        and "FIRST_DAY_SHERIFF_ELECTION"
+        in board.night_boundary_schedule.prerequisites
+        and not board.day_flow.sheriff.enabled
+    ):
+        raise _error(
+            "FIRST_DAY_SHERIFF_ELECTION requires the board's sheriff election to be enabled"
+        )
     board_program = board.victory.program
     if board.victory.mode == "declarative":
         if board_program is None or execution.victory_program != board_program:

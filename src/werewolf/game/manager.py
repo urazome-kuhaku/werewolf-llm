@@ -2286,7 +2286,9 @@ class GameManager:
                 None,
             )
             skill = (
-                next((item for item in package.skills if item.skill_id == occurrence.skill_id), None)
+                next(
+                    (item for item in package.skills if item.skill_id == occurrence.skill_id), None
+                )
                 if package is not None
                 else None
             )
@@ -2318,7 +2320,9 @@ class GameManager:
                 )
                 eligible_seats = select_seats(grant.actor_selector, {"observation": observation})
             except (RuleAdapterError, TypeError, ValueError) as exc:
-                raise EventCommitError("CHECKPOINT_BOUNDARY: ability grant selector failed") from exc
+                raise EventCommitError(
+                    "CHECKPOINT_BOUNDARY: ability grant selector failed"
+                ) from exc
             if occurrence.actor_seat not in eligible_seats:
                 raise EventCommitError("CHECKPOINT_BOUNDARY: actor is outside its frozen grant")
             open_windows: list[ActionWindow] = []
@@ -2328,7 +2332,9 @@ class GameManager:
                 try:
                     candidate = _load_action_window(stored)
                 except (TypeError, ValueError) as exc:
-                    raise EventCommitError("CHECKPOINT_BOUNDARY: stored action window is malformed") from exc
+                    raise EventCommitError(
+                        "CHECKPOINT_BOUNDARY: stored action window is malformed"
+                    ) from exc
                 if candidate.opened_at is not None and candidate.closed_at is None:
                     open_windows.append(candidate)
             if len(open_windows) != 1 or open_windows[0].window_id != occurrence.window_id:
@@ -2359,14 +2365,53 @@ class GameManager:
                 or pending.get("source_fact_id") != occurrence.source_fact_id
                 or pending.get("actor_seat") != occurrence.actor_seat
             ):
-                raise EventCommitError("CHECKPOINT_BOUNDARY: manager request is detached from choice")
+                raise EventCommitError(
+                    "CHECKPOINT_BOUNDARY: manager request is detached from choice"
+                )
             if occurrence.kind == "TRIGGER":
                 self._assert_private_checkpoint_trigger_source(state, occurrence)
+            if cursor.pending_flow_action is not None:
+                self._private_checkpoint_pending_flow_source(
+                    state,
+                    cursor.pending_flow_action,
+                )
+
+    async def assert_rule_trigger_source(
+        self,
+        state: GameState,
+        occurrence: RuleTriggerOccurrence,
+    ) -> None:
+        """Verify one queued trigger's exact causal fact and receipt chain."""
+
+        async with self._lock:
+            if state is not self._state:
+                raise EventCommitError("CHECKPOINT_STALE: state is no longer manager-current")
+            matches = tuple(
+                item
+                for item in state.rule_trigger_queue
+                if item.occurrence_id == occurrence.occurrence_id and item == occurrence
+            )
+            if len(matches) != 1:
+                raise EventCommitError("CHECKPOINT_SOURCE: trigger occurrence is detached")
+            self._assert_private_checkpoint_trigger_source(state, occurrence)
 
     def _assert_private_checkpoint_trigger_source(
         self,
         state: GameState,
         occurrence: RuleTriggerOccurrence,
+    ) -> None:
+        self._assert_private_checkpoint_source_fact(
+            state,
+            source_fact_id=occurrence.source_fact_id,
+            source_batch_id=occurrence.source_batch_id,
+        )
+
+    def _assert_private_checkpoint_source_fact(
+        self,
+        state: GameState,
+        *,
+        source_fact_id: str,
+        source_batch_id: str,
     ) -> None:
         """Verify the exact ledger, receipt, request, and use provenance."""
 
@@ -2376,13 +2421,13 @@ class GameManager:
         ledgers = tuple(
             entry
             for entry in state.rule_ledger
-            if entry.batch_id == occurrence.source_batch_id
-            and any(fact.fact_id == occurrence.source_fact_id for fact in entry.facts)
+            if entry.batch_id == source_batch_id
+            and any(fact.fact_id == source_fact_id for fact in entry.facts)
         )
         if len(ledgers) != 1:
             raise EventCommitError("CHECKPOINT_SOURCE: source fact has no unique rule ledger")
         ledger = ledgers[0]
-        facts = tuple(fact for fact in ledger.facts if fact.fact_id == occurrence.source_fact_id)
+        facts = tuple(fact for fact in ledger.facts if fact.fact_id == source_fact_id)
         if (
             len(facts) != 1
             or ledger.package_id != package.package_id
@@ -2392,7 +2437,9 @@ class GameManager:
             or len(set(ledger.request_ids)) != len(ledger.request_ids)
         ):
             raise EventCommitError("CHECKPOINT_SOURCE: source ledger identity is invalid")
-        receipts = tuple(receipt for receipt in state.rule_receipts if receipt.batch_id == ledger.batch_id)
+        receipts = tuple(
+            receipt for receipt in state.rule_receipts if receipt.batch_id == ledger.batch_id
+        )
         if len(receipts) != 1:
             raise EventCommitError("CHECKPOINT_SOURCE: source batch lacks a unique receipt")
         receipt = receipts[0]
@@ -2407,11 +2454,78 @@ class GameManager:
         ):
             raise EventCommitError("CHECKPOINT_SOURCE: source receipt does not match its ledger")
         fact = facts[0]
+        declared_rules = {
+            effect.effect_id
+            for skill in package.skills
+            for effect in (*skill.effects, *skill.pass_effects)
+        } | {item.interaction_id for item in package.interactions}
+        causal_value = fact.data.get("source_request_ids")
+        if causal_value is None:
+            causal_ids = (fact.source_request_id,) if fact.source_request_id is not None else ()
+        elif not isinstance(causal_value, (list, tuple)) or any(
+            not isinstance(item, str) or not item for item in causal_value
+        ):
+            raise EventCommitError("CHECKPOINT_SOURCE: causal request IDs are malformed")
+        else:
+            causal_ids = tuple(causal_value)
+        if (
+            not causal_ids
+            or len(causal_ids) != len(set(causal_ids))
+            or (fact.source_request_id is not None and fact.source_request_id not in causal_ids)
+        ):
+            raise EventCommitError("CHECKPOINT_SOURCE: fact has no unique causal request proof")
+        source_records_value = fact.data.get("sources")
+        source_records: tuple[Mapping[str, object], ...] = ()
+        if source_records_value is not None:
+            if not isinstance(source_records_value, (list, tuple)) or any(
+                not isinstance(item, Mapping) for item in source_records_value
+            ):
+                raise EventCommitError("CHECKPOINT_SOURCE: causal effect records are malformed")
+            source_records = tuple(
+                cast(Mapping[str, object], item) for item in source_records_value
+            )
+            recorded_ids: set[str] = set()
+            recorded_effect_ids: set[str] = set()
+            for source in source_records:
+                source_id = source.get("source_request_id")
+                rule_id = source.get("source_rule_id")
+                effect_id = source.get("effect_id")
+                actor_seat = source.get("actor_seat")
+                if (
+                    not isinstance(source_id, str)
+                    or source_id not in causal_ids
+                    or not isinstance(effect_id, str)
+                    or (rule_id is not None and rule_id not in declared_rules)
+                    or (actor_seat is not None and type(actor_seat) is not int)
+                ):
+                    raise EventCommitError("CHECKPOINT_SOURCE: causal effect binding is undeclared")
+                recorded_ids.add(source_id)
+                recorded_effect_ids.add(effect_id)
+            if recorded_ids != set(causal_ids):
+                raise EventCommitError(
+                    "CHECKPOINT_SOURCE: causal effects do not cover every request"
+                )
+            cause_effect_ids = fact.data.get("cause_effect_ids")
+            if (
+                not isinstance(cause_effect_ids, (list, tuple))
+                or any(not isinstance(item, str) or not item for item in cause_effect_ids)
+                or set(cause_effect_ids) != recorded_effect_ids
+            ):
+                raise EventCommitError("CHECKPOINT_SOURCE: causal effect IDs are inconsistent")
+        if fact.source_rule_id is not None and fact.source_rule_id not in declared_rules:
+            raise EventCommitError("CHECKPOINT_SOURCE: fact source rule is undeclared")
+
         if ledger.request_ids:
-            disposition_matches: list[tuple[ActionRequest, Mapping[str, object]]] = []
+            disposition_matches: dict[
+                str, tuple[ActionRequest, ActionWindow, Mapping[str, object]]
+            ] = {}
+            host_request_ids: set[str] = set()
             for request_id in ledger.request_ids:
                 raw_request = state.action_requests.get(request_id)
                 if not isinstance(raw_request, Mapping):
+                    if request_id.startswith("host-"):
+                        host_request_ids.add(request_id)
+                        continue
                     raise EventCommitError("CHECKPOINT_SOURCE: physical source request is missing")
                 try:
                     request = _stored_action_request(state, request_id)
@@ -2420,7 +2534,9 @@ class GameManager:
                         raise ValueError("source action window is missing")
                     window = _load_action_window(raw_window)
                 except (TypeError, ValueError) as exc:
-                    raise EventCommitError("CHECKPOINT_SOURCE: physical source request is malformed") from exc
+                    raise EventCommitError(
+                        "CHECKPOINT_SOURCE: physical source request is malformed"
+                    ) from exc
                 if (
                     request.game_id != state.game_id
                     or request.phase.value != ledger.timing
@@ -2437,23 +2553,84 @@ class GameManager:
                     or request.seat not in state.players
                     or request.session_epoch > state.players[request.seat].session_epoch
                 ):
-                    raise EventCommitError("CHECKPOINT_SOURCE: physical source request is unconfirmed")
+                    raise EventCommitError(
+                        "CHECKPOINT_SOURCE: physical source request is unconfirmed"
+                    )
                 rows = raw_request.get("rule_dispositions")
                 if not isinstance(rows, (list, tuple)) or not rows:
-                    raise EventCommitError("CHECKPOINT_SOURCE: request has no rule disposition proof")
+                    raise EventCommitError(
+                        "CHECKPOINT_SOURCE: request has no rule disposition proof"
+                    )
                 for row in rows:
-                    if not isinstance(row, Mapping):
+                    if not isinstance(row, Mapping) or not isinstance(
+                        row.get("skill_request_id"), str
+                    ):
                         raise EventCommitError("CHECKPOINT_SOURCE: rule disposition is malformed")
-                    disposition_matches.append((request, row))
-            if fact.source_request_id is not None:
-                matches = tuple(
-                    (request, row)
-                    for request, row in disposition_matches
-                    if row.get("skill_request_id") == fact.source_request_id
-                )
-                if len(matches) != 1:
-                    raise EventCommitError("CHECKPOINT_SOURCE: fact source request is not uniquely bound")
-                request, row = matches[0]
+                    internal_id = cast(str, row["skill_request_id"])
+                    if internal_id in disposition_matches:
+                        raise EventCommitError(
+                            "CHECKPOINT_SOURCE: internal request binding is ambiguous"
+                        )
+                    disposition_matches[internal_id] = (request, window, row)
+
+            for causal_id in causal_ids:
+                if causal_id in host_request_ids:
+                    if fact.fact_type.upper() == "RULE_FLOW_QUEUED":
+                        raise EventCommitError(
+                            "CHECKPOINT_SOURCE: queued FLOW has no physical source request"
+                        )
+                    audits = tuple(
+                        audit
+                        for audit in state.moderator_audit
+                        if isinstance(audit, Mapping)
+                        and audit.get("operation") == "DAY_EXILE"
+                        and audit.get("rule_batch_id") == ledger.batch_id
+                        and audit.get("package_id") == package.package_id
+                        and audit.get("committed_revision") == ledger.committed_revision
+                        and audit.get("outcome_digest") == ledger.batch_id
+                        and type(audit.get("target_seat")) is int
+                        and audit.get("target_seat") == fact.target_seat
+                        and isinstance(audit.get("vote_window_id"), str)
+                        and audit.get("resolution_id") == f"day-exile-{audit.get('vote_window_id')}"
+                        and causal_id
+                        == "host-"
+                        + hashlib.sha256(
+                            f"{state.game_id}:{audit.get('vote_window_id')}:{package.package_id}".encode()
+                        ).hexdigest()
+                    )
+                    host_skills = tuple(
+                        skill
+                        for skill in package.skills
+                        if skill.mode == "HOST"
+                        and skill.action_code == 203
+                        and GamePhase.DAY_RESOLVE.value in skill.timing
+                        and not skill.grants
+                    )
+                    if (
+                        len(audits) != 1
+                        or len(host_skills) != 1
+                        or host_skills[0].skill_id not in ledger.skill_ids
+                        or 203 not in ledger.action_codes
+                        or fact.target_seat not in ledger.actor_seats
+                        or ledger.group_id
+                        != f"day-resolve:{ledger.round_no}:{audits[0].get('vote_window_id')}"
+                    ):
+                        raise EventCommitError(
+                            "CHECKPOINT_SOURCE: host source lacks exact exile audit"
+                        )
+                    for source in source_records:
+                        if source.get("source_request_id") == causal_id and source.get(
+                            "actor_seat"
+                        ) not in {None, fact.target_seat}:
+                            raise EventCommitError(
+                                "CHECKPOINT_SOURCE: host source actor is inconsistent"
+                            )
+                    continue
+
+                bound = disposition_matches.get(causal_id)
+                if bound is None:
+                    raise EventCommitError("CHECKPOINT_SOURCE: causal ID is not receipt-bound")
+                request, window, row = bound
                 action_index = row.get("action_index")
                 action_code = row.get("action_code")
                 ability_id = row.get("ability_instance_id")
@@ -2469,13 +2646,16 @@ class GameManager:
                     or not isinstance(status, str)
                     or status not in {"ACCEPTED", "PASSED"}
                     or (status == "PASSED") != (action_code == 299)
-                    or (fact.actor_seat is not None and request.seat != fact.actor_seat)
                     or request.seat not in ledger.actor_seats
                     or skill_id not in ledger.skill_ids
                     or action_code not in ledger.action_codes
                 ):
-                    raise EventCommitError("CHECKPOINT_SOURCE: source request disposition is inconsistent")
-                source_skill = next((item for item in package.skills if item.skill_id == skill_id), None)
+                    raise EventCommitError(
+                        "CHECKPOINT_SOURCE: source request disposition is inconsistent"
+                    )
+                source_skill = next(
+                    (item for item in package.skills if item.skill_id == skill_id), None
+                )
                 source_instance = next(
                     (
                         item
@@ -2491,7 +2671,9 @@ class GameManager:
                     or source_instance is None
                     or source_skill.action_code != source_instance.action_code
                     or source_instance.grant_kind not in {"ACTIVE", "TRIGGER"}
-                    or all(grant.grant_id != source_instance.grant_id for grant in source_skill.grants)
+                    or all(
+                        grant.grant_id != source_instance.grant_id for grant in source_skill.grants
+                    )
                     or (status == "ACCEPTED" and source_skill.action_code != action_code)
                     or (
                         status == "PASSED"
@@ -2506,9 +2688,21 @@ class GameManager:
                         )
                     )
                 ):
-                    raise EventCommitError("CHECKPOINT_SOURCE: disposition skill binding is invalid")
+                    raise EventCommitError(
+                        "CHECKPOINT_SOURCE: disposition skill binding is invalid"
+                    )
+                if causal_id == fact.source_request_id and fact.actor_seat != request.seat:
+                    raise EventCommitError(
+                        "CHECKPOINT_SOURCE: primary source actor is inconsistent"
+                    )
+                if any(
+                    source.get("source_request_id") == causal_id
+                    and source.get("actor_seat") not in {None, request.seat}
+                    for source in source_records
+                ):
+                    raise EventCommitError("CHECKPOINT_SOURCE: causal source actor is inconsistent")
                 histories = tuple(
-                    use for use in ledger.history_updates if use.request_id == fact.source_request_id
+                    use for use in ledger.history_updates if use.request_id == causal_id
                 )
                 if histories:
                     use = histories[0]
@@ -2521,22 +2715,28 @@ class GameManager:
                         or use.disposition != status
                         or use.passed != (status == "PASSED")
                     ):
-                        raise EventCommitError("CHECKPOINT_SOURCE: use history disagrees with disposition")
-                if fact.source_rule_id is not None:
-                    declared_rules = {
-                        effect.effect_id
-                        for skill in package.skills
-                        for effect in (*skill.effects, *skill.pass_effects)
-                    } | {item.interaction_id for item in package.interactions}
-                    if fact.source_rule_id not in declared_rules:
-                        raise EventCommitError("CHECKPOINT_SOURCE: fact source rule is undeclared")
-            elif fact.data.get("source_request_ids"):
-                ids = fact.data.get("source_request_ids")
-                if not isinstance(ids, (list, tuple)) or any(
-                    not any(row.get("skill_request_id") == request_id for _, row in disposition_matches)
-                    for request_id in ids
-                ):
-                    raise EventCommitError("CHECKPOINT_SOURCE: causal request IDs are not receipt-bound")
+                        raise EventCommitError(
+                            "CHECKPOINT_SOURCE: use history disagrees with disposition"
+                        )
+                if fact.fact_type.upper() == "RULE_FLOW_QUEUED":
+                    flow_data = fact.data
+                    if (
+                        flow_data.get("flow_action") not in {"RESUME_HOOK", "ADVANCE_TO_NIGHT"}
+                        or flow_data.get("source_skill_request_id") != causal_id
+                        or flow_data.get("source_action_request_id") != request.request_id
+                        or flow_data.get("source_rule_id") != fact.source_rule_id
+                        or flow_data.get("source_skill_id") != skill_id
+                        or flow_data.get("source_ability_instance_id") != ability_id
+                        or flow_data.get("source_actor_seat") != request.seat
+                        or flow_data.get("source_skill_action_code") != source_skill.action_code
+                        or flow_data.get("source_physical_action_code") != action_code
+                        or flow_data.get("disposition") != status
+                        or flow_data.get("source_group_id") != ledger.group_id
+                        or flow_data.get("source_timing") != ledger.timing
+                    ):
+                        raise EventCommitError(
+                            "CHECKPOINT_SOURCE: queued FLOW source binding is inconsistent"
+                        )
         else:
             automatic_occurrences = tuple(
                 item
@@ -2546,12 +2746,100 @@ class GameManager:
                 and receipt.occurrence_ids == (item.occurrence_id,)
                 and ledger.group_id == f"automatic-{item.occurrence_id}"
             )
+            if ledger.timing != GamePhase.TRIGGER_ACTION.value or len(automatic_occurrences) != 1:
+                raise EventCommitError(
+                    "CHECKPOINT_SOURCE: virtual automatic source lacks exact completion proof"
+                )
+            automatic = automatic_occurrences[0]
+            automatic_request_id = f"automatic-{automatic.occurrence_id}"
+            skill = next(
+                (item for item in package.skills if item.skill_id == automatic.skill_id), None
+            )
+            instance = next(
+                (
+                    item
+                    for item in state.ability_instances
+                    if item.ability_instance_id == automatic.ability_instance_id
+                    and item.skill_id == automatic.skill_id
+                    and item.actor_seat == automatic.actor_seat
+                ),
+                None,
+            )
+            histories = tuple(
+                use for use in ledger.history_updates if use.request_id == automatic_request_id
+            )
             if (
-                ledger.timing != GamePhase.TRIGGER_ACTION.value
-                or len(automatic_occurrences) != 1
-                or fact.source_request_id != f"automatic-{automatic_occurrences[0].occurrence_id}"
+                causal_ids != (automatic_request_id,)
+                or fact.fact_type.upper() == "RULE_FLOW_QUEUED"
+                or (
+                    fact.source_request_id is not None
+                    and fact.source_request_id != automatic_request_id
+                )
+                or skill is None
+                or skill.trigger is None
+                or skill.trigger.mode != "AUTOMATIC"
+                or instance is None
+                or instance.grant_kind != "TRIGGER"
+                or automatic.skill_id not in ledger.skill_ids
+                or len(histories) != 1
+                or histories[0].ability_instance_id != automatic.ability_instance_id
+                or histories[0].skill_id != automatic.skill_id
+                or histories[0].action_code != skill.action_code
+                or histories[0].actor_seat != automatic.actor_seat
+                or histories[0].disposition != "ACCEPTED"
+                or histories[0].passed
             ):
-                raise EventCommitError("CHECKPOINT_SOURCE: virtual automatic source lacks exact completion proof")
+                raise EventCommitError(
+                    "CHECKPOINT_SOURCE: virtual automatic request is not history-bound"
+                )
+            if any(
+                source.get("actor_seat") not in {None, automatic.actor_seat}
+                for source in source_records
+            ):
+                raise EventCommitError("CHECKPOINT_SOURCE: automatic causal actor is inconsistent")
+
+    def _private_checkpoint_pending_flow_source(
+        self,
+        state: GameState,
+        action: str,
+    ) -> tuple[RuleLedgerEntry, RuleFactRecord]:
+        """Return the one unconsumed FLOW fact bound to a durable cursor."""
+
+        candidates = tuple(
+            (ledger, fact)
+            for ledger in state.rule_ledger
+            for fact in ledger.facts
+            if fact.fact_type.upper() == "RULE_FLOW_QUEUED"
+            and fact.data.get("flow_action") == action
+        )
+        unconsumed = tuple(
+            (ledger, fact)
+            for ledger, fact in candidates
+            if not any(
+                isinstance(audit, Mapping)
+                and audit.get("operation") == "RULE_FLOW_ACTION_COMPLETED"
+                and audit.get("flow_fact_id") == fact.fact_id
+                for audit in state.moderator_audit
+            )
+        )
+        if len(unconsumed) != 1:
+            raise EventCommitError(
+                "CHECKPOINT_FLOW: pending FLOW does not have one unconsumed source fact"
+            )
+        ledger, fact = unconsumed[0]
+        self._assert_private_checkpoint_source_fact(
+            state,
+            source_fact_id=fact.fact_id,
+            source_batch_id=ledger.batch_id,
+        )
+        if (
+            fact.data.get("source_group_id") != ledger.group_id
+            or fact.data.get("source_timing") != ledger.timing
+            or fact.data.get("source_skill_request_id") != fact.source_request_id
+            or not isinstance(fact.data.get("source_action_request_id"), str)
+        ):
+            raise EventCommitError("CHECKPOINT_FLOW: pending FLOW request binding is incomplete")
+        return ledger, fact
 
     def _rule_group_requests(
         self,
@@ -5130,10 +5418,67 @@ class GameManager:
             if item.fact_type.upper() != "DEATH_CONFIRMED"
         )
         confirmed_death_facts = self._confirmed_death_facts(state, batch)
+        queued_flow_facts: list[RuleFactRecord] = []
+        request_by_id: dict[str, SkillRequest] = {}
+        for request in requests:
+            if request.request_id in request_by_id:
+                raise ResolutionError("RULE_FLOW_INVALID", "flow source request ID is ambiguous")
+            request_by_id[request.request_id] = request
+        for index, flow_update in enumerate(batch.flow_updates):
+            source_request = request_by_id.get(flow_update.source_request_id)
+            source_bindings = tuple(
+                binding
+                for binding in bindings
+                if binding.skill_request.request_id == flow_update.source_request_id
+            )
+            if source_request is None or len(source_bindings) > 1:
+                raise ResolutionError(
+                    "RULE_FLOW_INVALID", "flow update lacks one bound source request"
+                )
+            source_binding = source_bindings[0] if source_bindings else None
+            source_disposition = disposition_by_id.get(flow_update.source_request_id)
+            disposition = source_disposition.status if source_disposition is not None else "ACCEPTED"
+            queued_flow_facts.append(
+                RuleFactRecord(
+                    fact_id=_stable_rule_identifier(
+                        "rule-flow-queued",
+                        state.game_id,
+                        batch.batch_id,
+                        index,
+                        flow_update.source_request_id,
+                        flow_update.action,
+                    ),
+                    fact_type="RULE_FLOW_QUEUED",
+                    source_rule_id=flow_update.source_rule_id,
+                    source_request_id=flow_update.source_request_id,
+                    actor_seat=source_request.actor_seat,
+                    data={
+                        "flow_action": flow_update.action,
+                        "window_id": flow_update.window_id,
+                        "logical_window_id": flow_update.logical_window_id,
+                        "hook_id": flow_update.hook_id,
+                        "source_skill_request_id": flow_update.source_request_id,
+                        "source_action_request_id": (
+                            source_binding.request_id if source_binding is not None else None
+                        ),
+                        "source_rule_id": flow_update.source_rule_id,
+                        "source_skill_id": flow_update.source_skill_id,
+                        "source_ability_instance_id": flow_update.source_ability_instance_id,
+                        "source_actor_seat": source_request.actor_seat,
+                        "source_skill_action_code": source_request.action_code,
+                        "source_physical_action_code": (
+                            source_binding.action_code if source_binding is not None else None
+                        ),
+                        "disposition": disposition,
+                        "source_group_id": group_id,
+                        "source_timing": timing,
+                    },
+                )
+            )
         # Persist exactly one canonical row for each newly confirmed death.
         # It reuses the interpreter fact ID when available and keeps all
         # applied causal effect/request provenance in its data payload.
-        facts = (*facts, *confirmed_death_facts)
+        facts = (*facts, *confirmed_death_facts, *queued_flow_facts)
         digest = hashlib.sha256(
             json.dumps(
                 batch.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
@@ -6467,6 +6812,39 @@ class GameManager:
                             "created_at": timestamp.isoformat(),
                         },
                     )
+            if cursor.pending_flow_action is not None:
+                flow_ledger, flow_fact = self._private_checkpoint_pending_flow_source(
+                    state,
+                    cursor.pending_flow_action,
+                )
+                flow_data = flow_fact.data
+                data["moderator_audit"] = (
+                    *data["moderator_audit"],
+                    {
+                        "operation": "RULE_FLOW_ACTION_COMPLETED",
+                        "flow_fact_id": flow_fact.fact_id,
+                        "flow_action": cursor.pending_flow_action,
+                        "source_batch_id": flow_ledger.batch_id,
+                        "source_group_id": flow_ledger.group_id,
+                        "source_timing": flow_ledger.timing,
+                        "source_skill_request_id": flow_data.get(
+                            "source_skill_request_id"
+                        ),
+                        "source_action_request_id": flow_data.get(
+                            "source_action_request_id"
+                        ),
+                        "source_skill_id": flow_data.get("source_skill_id"),
+                        "source_ability_instance_id": flow_data.get(
+                            "source_ability_instance_id"
+                        ),
+                        "source_rule_id": flow_data.get("source_rule_id"),
+                        "disposition": flow_data.get("disposition"),
+                        "source_cursor_id": cursor.cursor_id,
+                        "base_revision": state.state_revision,
+                        "committed_revision": state.state_revision + 1,
+                        "created_at": timestamp.isoformat(),
+                    },
+                )
             # Keep the workflow cursor and the lifecycle edge in one atomic
             # state replacement. For standard edges, reuse the phase reducer
             # so day/round counters follow the same semantics as an ordinary
@@ -8161,6 +8539,132 @@ class GameManager:
             committed = GameState.model_validate(data)
             self._state = committed
             return committed
+
+    async def rotate_recovered_session_epochs(
+        self,
+        *,
+        expected_revision: int,
+        now: datetime | None = None,
+    ) -> dict[int, int]:
+        """Rotate recovered seat epochs before issuing fresh runtime tokens."""
+
+        before = self._state
+        await self.assert_private_checkpoint_waiting_choice(before)
+        commit_time = utc_now() if now is None else now
+        if commit_time.tzinfo is None or commit_time.utcoffset() is None:
+            raise EventCommitError("CHECKPOINT_RESTORE: timestamp must include a timezone")
+        commit_time = commit_time.astimezone(UTC)
+        async with self._lock:
+            current = self._state
+            if current is not before:
+                raise EventCommitError("CHECKPOINT_STALE: recovered state changed before rotation")
+            _revision_check(current, expected_revision)
+            players = {
+                seat: player.model_copy(
+                    update={"session_epoch": player.session_epoch + 1, "runtime_ref": None}
+                )
+                for seat, player in current.players.items()
+            }
+            cursor = current.rule_workflow_cursor
+            occurrence = next(
+                item
+                for item in current.rule_trigger_queue
+                if cursor is not None and item.occurrence_id == cursor.active_occurrence_id
+            )
+            windows = dict(current.action_windows)
+            raw_window = windows.get(occurrence.window_id or "")
+            if not isinstance(raw_window, Mapping):
+                raise EventCommitError("CHECKPOINT_RESTORE: active choice window disappeared")
+            try:
+                window = _load_action_window(raw_window)
+            except (TypeError, ValueError) as exc:
+                raise EventCommitError(
+                    "CHECKPOINT_RESTORE: active choice window is malformed"
+                ) from exc
+            windows[window.window_id] = window.model_copy(
+                update={"session_epoch": players[occurrence.actor_seat].session_epoch}
+            ).model_dump(mode="json")
+            deliveries = {
+                seat: delivery.model_copy(
+                    update={
+                        "session_epoch": players[seat].session_epoch,
+                        "in_flight_request_id": None,
+                        "in_flight_event_ids": (),
+                    }
+                )
+                for seat, delivery in current.delivery_cursors.items()
+            }
+            data = _state_data(current)
+            data["players"] = players
+            data["action_windows"] = windows
+            data["delivery_cursors"] = deliveries
+            data["state_revision"] = current.state_revision + 1
+            data["updated_at"] = commit_time
+            data["moderator_audit"] = (
+                *current.moderator_audit,
+                {
+                    "operation": "CHECKPOINT_SESSION_EPOCHS_ROTATED",
+                    "base_revision": current.state_revision,
+                    "committed_revision": current.state_revision + 1,
+                    "epochs": {
+                        str(seat): player.session_epoch for seat, player in players.items()
+                    },
+                    "created_at": commit_time.isoformat(),
+                },
+            )
+            self._state = GameState.model_validate(data)
+            return {seat: player.session_epoch for seat, player in players.items()}
+
+    async def bind_recovered_session_refs(
+        self,
+        session_refs: Mapping[int, str],
+        *,
+        expected_revision: int,
+        now: datetime | None = None,
+    ) -> GameState:
+        """Bind fresh runtime IDs only after detached sessions start cleanly."""
+
+        before = self._state
+        await self.assert_private_checkpoint_waiting_choice(before)
+        if not isinstance(session_refs, Mapping) or set(session_refs) != set(before.players):
+            raise EventCommitError("CHECKPOINT_RESTORE: fresh session refs do not cover each seat")
+        if any(
+            type(seat) is not int
+            or not isinstance(runtime_ref, str)
+            or not runtime_ref.strip()
+            or len(runtime_ref) > 128
+            for seat, runtime_ref in session_refs.items()
+        ):
+            raise EventCommitError("CHECKPOINT_RESTORE: fresh session refs are invalid")
+        commit_time = utc_now() if now is None else now
+        if commit_time.tzinfo is None or commit_time.utcoffset() is None:
+            raise EventCommitError("CHECKPOINT_RESTORE: timestamp must include a timezone")
+        commit_time = commit_time.astimezone(UTC)
+        async with self._lock:
+            current = self._state
+            if current is not before:
+                raise EventCommitError("CHECKPOINT_STALE: recovered state changed before binding")
+            _revision_check(current, expected_revision)
+            players = {
+                seat: player.model_copy(update={"runtime_ref": session_refs[seat]})
+                for seat, player in current.players.items()
+            }
+            data = _state_data(current)
+            data["players"] = players
+            data["state_revision"] = current.state_revision + 1
+            data["updated_at"] = commit_time
+            data["moderator_audit"] = (
+                *current.moderator_audit,
+                {
+                    "operation": "CHECKPOINT_SESSION_REFS_BOUND",
+                    "base_revision": current.state_revision,
+                    "committed_revision": current.state_revision + 1,
+                    "seats": list(sorted(session_refs)),
+                    "created_at": commit_time.isoformat(),
+                },
+            )
+            self._state = GameState.model_validate(data)
+            return self._state
 
     async def commit_player_ready(
         self,

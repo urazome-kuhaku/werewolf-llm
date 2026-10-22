@@ -34,6 +34,12 @@ class NightBoundarySchedule(BaseModel):
             "DAY_ANNOUNCEMENT",
         }:
             raise ValueError("night-boundary schedule contains an unsupported prerequisite")
+        canonical_order = ("FIRST_DAY_SHERIFF_ELECTION", "DAY_ANNOUNCEMENT")
+        object.__setattr__(
+            self,
+            "prerequisites",
+            tuple(item for item in canonical_order if item in self.prerequisites),
+        )
         return self
 
     def required_for_round(self, round_no: int) -> tuple[NightBoundaryPrerequisite, ...]:

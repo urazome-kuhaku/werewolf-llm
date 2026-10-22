@@ -30,8 +30,11 @@ from werewolf.game.events import EventType, GameEvent
 from werewolf.game.state import GameState
 from werewolf.knowledge.compiled_store import CompiledKnowledgeStore
 from werewolf.knowledge.refs import VersionedRef
-from werewolf.knowledge.runtime_loader import load_runtime_knowledge_bundle_from_snapshot
-from werewolf.knowledge.snapshot import KnowledgeSnapshotBuilder
+from werewolf.knowledge.runtime_loader import (
+    RuntimeKnowledgeBundle,
+    load_runtime_knowledge_bundle_from_snapshot,
+)
+from werewolf.knowledge.snapshot import KnowledgeSnapshot, KnowledgeSnapshotBuilder
 from werewolf.rules.models import ExecutionPackage
 
 if TYPE_CHECKING:
@@ -716,6 +719,7 @@ async def _validate_detached_bundle(
                 state,
                 registry=registry,
                 execution_package=execution,
+                package_identity=package.package_identity,
             )
             await detached_manager.assert_private_checkpoint_waiting_choice(state)
         except (TypeError, ValueError) as exc:
@@ -780,6 +784,68 @@ async def _validate_detached_bundle(
                 )
         elif occurrence.kind == "HOOK" and occurrence.hook_id not in skill.hook_ids:
             raise PrivateCheckpointIdentityError("waiting hook is not declared by the frozen skill")
+
+
+async def load_verified_checkpoint_bundle(
+    checkpoint: VerifiedPrivateCheckpoint,
+    temporary_root: str | os.PathLike[str],
+) -> tuple[KnowledgeSnapshot, RuntimeKnowledgeBundle]:
+    """Materialize the checkpoint's frozen package into a detached runtime bundle.
+
+    ``temporary_root`` must be a fresh directory owned by the caller.  This
+    intentionally does not consult the live compiled store: recovery remains
+    possible after that package has been removed or replaced.
+    """
+
+    identity = checkpoint.manifest.identity
+    root = Path(temporary_root)
+    if root.is_symlink() or not root.is_dir() or any(root.iterdir()):
+        raise PrivateCheckpointIdentityError(
+            "checkpoint runtime staging root must be a fresh regular directory"
+        )
+    game_root = root / identity.game_id
+    ruleset_root = game_root / "ruleset"
+    ruleset_root.mkdir(parents=True, mode=0o700)
+    for relative, content in checkpoint.frozen_files.items():
+        filename = _validate_relative_path(relative)
+        target = ruleset_root / filename
+        if target.parent != ruleset_root:
+            raise PrivateCheckpointIdentityError("checkpoint artifact path is not flat")
+        with target.open("xb") as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+    with (ruleset_root / "snapshot.json").open("xb") as output:
+        output.write(_canonical_json_bytes(dict(checkpoint.knowledge_snapshot_manifest)))
+        output.flush()
+        os.fsync(output.fileno())
+    builder = KnowledgeSnapshotBuilder.from_game_root(
+        CompiledKnowledgeStore(root / "unused-compiled"),
+        game_root,
+        game_id=identity.game_id,
+    )
+    try:
+        snapshot = await builder.load(identity.game_id)
+        bundle = await load_runtime_knowledge_bundle_from_snapshot(snapshot)
+    except (TypeError, ValueError, OSError) as exc:
+        raise PrivateCheckpointIdentityError(
+            "detached checkpoint runtime bundle failed verification"
+        ) from exc
+    execution = bundle.package.execution
+    registry = bundle.package.action_registry
+    if (
+        execution is None
+        or registry is None
+        or execution.package_id != identity.execution_package_id
+        or bundle.package.package_identity != identity.package_identity
+        or bundle.board.board_ref.format() != identity.board_ref
+        or snapshot.game_id != identity.game_id
+        or snapshot.package_id != identity.package_id
+    ):
+        raise PrivateCheckpointIdentityError(
+            "detached checkpoint runtime bundle identity changed"
+        )
+    return snapshot, bundle
 
 
 def _payload_bytes(

@@ -11,9 +11,13 @@ from pathlib import Path
 import pytest
 from test_rules_b_workflow import (
     GAME_ID as WORKFLOW_GAME_ID,
+)
+from test_rules_b_workflow import (
     _compiled_workflow_fixture,
-    _manager as _workflow_manager,
     _settle_initial_multi_death,
+)
+from test_rules_b_workflow import (
+    _manager as _workflow_manager,
 )
 
 from werewolf.domain.enums import GamePhase
@@ -71,7 +75,6 @@ async def test_waiting_choice_checkpoint_restores_frozen_bundle_and_checks_ident
     }
     execution_digest = compiled.manifest_payload["execution_sha256"]
     assert isinstance(execution_digest, str)
-    action_registry_digest = _digest(compiled.action_registry.model_dump(mode="json"))
     frozen_ref = RulesetRef(
         board_id=compiled.board_ref.id,
         version=compiled.board_ref.version,
