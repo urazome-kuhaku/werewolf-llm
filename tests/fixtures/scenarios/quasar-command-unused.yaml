@@ -1,0 +1,20 @@
+schema_version: 1
+scenario_id: quasar-command-unused-step
+board_ref: quasar_echo_lab@1.0.0
+mode: COMMAND
+steps:
+  - kind: HOST_COMMAND
+    step_id: create
+    command: NEW
+  - kind: PLAYER_TURN
+    step_id: unused-player-action
+    match:
+      seat: 1
+      phase: NIGHT_ACTION
+      role_id: quasar_oracle
+      authorized_skill_ids: [quasar_echo_unfamiliar]
+    expected_kind: action
+    actions:
+      - action_code: 987
+        targets: [2, 3]
+        parameters: {mode: strike}

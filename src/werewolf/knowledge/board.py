@@ -25,6 +25,7 @@ from pydantic import (
 )
 
 from werewolf.domain.enums import GamePhase
+from werewolf.domain.night_boundaries import NightBoundarySchedule
 from werewolf.domain.victory_rules import VictoryProgram
 
 from .models import BoardRoleBinding, ReadingPlan
@@ -567,6 +568,7 @@ class BoardDefinition(_StrictBoardModel):
         validation_alias=AliasChoices("role_bindings", "roles"),
     )
     victory: VictoryDefinition
+    night_boundary_schedule: NightBoundarySchedule | None = None
     wolf_team_visibility: WolfTeamVisibility
     knife_rule: KnifeRule
     identity_reveal: IdentityRevealDefinition = Field(
@@ -592,6 +594,13 @@ class BoardDefinition(_StrictBoardModel):
         min_length=1,
         validation_alias=AliasChoices("source_refs", "sources"),
     )
+
+    @model_serializer(mode="wrap")
+    def serialize_legacy_shape(self, handler: Any) -> dict[str, object]:
+        data = cast(dict[str, object], handler(self))
+        if self.night_boundary_schedule is None:
+            data.pop("night_boundary_schedule", None)
+        return data
 
     @model_validator(mode="before")
     @classmethod

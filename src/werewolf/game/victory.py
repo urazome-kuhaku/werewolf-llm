@@ -24,7 +24,12 @@ from werewolf.domain.victory_rules import (
 )
 from werewolf.knowledge.board import BoardDefinition
 from werewolf.knowledge.preview import experimental_preview_enabled
-from werewolf.rules.models import ExecutionPackage, RuleObservation
+from werewolf.rules.models import (
+    ExecutionPackage,
+    RuleObservation,
+    StateDeclaration,
+)
+from werewolf.rules.models import RuleStateValue as ObservationRuleStateValue
 
 from .state import GameState, PlayerState
 
@@ -282,11 +287,63 @@ def _declarative_observation(
             group_id="victory",
             timing=state.phase.value,
         )
+        # NEXT_NIGHT_START values are removed at their real boundary. A
+        # declared GAME bool still has its frozen initial value after that
+        # removal, matching rule-interpreter reads while keeping this view
+        # expiry-filtered. Do not mask duplicate or malformed stored rows:
+        # the evaluator below rejects those explicitly.
+        declarations_by_key: dict[str, list[StateDeclaration]] = {}
+        for declaration in execution_package.state_declarations:
+            if declaration.scope == "GAME":
+                declarations_by_key.setdefault(declaration.key, []).append(declaration)
+        referenced_keys = _victory_game_state_keys(program)
+        state_values = list(observation.state_values)
+        changed = False
+        for key in referenced_keys:
+            matches = declarations_by_key.get(key, [])
+            if len(matches) != 1:
+                continue
+            declaration = matches[0]
+            if declaration.value_type != "bool" or type(declaration.initial) is not bool:
+                continue
+            if any(item.scope == "GAME" and item.key == key for item in state_values):
+                continue
+            state_values.append(
+                ObservationRuleStateValue(
+                    scope="GAME",
+                    skill_id=declaration.skill_id,
+                    key=key,
+                    value=declaration.initial,
+                )
+            )
+            changed = True
+        if changed:
+            observation = observation.model_copy(update={"state_values": tuple(state_values)})
     except (RuleAdapterError, TypeError, ValueError) as exc:
         raise RulesetMismatchError(
             "frozen execution package could not produce its authoritative observation"
         ) from exc
     return program, observation
+
+
+def _victory_game_state_keys(program: VictoryProgram) -> set[str]:
+    """Collect the closed set of state keys referenced by the victory AST."""
+
+    keys: set[str] = set()
+
+    def visit(expression: VictoryExpr) -> None:
+        if isinstance(expression, VictoryGameState):
+            keys.add(expression.key)
+        elif isinstance(expression, VictoryCompare):
+            visit(expression.left)
+            visit(expression.right)
+        elif isinstance(expression, VictoryBoolean):
+            for child in expression.values:
+                visit(child)
+
+    for condition in program.conditions:
+        visit(condition.when)
+    return keys
 
 
 def _evaluate_victory_expr(expression: VictoryExpr, observation: RuleObservation) -> bool | int:

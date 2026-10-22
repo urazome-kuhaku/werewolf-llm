@@ -1,0 +1,13 @@
+schema_version: 1
+scenario_id: quasar-command-budget-exhaustion
+board_ref: quasar_echo_lab@1.0.0
+mode: COMMAND
+budget:
+  max_commands: 1
+steps:
+  - kind: HOST_COMMAND
+    step_id: create
+    command: NEW
+  - kind: HOST_COMMAND
+    step_id: over-budget
+    command: STATUS

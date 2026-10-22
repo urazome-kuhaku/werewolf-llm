@@ -2253,6 +2253,9 @@ class GameManager:
             if len(active) != 1 or active[0].occurrence_id != cursor.active_occurrence_id:
                 raise EventCommitError("CHECKPOINT_BOUNDARY: choice occurrence is ambiguous")
             occurrence = active[0]
+            actor = state.players.get(occurrence.actor_seat)
+            if actor is None:
+                raise EventCommitError("CHECKPOINT_BOUNDARY: choice actor is unassigned")
             if occurrence.window_id is None:
                 raise EventCommitError("CHECKPOINT_BOUNDARY: choice has no physical action window")
             raw_window = state.action_windows.get(occurrence.window_id)
@@ -2267,6 +2270,7 @@ class GameManager:
                 or window.opened_at is None
                 or window.window_id not in cursor.active_window_ids
                 or window.allowed_seats != (occurrence.actor_seat,)
+                or window.session_epoch != actor.session_epoch
                 or window.submitted_request_ids
                 or self._rule_occurrence_for_window(state, window) != occurrence
             ):
@@ -2384,7 +2388,7 @@ class GameManager:
             or ledger.package_id != package.package_id
             or ledger.committed_revision != ledger.read_revision + 1
             or ledger.committed_revision > state.state_revision
-            or ledger.round_no != state.round_no
+            or ledger.round_no > state.round_no
             or len(set(ledger.request_ids)) != len(ledger.request_ids)
         ):
             raise EventCommitError("CHECKPOINT_SOURCE: source ledger identity is invalid")
@@ -2411,19 +2415,27 @@ class GameManager:
                     raise EventCommitError("CHECKPOINT_SOURCE: physical source request is missing")
                 try:
                     request = _stored_action_request(state, request_id)
-                    window = self._window_for_request(state, request)
-                except (TypeError, ValueError, ResolutionError) as exc:
+                    raw_window = state.action_windows.get(request.window_id)
+                    if raw_window is None:
+                        raise ValueError("source action window is missing")
+                    window = _load_action_window(raw_window)
+                except (TypeError, ValueError) as exc:
                     raise EventCommitError("CHECKPOINT_SOURCE: physical source request is malformed") from exc
                 if (
-                    raw_request.get("request_id", request_id) != request_id
+                    request.game_id != state.game_id
+                    or request.phase.value != ledger.timing
+                    or raw_request.get("request_id", request_id) != request_id
                     or raw_request.get("status") != "CONFIRMED"
                     or raw_request.get("rule_receipt_id") != ledger.batch_id
                     or raw_request.get("rule_group_id") != ledger.group_id
+                    or window.game_id != state.game_id
                     or window.closed_at is None
                     or window.settlement_group_id != ledger.group_id
                     or window.phase.value != ledger.timing
+                    or request.window_id != window.window_id
                     or request.session_epoch != window.session_epoch
-                    or request.session_epoch != state.players[request.seat].session_epoch
+                    or request.seat not in state.players
+                    or request.session_epoch > state.players[request.seat].session_epoch
                 ):
                     raise EventCommitError("CHECKPOINT_SOURCE: physical source request is unconfirmed")
                 rows = raw_request.get("rule_dispositions")
@@ -2454,9 +2466,13 @@ class GameManager:
                     or request.actions[action_index].action_code != action_code
                     or not isinstance(ability_id, str)
                     or not isinstance(skill_id, str)
+                    or not isinstance(status, str)
                     or status not in {"ACCEPTED", "PASSED"}
                     or (status == "PASSED") != (action_code == 299)
                     or (fact.actor_seat is not None and request.seat != fact.actor_seat)
+                    or request.seat not in ledger.actor_seats
+                    or skill_id not in ledger.skill_ids
+                    or action_code not in ledger.action_codes
                 ):
                     raise EventCommitError("CHECKPOINT_SOURCE: source request disposition is inconsistent")
                 source_skill = next((item for item in package.skills if item.skill_id == skill_id), None)
@@ -2470,7 +2486,26 @@ class GameManager:
                     ),
                     None,
                 )
-                if source_skill is None or source_instance is None or source_skill.action_code != action_code:
+                if (
+                    source_skill is None
+                    or source_instance is None
+                    or source_skill.action_code != source_instance.action_code
+                    or source_instance.grant_kind not in {"ACTIVE", "TRIGGER"}
+                    or all(grant.grant_id != source_instance.grant_id for grant in source_skill.grants)
+                    or (status == "ACCEPTED" and source_skill.action_code != action_code)
+                    or (
+                        status == "PASSED"
+                        and (
+                            not window.allow_pass
+                            or source_skill.action_code not in window.allowed_action_codes
+                            or 299 not in window.allowed_action_codes
+                            or not any(
+                                item.action_code == source_skill.action_code and item.allow_pass
+                                for item in package.actions
+                            )
+                        )
+                    )
+                ):
                     raise EventCommitError("CHECKPOINT_SOURCE: disposition skill binding is invalid")
                 histories = tuple(
                     use for use in ledger.history_updates if use.request_id == fact.source_request_id
@@ -2481,9 +2516,10 @@ class GameManager:
                         len(histories) != 1
                         or use.ability_instance_id != ability_id
                         or use.skill_id != skill_id
-                        or use.action_code != action_code
+                        or use.action_code != source_skill.action_code
                         or use.actor_seat != request.seat
                         or use.disposition != status
+                        or use.passed != (status == "PASSED")
                     ):
                         raise EventCommitError("CHECKPOINT_SOURCE: use history disagrees with disposition")
                 if fact.source_rule_id is not None:

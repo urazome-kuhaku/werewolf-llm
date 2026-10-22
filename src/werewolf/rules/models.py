@@ -23,6 +23,7 @@ from pydantic import (
     model_validator,
 )
 
+from werewolf.domain.night_boundaries import NightBoundarySchedule
 from werewolf.domain.victory_rules import VictoryProgram
 
 SeatNo = Annotated[int, Field(ge=1, le=64, strict=True)]
@@ -491,12 +492,17 @@ class ExecutionPackage(RuleModel):
     # Derived from the frozen board definition. Omit the absent value from
     # legacy serialization so A/B execution identities remain unchanged.
     victory_program: VictoryProgram | None = None
+    # Board-derived typed night boundary flow. Omit an absent legacy value to
+    # preserve A/B execution package identities.
+    night_boundary_schedule: NightBoundarySchedule | None = None
 
     @model_serializer(mode="wrap")
     def serialize_legacy_shape(self, handler: Any) -> dict[str, object]:
         data = cast(dict[str, object], handler(self))
         if self.victory_program is None:
             data.pop("victory_program", None)
+        if self.night_boundary_schedule is None:
+            data.pop("night_boundary_schedule", None)
         return data
 
     def model_post_init(self, __context: object) -> None:

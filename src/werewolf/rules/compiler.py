@@ -219,9 +219,18 @@ def compile_execution_definition(package: KnowledgePackage) -> CompiledExecution
             if execution_input["victory_program"] is not None:
                 raise _error("victory_program is derived from the frozen board definition")
             del execution_input["victory_program"]
+        if "night_boundary_schedule" in execution_input:
+            if execution_input["night_boundary_schedule"] is not None:
+                raise _error(
+                    "night_boundary_schedule is derived from the frozen board definition"
+                )
+            del execution_input["night_boundary_schedule"]
         execution = ExecutionPackage.model_validate(execution_input)
         execution = execution.model_copy(
-            update={"victory_program": package.board.model.victory.program}
+            update={
+                "victory_program": package.board.model.victory.program,
+                "night_boundary_schedule": package.board.model.night_boundary_schedule,
+            }
         )
         additions_raw = raw["action_definitions"]
         if not isinstance(additions_raw, Sequence) or isinstance(additions_raw, str | bytes):
@@ -575,9 +584,11 @@ def _validate_victory_program_binding(
     """Bind a typed victory program to its board and declared state schema."""
 
     if board is None:
-        if execution.victory_program is not None:
-            raise _error("a frozen board is required for declarative victory")
+        if execution.victory_program is not None or execution.night_boundary_schedule is not None:
+            raise _error("a frozen board is required for board-derived execution fields")
         return
+    if execution.night_boundary_schedule != board.night_boundary_schedule:
+        raise _error("execution night-boundary schedule disagrees with the frozen board")
     board_program = board.victory.program
     if board.victory.mode == "declarative":
         if board_program is None or execution.victory_program != board_program:

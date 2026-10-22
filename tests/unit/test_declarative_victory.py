@@ -19,6 +19,7 @@ from werewolf.game.state import (
     PlayerState,
     RuleBoundary,
     RuleReturnPoint,
+    RuleStateValue,
     RuleWorkflowCursor,
 )
 from werewolf.game.victory import RulesetMismatchError, evaluate_victory
@@ -196,6 +197,71 @@ def test_faction_and_victory_group_counts_read_independent_current_fields() -> N
     assert result.status == "DRAW"
     assert result.candidate_sides == ("good", "wolf")
     assert result.reasons == ("TOP_PRIORITY_MULTI_SIDE_DRAW",)
+
+
+@pytest.mark.asyncio
+async def test_expired_game_bool_uses_its_frozen_initial_value_after_next_night_starts() -> None:
+    program = _program(
+        VictoryCondition(
+            condition_id="gate-is-initially-false",
+            side_id="wolf",
+            priority=3,
+            when=VictoryBoolean(op="not", values=(VictoryGameState(key="gate"),)),
+        )
+    )
+    execution = _execution(program).model_copy(
+        update={
+            "state_declarations": (
+                StateDeclaration(
+                    skill_id="victory-state",
+                    key="gate",
+                    value_type="bool",
+                    initial=False,
+                    scope="GAME",
+                    expiry_policy="NEXT_NIGHT_START",
+                ),
+            )
+        }
+    )
+    manager = _manager(execution)
+    manager._state = manager.state.model_copy(
+        update={
+            "phase": GamePhase.VICTORY_CHECK,
+            "round_no": 1,
+            "rule_state": (
+                RuleStateValue(
+                    scope="GAME",
+                    key="gate",
+                    value_type="bool",
+                    value=True,
+                    source_batch_id="expired-state-write",
+                    skill_id="victory-state",
+                    expiry_policy="NEXT_NIGHT_START",
+                    expires_at_round=1,
+                    expires_at_hook=GamePhase.NIGHT_TEAM_CHAT.value,
+                ),
+            ),
+        }
+    )
+    board = _board(program)
+
+    before_expiry = evaluate_victory(
+        manager.state,
+        board,
+        execution_package=execution,
+    )
+    assert before_expiry.status == "ONGOING"
+
+    await manager.commit_phase_transition(GamePhase.NIGHT_TEAM_CHAT, now=NOW)
+    assert not manager.state.rule_state
+
+    after_expiry = evaluate_victory(
+        manager.state,
+        board,
+        execution_package=execution,
+    )
+    assert after_expiry.status == "WINNER"
+    assert after_expiry.winner == "wolf"
 
 
 @pytest.mark.parametrize(

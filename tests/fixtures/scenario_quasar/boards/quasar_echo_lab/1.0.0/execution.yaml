@@ -1,0 +1,243 @@
+schema_version: 1
+execution:
+  schema_version: 1
+  language_version: 1
+  board_id: quasar_echo_lab
+  board_version: 1.0.0
+  actions:
+  - action_code: 299
+    action_id: PASS
+    allow_pass: true
+  - action_code: 987
+    action_id: QUASAR_ECHO
+    allow_pass: true
+  skills:
+  - skill_id: quasar_echo_unfamiliar
+    action_code: 987
+    mode: PLAYER
+    grants:
+    - grant_id: quasar_echo_grant
+      actor_selector:
+        op: select
+        source: players
+        where:
+          op: eq
+          left:
+            op: ref
+            source: item
+            name: role_id
+          right:
+            op: literal
+            value: quasar_oracle
+            value_type: null
+        map:
+          op: ref
+          source: item
+          name: seat
+        distinct: true
+    timing:
+    - NIGHT_ACTION
+    after_skills: []
+    window_ids: []
+    hook_ids: []
+    trigger: null
+    coordination_scope: INDIVIDUAL
+    condition:
+      op: gt
+      left:
+        op: count
+        selector:
+          op: select
+          source: players
+          where:
+            op: eq
+            left:
+              op: ref
+              source: item
+              name: alive
+            right:
+              op: literal
+              value: true
+              value_type: null
+          map: null
+          distinct: true
+      right:
+        op: literal
+        value: 2
+        value_type: null
+    targets:
+      min_targets: 2
+      max_targets: 2
+      selector:
+        op: select
+        source: players
+        where:
+          op: and
+          values:
+          - op: eq
+            left:
+              op: ref
+              source: item
+              name: alive
+            right:
+              op: literal
+              value: true
+              value_type: null
+          - op: ne
+            left:
+              op: ref
+              source: item
+              name: seat
+            right:
+              op: ref
+              source: actor
+              name: seat
+        map:
+          op: ref
+          source: item
+          name: seat
+        distinct: true
+      allow_self: false
+    usage:
+      max_uses: 1
+      scope: ROUND
+      pass_records: true
+      pass_updates_history: false
+      costs: []
+      cost_policy: ON_SUCCESS
+      charge_on_pass: false
+    effects:
+    - effect_id: quasar-scan-fact
+      effect_type: FACT
+      target:
+        op: ref
+        source: target
+        name: seat
+      condition:
+        op: eq
+        left:
+          op: ref
+          source: request
+          name: parameter:mode
+        right:
+          op: literal
+          value: scan
+          value_type: null
+      value: null
+      tags: []
+      state_key: null
+      fact_type: quasar_scan_mark
+      authorized_targets: []
+      player_field: null
+      resource_id: null
+      delta: null
+      relation_type: null
+      relation_source: null
+      relation_target: null
+      relation_expiry_policy: null
+      grant_skill_id: null
+      grant_id: null
+      flow_action: null
+    - effect_id: quasar-strike-damage
+      effect_type: DAMAGE
+      target:
+        op: ref
+        source: target
+        name: seat
+      condition:
+        op: eq
+        left:
+          op: ref
+          source: request
+          name: parameter:mode
+        right:
+          op: literal
+          value: strike
+          value_type: null
+      value: null
+      tags: []
+      state_key: null
+      fact_type: null
+      authorized_targets: []
+      player_field: null
+      resource_id: null
+      delta: null
+      relation_type: null
+      relation_source: null
+      relation_target: null
+      relation_expiry_policy: null
+      grant_skill_id: null
+      grant_id: null
+      flow_action: null
+    pass_effects: []
+    disclosures:
+    - disclosure_id: quasar-self-report
+      audience: SELF
+      fields: []
+      values:
+        mode:
+          op: ref
+          source: request
+          name: parameter:mode
+        selected_targets:
+          op: map
+          selector:
+            op: select
+            source: request_targets
+            where: null
+            map: null
+            distinct: true
+          value:
+            op: ref
+            source: item
+            name: seat
+        alive_count:
+          op: count
+          selector:
+            op: select
+            source: players
+            where:
+              op: eq
+              left:
+                op: ref
+                source: item
+                name: alive
+              right:
+                op: literal
+                value: true
+                value_type: null
+            map: null
+            distinct: true
+      condition: null
+      recipients: null
+      hook: null
+      event_type: quasar_skill_report
+    parameters:
+    - name: mode
+      value_type: str
+      required: true
+      choices:
+      - strike
+  state_declarations: []
+  relation_declarations: []
+  resource_declarations: []
+  player_field_values: null
+  window_metadata: []
+  window_settlement_groups: {}
+  boundary_policy: null
+  interactions:
+  - interaction_id: quasar-confirm-damage
+    rule_type: CONFIRM_DEATH
+    priority: 0
+    when: null
+    damage_tags: []
+    counter_tags: []
+    fact_type: null
+    death_cause: null
+    effects: []
+    disclosures: []
+action_definitions:
+- action_code: 987
+  action_name: QUASAR_ECHO
+  target_policy: other_alive
+  target_count: 2

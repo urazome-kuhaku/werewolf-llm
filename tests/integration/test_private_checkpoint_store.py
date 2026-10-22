@@ -9,21 +9,19 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from test_rules_b_workflow import _compiled_workflow_fixture
+from test_rules_b_workflow import (
+    GAME_ID as WORKFLOW_GAME_ID,
+    _compiled_workflow_fixture,
+    _manager as _workflow_manager,
+    _settle_initial_multi_death,
+)
 
-from werewolf.domain.enums import GamePhase, RunStatus
-from werewolf.game.actions import ActionWindow
+from werewolf.domain.enums import GamePhase
+from werewolf.game.manager import GameManager
 from werewolf.game.state import (
-    AbilityInstanceState,
     GameState,
-    PlayerState,
-    RuleCommitReceipt,
     RuleExecutionIdentity,
-    RuleFactRecord,
-    RuleLedgerEntry,
     RulesetRef,
-    RuleTriggerOccurrence,
-    RuleWorkflowCursor,
 )
 from werewolf.knowledge.compiled_store import CompiledKnowledgeStore
 from werewolf.knowledge.snapshot import KnowledgeSnapshotBuilder
@@ -38,7 +36,7 @@ from werewolf.persistence.checkpoint import (
 )
 
 NOW = datetime(2026, 10, 22, 20, 0, tzinfo=UTC)
-GAME_ID = "private-choice-checkpoint"
+GAME_ID = WORKFLOW_GAME_ID
 
 
 def _digest(value: object) -> str:
@@ -54,6 +52,9 @@ async def test_waiting_choice_checkpoint_restores_frozen_bundle_and_checks_ident
     compiled, _ = await _compiled_workflow_fixture()
     assert compiled.execution is not None
     assert compiled.action_registry is not None
+    manager, _ = await _workflow_manager()
+    assert manager.execution_package is not None
+    assert manager.execution_package.package_id == compiled.execution.package_id
     compiled_store = CompiledKnowledgeStore(tmp_path / "compiled")
     await compiled_store.publish(compiled)
     package_load = await compiled_store.load(compiled.board_ref)
@@ -68,183 +69,44 @@ async def test_waiting_choice_checkpoint_restores_frozen_bundle_and_checks_ident
     frozen_files = {
         relative: (snapshot.root / relative).read_bytes() for relative in snapshot.file_digests
     }
-    executable_wrapper = compiled.package_payload["executable"]
-    assert isinstance(executable_wrapper, dict)
     execution_digest = compiled.manifest_payload["execution_sha256"]
     assert isinstance(execution_digest, str)
     action_registry_digest = _digest(compiled.action_registry.model_dump(mode="json"))
-    skill = next(
-        item
-        for item in compiled.execution.skills
-        if item.trigger is not None and item.trigger.mode == "PLAYER_CHOICE"
+    frozen_ref = RulesetRef(
+        board_id=compiled.board_ref.id,
+        version=compiled.board_ref.version,
+        snapshot_id=snapshot.snapshot_id,
+        manifest_sha256=snapshot.manifest_sha256,
     )
-    assert skill.trigger is not None
-    source_fact_id = "confirmed-death-fact-1"
-    source_batch_id = "source-rule-batch-1"
-    source_request_id = "source-internal-request-1"
-    occurrence_id = "hunter-choice-1"
-    window_id = "hunter-choice-window-1"
-    ability_id = "hunter-trigger-instance-1"
-    action_code = skill.action_code
-    source_fact = RuleFactRecord(
-        fact_id=source_fact_id,
-        fact_type=skill.trigger.fact_types[0],
-        source_request_id=source_request_id,
-        actor_seat=2,
-        target_seat=2,
-        death_cause="white_wolf_explosion",
+    state = GameState.model_validate(
+        {
+            **manager.state.model_dump(mode="python"),
+            "ruleset": frozen_ref.model_dump(mode="python"),
+        }
     )
-    trigger_window = ActionWindow(
-        window_id=window_id,
-        game_id=GAME_ID,
-        session_epoch=4,
-        phase=GamePhase.TRIGGER_ACTION,
-        allowed_seats=(2,),
-        allowed_action_codes=(action_code,),
-        opened_at=NOW,
-        settlement_group_id="trigger-group-1",
-        logical_window_id="hunter-choice",
-        visible_context={
-            "rule_occurrence_id": occurrence_id,
-            "rule_source_fact_id": source_fact_id,
-            "rule_actor_seat": 2,
-            "rule_ability_instance_id": ability_id,
-            "rule_skill_id": skill.skill_id,
-            "rule_action_code": action_code,
-        },
+    manager = GameManager(
+        state,
+        registry=manager.registry,
+        execution_package=manager.execution_package,
     )
-    closed_source_window = ActionWindow(
-        window_id="source-window-1",
-        game_id=GAME_ID,
-        session_epoch=4,
-        phase=GamePhase.NIGHT_ACTION,
-        allowed_seats=(2,),
-        allowed_action_codes=(299,),
-        opened_at=NOW,
-        closed_at=NOW,
-        settlement_group_id="source-group-1",
+    await _settle_initial_multi_death(manager)
+    automatic = next(item for item in manager.state.rule_trigger_queue if item.mode == "AUTOMATIC")
+    auto_step = await manager.advance_rule_workflow(
+        expected_revision=manager.state.state_revision,
     )
-    ledger = RuleLedgerEntry(
-        batch_id=source_batch_id,
-        package_id=compiled.execution.package_id,
-        group_id="source-group-1",
-        timing="NIGHT_ACTION",
-        read_revision=10,
-        committed_revision=11,
-        round_no=1,
-        request_ids=("source-physical-request-1",),
-        actor_seats=(2,),
-        skill_ids=("source-skill-1",),
-        action_codes=(299,),
-        facts=(source_fact,),
-        outcome_digest="a" * 64,
-        created_at=NOW,
+    assert auto_step.kind == "AUTOMATIC"
+    assert auto_step.occurrence_id == automatic.occurrence_id
+    await manager.commit_rule_group(
+        f"automatic-{automatic.occurrence_id}",
+        occurrence_ids=(automatic.occurrence_id,),
+        expected_revision=manager.state.state_revision,
     )
-    receipt = RuleCommitReceipt(
-        batch_id=source_batch_id,
-        package_id=compiled.execution.package_id,
-        group_id="source-group-1",
-        timing="NIGHT_ACTION",
-        read_revision=10,
-        committed_revision=11,
-        request_ids=("source-physical-request-1",),
-        outcome_digest="a" * 64,
+    choice_step = await manager.advance_rule_workflow(
+        expected_revision=manager.state.state_revision,
     )
-    state = GameState(
-        game_id=GAME_ID,
-        created_at=NOW,
-        updated_at=NOW,
-        phase=GamePhase.TRIGGER_ACTION,
-        run_status=RunStatus.RUNNING,
-        round_no=1,
-        ruleset=RulesetRef(
-            board_id=compiled.board_ref.id,
-            version=compiled.board_ref.version,
-            snapshot_id=snapshot.snapshot_id,
-            manifest_sha256=snapshot.manifest_sha256,
-        ),
-        execution_identity=RuleExecutionIdentity(
-            package_id=compiled.execution.package_id,
-            board_id=compiled.execution.board_id,
-            board_version=compiled.execution.board_version,
-            execution_digest=compiled.execution.package_id,
-            action_registry_digest=action_registry_digest,
-        ),
-        ability_instances=(
-            AbilityInstanceState(
-                ability_instance_id=ability_id,
-                skill_id=skill.skill_id,
-                grant_id=skill.grants[0].grant_id,
-                action_code=action_code,
-                actor_seat=2,
-                grant_kind="TRIGGER",
-            ),
-        ),
-        rule_trigger_queue=(
-            RuleTriggerOccurrence(
-                occurrence_id=occurrence_id,
-                kind="TRIGGER",
-                source_fact_id=source_fact_id,
-                source_batch_id=source_batch_id,
-                ability_instance_id=ability_id,
-                skill_id=skill.skill_id,
-                actor_seat=2,
-                mode="PLAYER_CHOICE",
-                order=1,
-                status="WAITING_CHOICE",
-                window_id=window_id,
-                logical_window_id="hunter-choice",
-            ),
-        ),
-        rule_workflow_cursor=RuleWorkflowCursor(
-            cursor_id="cursor-1",
-            settlement_group_id="trigger-group-1",
-            active_window_ids=(window_id,),
-            active_occurrence_id=occurrence_id,
-            status="WAITING_CHOICE",
-        ),
-        rule_ledger=(ledger,),
-        rule_receipts=(receipt,),
-        players={
-            1: PlayerState(
-                seat=1,
-                role_id="villager",
-                faction_id="good",
-                runtime_ref="old-runtime-1",
-                session_epoch=4,
-            ),
-            2: PlayerState(
-                seat=2,
-                role_id="wolf",
-                faction_id="wolf",
-                alive=False,
-                death_cause="white_wolf_explosion",
-                runtime_ref="old-runtime-1",
-                session_epoch=4,
-            ),
-        },
-        action_windows={
-            window_id: trigger_window.model_dump(mode="json"),
-            closed_source_window.window_id: closed_source_window.model_dump(mode="json"),
-        },
-        action_requests={
-            "source-physical-request-1": {
-                "request_id": "source-physical-request-1",
-                "window_id": "source-window-1",
-                "seat": 2,
-                "status": "CONFIRMED",
-            }
-        },
-        resolutions=({"request_id": "source-physical-request-1", "status": "CONFIRMED"},),
-        pending_resolution={
-            "operation": "RULE_TRIGGER",
-            "status": "RULE_TRIGGER_ACTION_REQUIRED",
-            "occurrence_id": occurrence_id,
-            "window_id": window_id,
-            "source_fact_id": source_fact_id,
-            "actor_seat": 2,
-        },
-    )
+    assert choice_step.kind == "PLAYER_CHOICE"
+    state = manager.state
+    await manager.assert_private_checkpoint_waiting_choice(state)
     identity = PrivateCheckpointIdentity(
         game_id=GAME_ID,
         board_ref=compiled.board_ref.format(),
@@ -257,6 +119,7 @@ async def test_waiting_choice_checkpoint_restores_frozen_bundle_and_checks_ident
 
     saved = await store.create(
         state,
+        manager=manager,
         knowledge_snapshot_manifest=snapshot_manifest,
         frozen_files=frozen_files,
         identity=identity,
@@ -348,9 +211,15 @@ async def test_private_checkpoint_rejects_unsupported_phase_and_payload_tamperin
             action_registry_digest=_digest(compiled.action_registry.model_dump(mode="json")),
         ),
     )
+    invalid_manager = GameManager(
+        invalid,
+        registry=compiled.action_registry,
+        execution_package=compiled.execution,
+    )
     with pytest.raises(PrivateCheckpointBoundaryError):
         await store.create(
             invalid,
+            manager=invalid_manager,
             knowledge_snapshot_manifest=snapshot_manifest,
             frozen_files=frozen_files,
             created_at=NOW.isoformat(),
