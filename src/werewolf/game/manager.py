@@ -94,6 +94,7 @@ from .state import (
     GrantedTriggerAbility,
     PlayerState,
     RuleBoundary,
+    RuleBoundaryPrerequisiteResult,
     RuleCommitReceipt,
     RuleDeferredDisclosure,
     RuleExecutionIdentity,
@@ -2490,15 +2491,21 @@ class GameManager:
                 for cursor in state.delivery_cursors.values()
             ):
                 raise EventCommitError("CHECKPOINT_BOUNDARY: event delivery is still in flight")
-            if any(
-                not isinstance(request, Mapping)
-                or request.get("window_id") == occurrence.window_id
-                or not isinstance(request.get("status"), str)
-                or request.get("status", "").upper()
-                in {"OPEN", "REQUESTED", "SUBMITTING", "IN_FLIGHT", "PROCESSING", "PENDING"}
-                for request in state.action_requests.values()
-            ):
-                raise EventCommitError("CHECKPOINT_BOUNDARY: physical action request is in flight")
+            for request in state.action_requests.values():
+                if not isinstance(request, Mapping):
+                    raise EventCommitError(
+                        "CHECKPOINT_BOUNDARY: physical action request is malformed"
+                    )
+                status = request.get("status")
+                if (
+                    request.get("window_id") == occurrence.window_id
+                    or not isinstance(status, str)
+                    or status.upper()
+                    in {"OPEN", "REQUESTED", "SUBMITTING", "IN_FLIGHT", "PROCESSING", "PENDING"}
+                ):
+                    raise EventCommitError(
+                        "CHECKPOINT_BOUNDARY: physical action request is in flight"
+                    )
             pending = state.pending_resolution
             if (
                 not isinstance(pending, Mapping)
@@ -2604,6 +2611,7 @@ class GameManager:
             for effect in (*skill.effects, *skill.pass_effects)
         } | {item.interaction_id for item in package.interactions}
         causal_value = fact.data.get("source_request_ids")
+        causal_ids: tuple[str, ...]
         if causal_value is None:
             causal_ids = (fact.source_request_id,) if fact.source_request_id is not None else ()
         elif not isinstance(causal_value, (list, tuple)) or any(
@@ -2611,13 +2619,16 @@ class GameManager:
         ):
             raise EventCommitError("CHECKPOINT_SOURCE: causal request IDs are malformed")
         else:
-            causal_ids = tuple(causal_value)
+            causal_ids = tuple(cast(str, item) for item in causal_value)
         if (
             not causal_ids
+            or len(causal_ids) > 64
             or len(causal_ids) != len(set(causal_ids))
             or (fact.source_request_id is not None and fact.source_request_id not in causal_ids)
         ):
-            raise EventCommitError("CHECKPOINT_SOURCE: fact has no unique causal request proof")
+            raise EventCommitError(
+                "CHECKPOINT_SOURCE: fact has no unique causal request proof or exceeds ancestry limit"
+            )
         source_records_value = fact.data.get("sources")
         source_records: tuple[Mapping[str, object], ...] = ()
         if source_records_value is not None:
@@ -2683,6 +2694,7 @@ class GameManager:
                     ) from exc
                 if (
                     request.game_id != state.game_id
+                    or request.phase is None
                     or request.phase.value != ledger.timing
                     or raw_request.get("request_id", request_id) != request_id
                     or raw_request.get("status") != "CONFIRMED"
@@ -2774,12 +2786,12 @@ class GameManager:
                 bound = disposition_matches.get(causal_id)
                 if bound is None:
                     raise EventCommitError("CHECKPOINT_SOURCE: causal ID is not receipt-bound")
-                request, window, row = bound
-                action_index = row.get("action_index")
-                action_code = row.get("action_code")
-                ability_id = row.get("ability_instance_id")
-                skill_id = row.get("skill_id")
-                status = row.get("status")
+                request, window, disposition_row = bound
+                action_index = disposition_row.get("action_index")
+                action_code = disposition_row.get("action_code")
+                ability_id = disposition_row.get("ability_instance_id")
+                skill_id = disposition_row.get("skill_id")
+                status = disposition_row.get("status")
                 if (
                     type(action_index) is not int
                     or not 0 <= action_index < len(request.actions)
@@ -3295,6 +3307,14 @@ class GameManager:
             raise ResolutionError("RULE_PACKAGE_MISSING", "game has no pinned execution package")
         if self._rules is None:
             raise ResolutionError("RULE_PACKAGE_MISSING", "game has no pinned rule interpreter")
+        if any(
+            fact.fact_type.upper() in {"DEATH_CONFIRMED", "RULE_FLOW_QUEUED"}
+            for fact in (*batch.outcomes, *batch.facts)
+        ):
+            raise ResolutionError(
+                "RULE_RESERVED_FACT",
+                "reserved manager facts cannot be emitted by a rule batch",
+            )
         if (
             batch.package_id != package.package_id
             or batch.board_id != package.board_id
@@ -5559,7 +5579,7 @@ class GameManager:
                 }
             )
             for item in (*batch.outcomes, *batch.facts)
-            if item.fact_type.upper() != "DEATH_CONFIRMED"
+            if item.fact_type.upper() not in {"DEATH_CONFIRMED", "RULE_FLOW_QUEUED"}
         )
         confirmed_death_facts = self._confirmed_death_facts(state, batch)
         queued_flow_facts: list[RuleFactRecord] = []
@@ -5581,7 +5601,9 @@ class GameManager:
                 )
             source_binding = source_bindings[0] if source_bindings else None
             source_disposition = disposition_by_id.get(flow_update.source_request_id)
-            disposition = source_disposition.status if source_disposition is not None else "ACCEPTED"
+            disposition = (
+                source_disposition.status if source_disposition is not None else "ACCEPTED"
+            )
             queued_flow_facts.append(
                 RuleFactRecord(
                     fact_id=_stable_rule_identifier(
@@ -5749,7 +5771,7 @@ class GameManager:
             else existing_cursor
         )
         assert cursor is not None
-        flow_update = batch.flow_updates[0] if batch.flow_updates else None
+        pending_flow_update = batch.flow_updates[0] if batch.flow_updates else None
         pending_queue = any(item.status in {"QUEUED", "READY", "WAITING_CHOICE"} for item in queue)
         pending_boundaries = tuple(item for item in boundaries if item.is_pending)
         cursor = cursor.model_copy(
@@ -5760,7 +5782,9 @@ class GameManager:
                 "return_point": return_point,
                 "next_logical_window_id": return_point.logical_window_id,
                 "pending_flow_action": (
-                    flow_update.action if flow_update is not None else cursor.pending_flow_action
+                    pending_flow_update.action
+                    if pending_flow_update is not None
+                    else cursor.pending_flow_action
                 ),
                 "pending_boundary_id": (
                     pending_boundaries[0].boundary_id if pending_boundaries else None
@@ -6435,6 +6459,137 @@ class GameManager:
             and receipt.request_ids == ledger.request_ids
             and receipt.outcome_digest == ledger.outcome_digest
             for receipt in state.rule_receipts
+        )
+
+    def night_boundary_prerequisites(
+        self,
+        state: GameState | None = None,
+        *,
+        round_no: int | None = None,
+    ) -> tuple[RuleBoundaryPrerequisiteResult, ...]:
+        """Project manager-verified completion for the frozen night schedule.
+
+        The result is derived from durable election and announcement records.
+        It is used for moderator progress and lifecycle gates; a caller cannot
+        submit a boolean to satisfy a prerequisite.
+        """
+
+        current = self._state if state is None else state
+        package = self._execution_package
+        schedule = package.night_boundary_schedule if package is not None else None
+        if schedule is None:
+            return ()
+        completed_round = round_no
+        if completed_round is None:
+            completed_round = current.round_no
+            if current.phase in {GamePhase.VICTORY_CHECK, GamePhase.NIGHT_TEAM_CHAT}:
+                completed_round = max(0, completed_round - 1)
+        required = schedule.required_for_round(completed_round)
+        results: list[RuleBoundaryPrerequisiteResult] = []
+        for prerequisite in required:
+            if prerequisite == "FIRST_DAY_SHERIFF_ELECTION":
+                source_id = self._completed_sheriff_election_source(current, completed_round)
+            else:
+                source_id = self._day_announcement_source(current, completed_round)
+            results.append(
+                RuleBoundaryPrerequisiteResult(
+                    prerequisite=prerequisite,
+                    satisfied=source_id is not None,
+                    source_id=source_id,
+                )
+            )
+        return tuple(results)
+
+    @staticmethod
+    def _completed_sheriff_election_source(
+        state: GameState,
+        round_no: int,
+    ) -> str | None:
+        if round_no != 0 or state.day_no != 1 or state.sheriff_election is None:
+            return None
+        try:
+            election = _load_sheriff_election(state.sheriff_election)
+        except EventCommitError:
+            return None
+        if (
+            election.game_id != state.game_id
+            or election.day_no != 1
+            or election.status
+            not in {SheriffElectionStatus.RESOLVED, SheriffElectionStatus.NO_SHERIFF}
+        ):
+            return None
+        return "sheriff-election-r0-d1"
+
+    @staticmethod
+    def _day_announcement_source(state: GameState, round_no: int) -> str | None:
+        expected_correlation = f"day-announce-r{round_no}-d{round_no + 1}"
+        try:
+            events = _typed_events(state)
+        except EventCommitError:
+            return None
+        matching = tuple(
+            event
+            for event in events
+            if event.event_type is EventType.ANNOUNCEMENT
+            and event.phase is GamePhase.DAY_ANNOUNCE
+            and event.round_no == round_no
+            and event.correlation_id == expected_correlation
+        )
+        if len(matching) != 1:
+            return None
+        return f"announcement-event-{matching[0].event_id}"
+
+    def _scheduled_night_prerequisites_satisfied(
+        self,
+        state: GameState,
+        round_no: int,
+    ) -> bool:
+        results = self.night_boundary_prerequisites(state, round_no=round_no)
+        return bool(results) and all(item.satisfied for item in results)
+
+    def _scheduled_sheriff_badge_complete(self, state: GameState) -> bool:
+        package = self._execution_package
+        policy = package.boundary_policy if package is not None else None
+        sheriff_seat = state.sheriff_seat
+        if (
+            policy is None
+            or not policy.sheriff_enabled
+            or policy.badge_transfer_enabled is not True
+            or sheriff_seat is None
+        ):
+            return True
+        player = state.players.get(sheriff_seat)
+        if player is None or (player.alive and player.can_vote):
+            return True
+        required = (
+            policy.badge_transfer_on_death is True
+            if not player.alive
+            else policy.badge_transfer_enabled is True
+        )
+        if not required:
+            return True
+        marker = state.sheriff_badge
+        if not isinstance(marker, Mapping) or marker.get("status") != "COMPLETE":
+            return False
+        request_id = marker.get("request_id")
+        source_seat = marker.get("source_seat")
+        action_code = marker.get("action_code")
+        target_seat = marker.get("target_seat")
+        office_matches = (
+            action_code == 201 and target_seat == sheriff_seat
+        ) or (action_code == 202 and sheriff_seat is None)
+        return bool(
+            isinstance(request_id, str)
+            and request_id
+            and type(source_seat) is int
+            and office_matches
+            and any(
+                audit.get("operation") == "SHERIFF_BADGE_COMPLETE"
+                and audit.get("request_id") == request_id
+                and audit.get("source_seat") == source_seat
+                for audit in state.moderator_audit
+                if isinstance(audit, Mapping)
+            )
         )
 
     async def advance_rule_workflow(
@@ -7795,8 +7950,8 @@ class GameManager:
             max_submissions_per_seat=1,
         )
 
-    @staticmethod
     def _workflow_step(
+        self,
         occurrence: RuleTriggerOccurrence,
         skill: SkillSpec,
         cursor: RuleWorkflowCursor,
@@ -7819,6 +7974,7 @@ class GameManager:
             return_point=cursor.return_point,
             queue_pending=True,
             cursor_id=cursor.cursor_id,
+            boundary_prerequisites=self.night_boundary_prerequisites(),
         )
 
     def _refresh_boundary_completion(
@@ -10187,6 +10343,24 @@ class GameManager:
                 SheriffElectionStatus.NO_SHERIFF,
             }:
                 raise SheriffElectionError("ELECTION_PENDING", "sheriff election is not confirmed")
+            schedule = (
+                self._execution_package.night_boundary_schedule
+                if self._execution_package is not None
+                else None
+            )
+            if (
+                schedule is not None
+                and current.round_no == 0
+                and "FIRST_DAY_SHERIFF_ELECTION" in schedule.required_for_round(0)
+            ):
+                timestamp = _aware_commit_time(now)
+                data = _state_data(current)
+                data["phase"] = GamePhase.DAY_ANNOUNCE
+                data["state_revision"] = revision + 1
+                data["updated_at"] = timestamp
+                committed = GameState.model_validate(data)
+                self._state = committed
+                return committed
             try:
                 committed = transition_phase(
                     current,
@@ -10751,7 +10925,12 @@ class GameManager:
                         "BADGE_BOUNDARY_INVALID",
                         "completed badge lacks a matching decision request and boundary audit",
                     )
-            if current.phase is GamePhase.DAY_SPEECH:
+            scheduled_dawn_hold = bool(
+                current.phase is GamePhase.DAY_ANNOUNCE
+                and self._execution_package is not None
+                and self._execution_package.night_boundary_schedule is not None
+            )
+            if current.phase is GamePhase.DAY_SPEECH or scheduled_dawn_hold:
                 data = _state_data(current)
                 data["state_revision"] = revision + 1
                 data["updated_at"] = timestamp
@@ -11735,6 +11914,14 @@ class GameManager:
             _revision_check(state, revision)
             if state.phase is not GamePhase.DAY_ANNOUNCE:
                 raise EventCommitError("PHASE_MISMATCH: night victory check requires DAY_ANNOUNCE")
+            if (
+                self._execution_package is not None
+                and self._execution_package.night_boundary_schedule is not None
+                and not self._scheduled_night_prerequisites_satisfied(state, state.round_no)
+            ):
+                raise EventCommitError(
+                    "VICTORY_BLOCKED: scheduled night prerequisites are incomplete"
+                )
             if state.run_status in {
                 RunStatus.PAUSED,
                 RunStatus.FAILED,
@@ -11766,6 +11953,14 @@ class GameManager:
             ) == "OPEN":
                 raise EventCommitError(
                     "VICTORY_BLOCKED: a sheriff badge choice is still pending"
+                )
+            if (
+                self._execution_package is not None
+                and self._execution_package.night_boundary_schedule is not None
+                and not self._scheduled_sheriff_badge_complete(state)
+            ):
+                raise EventCommitError(
+                    "VICTORY_BLOCKED: scheduled sheriff badge choice is incomplete"
                 )
             active_request_statuses = {
                 "OPEN",
@@ -12511,6 +12706,52 @@ class GameManager:
                 self._state.state_revision if expected_revision is None else expected_revision
             )
             current = self._state
+            schedule = (
+                self._execution_package.night_boundary_schedule
+                if self._execution_package is not None
+                else None
+            )
+            if schedule is not None:
+                if (
+                    current.phase is GamePhase.SHERIFF_TRANSFER
+                    and target is GamePhase.DAY_SPEECH
+                ):
+                    raise EventCommitError(
+                        "PHASE_BLOCKED: scheduled sheriff transfer must return through "
+                        "its manager completion boundary"
+                    )
+                if (
+                    current.phase is GamePhase.DAY_ANNOUNCE
+                    and target is GamePhase.DAY_SPEECH
+                    and not self._scheduled_night_prerequisites_satisfied(
+                        current, current.round_no
+                    )
+                ):
+                    raise EventCommitError(
+                        "PHASE_BLOCKED: scheduled night prerequisites are incomplete"
+                    )
+                if (
+                    current.phase is GamePhase.DAY_ANNOUNCE
+                    and target is GamePhase.DAY_SPEECH
+                    and not self._scheduled_sheriff_badge_complete(current)
+                ):
+                    raise EventCommitError(
+                        "PHASE_BLOCKED: scheduled sheriff badge choice is incomplete"
+                    )
+                if (
+                    current.phase is GamePhase.VICTORY_CHECK
+                    and target is GamePhase.NIGHT_TEAM_CHAT
+                    and current.round_no > 0
+                    and (
+                        not self._scheduled_night_prerequisites_satisfied(
+                            current, current.round_no - 1
+                        )
+                        or not self._scheduled_sheriff_badge_complete(current)
+                    )
+                ):
+                    raise EventCommitError(
+                        "PHASE_BLOCKED: the prior scheduled night boundary is incomplete"
+                    )
             unsettled_successor = self._is_unsettled_group_successor(current, target)
             if self._rule_work_blocks_lifecycle(current) and not unsettled_successor:
                 raise EventCommitError(

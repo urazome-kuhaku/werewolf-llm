@@ -25,6 +25,7 @@ from pydantic import (
 
 from werewolf.domain.admission import CatalogAdmission
 from werewolf.domain.enums import GamePhase, RunStatus
+from werewolf.domain.night_boundaries import NightBoundaryPrerequisite
 from werewolf.knowledge.role import (
     ActionCode,
     ResourceDefinition,
@@ -521,6 +522,14 @@ class RuleWorkflowCursor(_StrictModel):
         return self
 
 
+class RuleBoundaryPrerequisiteResult(_StrictModel):
+    """Manager-authored result for one frozen night-boundary prerequisite."""
+
+    prerequisite: NightBoundaryPrerequisite
+    satisfied: bool
+    source_id: LogicalId | None = None
+
+
 class RuleWorkflowStep(_StrictModel):
     """Read-only manager response describing the next durable workflow step."""
 
@@ -540,6 +549,7 @@ class RuleWorkflowStep(_StrictModel):
     queue_pending: bool = False
     cursor_id: LogicalId | None = None
     boundary: RuleBoundary | None = None
+    boundary_prerequisites: tuple[RuleBoundaryPrerequisiteResult, ...] = ()
 
     @model_validator(mode="after")
     def validate_step_shape(self) -> RuleWorkflowStep:
@@ -1119,6 +1129,7 @@ __all__ = [
     "RuleRelationValue",
     "RuleDeferredDisclosure",
     "RuleBoundary",
+    "RuleBoundaryPrerequisiteResult",
     "RuleReturnPoint",
     "RuleTriggerOccurrence",
     "RuleWorkflowCursor",

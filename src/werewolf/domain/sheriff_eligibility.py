@@ -275,7 +275,7 @@ def _strict_first_night_death_seats(state: Any, execution_package: object) -> tu
     def verify_fact_source(
         *, fact_id: str, batch_id: str, expected_group_id: str, depth: int, seen: frozenset[str]
     ) -> bool:
-        if depth > 32 or fact_id in seen:
+        if depth > 64 or fact_id in seen:
             return False
         candidates = tuple(
             ledger

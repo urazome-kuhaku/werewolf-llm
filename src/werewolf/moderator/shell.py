@@ -8,10 +8,10 @@ import json
 import math
 import shlex
 import tempfile
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import yaml  # type: ignore[import-untyped]
 from pydantic import JsonValue
@@ -67,6 +67,19 @@ class ModeratorError(RuntimeError):
 CommandInput = Callable[[], str]
 CommandOutput = Callable[[str], None]
 Clock = Callable[[], datetime]
+_T = TypeVar("_T")
+
+
+async def _await_uncancellable(awaitable: Awaitable[_T]) -> _T:
+    """Finish a small cleanup or lease operation before re-raising cancellation."""
+
+    task = asyncio.ensure_future(awaitable)
+    while True:
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.cancelled():
+                raise
 
 
 def _project_root() -> Path:
@@ -576,23 +589,58 @@ class ModeratorShell:
             runtime_factory=self.runtime_factory,
             state_provider=self.manager.snapshot,
         )
+        manager = self.manager
         admission: CatalogAdmission | None = None
-        admission_bound = False
+        lease_task: asyncio.Task[CatalogAdmission] | None = None
+
+        async def cleanup_failed_start() -> list[str]:
+            cleanup_errors: list[str] = []
+            try:
+                await _await_uncancellable(service.close("start failed"))
+            except Exception:
+                pass
+            if admission is not None and self.catalog_store is not None:
+                try:
+                    if not await _await_uncancellable(
+                        self.catalog_store.cancel_lease(admission, self.state.game_id)
+                    ):
+                        cleanup_errors.append("catalog lease was not cancelled")
+                except Exception as cleanup_exc:
+                    cleanup_errors.append(f"catalog lease cleanup failed: {cleanup_exc}")
+                if manager.state.catalog_admission == admission:
+                    try:
+                        await _await_uncancellable(
+                            manager.clear_catalog_admission(
+                                admission,
+                                expected_revision=manager.state.state_revision,
+                                now=self.clock(),
+                            )
+                        )
+                    except Exception as cleanup_exc:
+                        cleanup_errors.append(
+                            f"game catalog binding cleanup failed: {cleanup_exc}"
+                        )
+            return cleanup_errors
+
         try:
             if self.catalog_selection is not None:
                 if self.catalog_store is None or self.manager.package_identity is None:
-                    raise ModeratorError("catalog admission has no verified store or package identity")
-                admission = await self.catalog_store.acquire_lease(
-                    selection=self.catalog_selection,
-                    game_id=self.state.game_id,
-                    package_identity=self.manager.package_identity,
+                    raise ModeratorError(
+                        "catalog admission has no verified store or package identity"
+                    )
+                lease_task = asyncio.create_task(
+                    self.catalog_store.acquire_lease(
+                        selection=self.catalog_selection,
+                        game_id=self.state.game_id,
+                        package_identity=self.manager.package_identity,
+                    )
                 )
+                admission = await asyncio.shield(lease_task)
                 await self.manager.bind_catalog_admission(
                     admission,
                     expected_revision=self.state.state_revision,
                     now=self.clock(),
                 )
-                admission_bound = True
             records = await service.start(bundle, configuration, assignment_plan)
             refs = {seat: record.runtime_ref.session_id for seat, record in records.items()}
             await self.manager.commit_game_start(
@@ -602,27 +650,18 @@ class ModeratorShell:
                 catalog_admission=admission,
                 now=self.clock(),
             )
-        except Exception as exc:
-            try:
-                await service.close("start failed")
-            except Exception:
-                pass
-            cleanup_errors: list[str] = []
-            if admission is not None and self.catalog_store is not None:
+        except asyncio.CancelledError as exc:
+            if admission is None and lease_task is not None:
                 try:
-                    if not await self.catalog_store.cancel_lease(admission, self.state.game_id):
-                        cleanup_errors.append("catalog lease was not cancelled")
-                except Exception as cleanup_exc:
-                    cleanup_errors.append(f"catalog lease cleanup failed: {cleanup_exc}")
-                if admission_bound:
-                    try:
-                        await self.manager.clear_catalog_admission(
-                            admission,
-                            expected_revision=self.state.state_revision,
-                            now=self.clock(),
-                        )
-                    except Exception as cleanup_exc:
-                        cleanup_errors.append(f"game catalog binding cleanup failed: {cleanup_exc}")
+                    admission = await _await_uncancellable(lease_task)
+                except Exception:
+                    admission = None
+            cleanup_errors = await cleanup_failed_start()
+            if cleanup_errors:
+                exc.add_note("catalog startup cleanup issues: " + "; ".join(cleanup_errors))
+            raise
+        except Exception as exc:
+            cleanup_errors = await cleanup_failed_start()
             if cleanup_errors:
                 raise ModeratorError(
                     "start failed and catalog cleanup was incomplete: "
@@ -2403,6 +2442,8 @@ class ModeratorShell:
             raise ModeratorError("checkpoint restore staging is already owned by this process")
         service: PlayerSessionService | None = None
         temporary: tempfile.TemporaryDirectory[str] | None = None
+        recovered_catalog_selection: CatalogSelection | None = None
+        recovered_catalog_store: CatalogStore | None = None
         try:
             (
                 config,
@@ -2428,6 +2469,41 @@ class ModeratorShell:
                 verified,
                 temporary.name,
             )
+            admission = verified.state.catalog_admission
+            selection_raw = config.get("catalog_selection")
+            if admission is None:
+                if selection_raw is not None:
+                    raise ModeratorError(
+                        "checkpoint has no catalog admission for its configured selection"
+                    )
+            else:
+                if not isinstance(selection_raw, Mapping):
+                    raise ModeratorError(
+                        "checkpoint catalog admission has no configured catalog selection"
+                    )
+                try:
+                    recovered_catalog_selection = CatalogSelection.model_validate(
+                        dict(selection_raw), strict=True
+                    )
+                    admission.validate_for_game(verified.state.game_id)
+                except (TypeError, ValueError) as exc:
+                    raise ModeratorError("checkpoint catalog identity is invalid") from exc
+                if (
+                    recovered_catalog_selection.catalog_id != admission.catalog_id
+                    or recovered_catalog_selection.board_ref.format() != identity.board_ref
+                    or f"{admission.board_id}@{admission.board_version}" != identity.board_ref
+                    or recovered_catalog_selection.package_identity != identity.package_identity
+                    or admission.package_identity != identity.package_identity
+                    or recovered_catalog_selection.gate_sha256 != admission.gate_sha256
+                ):
+                    raise ModeratorError(
+                        "checkpoint catalog selection differs from its frozen admission"
+                    )
+                recovered_catalog_store = recovered_catalog_selection.store()
+                if recovered_catalog_store.catalog_id != admission.catalog_id:
+                    raise ModeratorError(
+                        "configured catalog root differs from the admitted catalog identity"
+                    )
             execution = bundle.package.execution
             registry = bundle.package.action_registry
             if execution is None or registry is None:
@@ -2482,14 +2558,28 @@ class ModeratorShell:
                 expected_revision=manager.state.state_revision,
                 now=self.clock(),
             )
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
             if service is not None:
-                try:
-                    await service.close("checkpoint restore failed")
-                except Exception:
-                    pass
+                close_task = asyncio.create_task(service.close("checkpoint restore failed"))
+                while not close_task.done():
+                    try:
+                        await asyncio.shield(close_task)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                if close_task.done() and not close_task.cancelled():
+                    try:
+                        close_task.exception()
+                    except BaseException:
+                        pass
             if temporary is not None:
-                temporary.cleanup()
+                try:
+                    temporary.cleanup()
+                except BaseException:
+                    pass
+            if isinstance(exc, asyncio.CancelledError):
+                raise
             if isinstance(exc, ModeratorError):
                 raise
             raise ModeratorError("private checkpoint restore failed") from exc
@@ -2505,6 +2595,8 @@ class ModeratorShell:
         self.assignment_plan = assignments
         self.session_refs = dict(refs)
         self.session_service = service
+        self.catalog_selection = recovered_catalog_selection
+        self.catalog_store = recovered_catalog_store
         self.snapshot_store = GameSnapshotStore(active)
         self.archive_store = GameArchiveStore(games)
         self._schema_one_manual_compat = False

@@ -10,18 +10,23 @@ import re
 import shutil
 import tempfile
 import time
-from collections.abc import AsyncIterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Literal, cast
+from typing import Annotated, Literal, TypeVar, cast
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, StringConstraints, field_validator
 
 from werewolf.cli_support.play_setup import PlaySetupError, _validate_manifest, build_play_setup
 from werewolf.domain.admission import CatalogAdmission
-from werewolf.domain.scenario import ScenarioError, load_scenario, scenario_sha256
+from werewolf.domain.scenario import (
+    ScenarioError,
+    load_scenario,
+    load_scenario_bytes,
+    scenario_sha256,
+)
 from werewolf.knowledge.compiled_store import CompiledKnowledgeStore
 from werewolf.knowledge.compiler import KnowledgePackageCompiler
 from werewolf.knowledge.package_loader import KnowledgePackageLoader
@@ -32,7 +37,9 @@ from werewolf.rules.models import ExecutionPackage
 _REGISTRY_SCHEMA = 1
 _MANIFEST_NAME = "catalog-manifest.json"
 _IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$", re.ASCII)
+_VERSION = re.compile(r"^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$", re.ASCII)
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
+_T = TypeVar("_T")
 
 
 class CatalogError(ValueError):
@@ -202,9 +209,27 @@ def _validate_relative(relative: object) -> str:
     return relative
 
 
-def _registry_template() -> dict[str, object]:
+def _parse_board_ref(value: object, *, label: str) -> VersionedRef:
+    if not isinstance(value, str):
+        raise CatalogError(f"{label} must be a pinned board reference")
+    try:
+        ref = VersionedRef.parse(value)
+    except ValueError as exc:
+        raise CatalogError(f"{label} must be a pinned board reference") from exc
+    if (
+        ref.id != ref.id.lower()
+        or _IDENTIFIER.fullmatch(ref.id) is None
+        or _VERSION.fullmatch(ref.version) is None
+        or ref.format() != value
+    ):
+        raise CatalogError(f"{label} must be a canonical pinned board reference")
+    return ref
+
+
+def _registry_template(catalog_id: str) -> dict[str, object]:
     return {
         "schema_version": _REGISTRY_SCHEMA,
+        "catalog_id": catalog_id,
         "revision": 0,
         "active": {},
         "retired": [],
@@ -212,8 +237,50 @@ def _registry_template() -> dict[str, object]:
         "lease_generations": {},
         "tombstones": {},
         "entry_revisions": {},
+        "entry_digests": {},
         "gate_runs": {},
     }
+
+
+def _reject_symlink_components(path: Path, *, label: str) -> Path:
+    """Reject symlinks in the supplied path before returning its canonical form."""
+
+    raw = path.expanduser()
+    if not raw.is_absolute():
+        raw = Path.cwd() / raw
+    cursor = Path(raw.anchor)
+    for part in raw.parts[1:]:
+        if part == ".":
+            continue
+        if part == "..":
+            cursor = cursor.parent
+            continue
+        cursor /= part
+        if cursor.is_symlink():
+            raise CatalogError(f"{label} path must not contain symlinks")
+    return raw.resolve()
+
+
+async def _await_uncancellable(awaitable: Awaitable[_T]) -> _T:
+    """Let a filesystem operation finish before propagating task cancellation."""
+
+    task = asyncio.ensure_future(awaitable)
+    cancelled = False
+    while True:
+        try:
+            result = await asyncio.shield(task)
+            break
+        except asyncio.CancelledError:
+            if task.cancelled():
+                raise
+            cancelled = True
+    if cancelled:
+        raise asyncio.CancelledError
+    return result
+
+
+async def _thread_call_uncancellable(function: Callable[..., _T], *args: object) -> _T:
+    return await _await_uncancellable(asyncio.to_thread(function, *args))
 
 
 def _copy_file(source: Path, target: Path) -> None:
@@ -242,20 +309,24 @@ class CatalogStore:
     """A local, hash-verified registry of immutable candidate packages."""
 
     def __init__(self, root: str | os.PathLike[str]) -> None:
-        supplied_path = Path(root).expanduser()
-        if supplied_path.is_symlink():
-            raise CatalogError("catalog root must not be a symlink")
-        supplied = supplied_path.resolve()
+        supplied = _reject_symlink_components(Path(root), label="catalog root")
         if supplied.exists() and not supplied.is_dir():
             raise CatalogError("catalog root must be a directory")
         self.root = supplied
+        self.catalog_id = hashlib.sha256(str(supplied).encode("utf-8")).hexdigest()
 
     def entry_path(self, board_ref: str | VersionedRef) -> Path:
         ref = board_ref if isinstance(board_ref, VersionedRef) else VersionedRef.parse(board_ref)
+        entries_root = self.root / "entries"
+        for candidate in (
+            entries_root,
+            entries_root / ref.id,
+            entries_root / ref.id / ref.version,
+        ):
+            if candidate.is_symlink():
+                raise CatalogError("catalog entry path must not contain symlinks")
         try:
-            return resolve_contained_path(
-                self.root / "entries", Path(ref.id) / ref.version
-            )
+            return resolve_contained_path(entries_root, Path(ref.id) / ref.version)
         except PathSecurityError as exc:
             raise CatalogError("catalog board reference escapes its root") from exc
 
@@ -268,10 +339,7 @@ class CatalogStore:
         """Validate, compile, and atomically stage one complete candidate closure."""
 
         ref = board_ref if isinstance(board_ref, VersionedRef) else VersionedRef.parse(board_ref)
-        supplied_workbench = Path(workbench_root).expanduser()
-        if supplied_workbench.is_symlink():
-            raise CatalogError("candidate workbench root must not be a symlink")
-        workbench = supplied_workbench.resolve()
+        workbench = _reject_symlink_components(Path(workbench_root), label="candidate workbench")
         try:
             manifest, source_manifest_sha, draft = await asyncio.to_thread(
                 _validate_manifest,
@@ -314,17 +382,12 @@ class CatalogStore:
         scenario_records: list[dict[str, str]] = []
         scenario_source_by_id: dict[str, tuple[Path, bytes, str]] = {}
         for supplied_path in scenarios:
-            scenario_source = Path(supplied_path).expanduser()
-            if scenario_source.is_symlink():
-                raise CatalogError("scenario paths must be regular files")
-            path = scenario_source.resolve()
+            path = _reject_symlink_components(Path(supplied_path), label="scenario")
             if not path.is_file():
                 raise CatalogError("scenario paths must be regular files")
             try:
-                definition, data = await asyncio.gather(
-                    asyncio.to_thread(load_scenario, path),
-                    asyncio.to_thread(path.read_bytes),
-                )
+                data = await asyncio.to_thread(path.read_bytes)
+                definition = load_scenario_bytes(data, source_name=path.name)
             except (OSError, ScenarioError) as exc:
                 raise CatalogError(f"catalog scenario is invalid: {path.name}") from exc
             if definition.board_ref != ref.format():
@@ -373,7 +436,7 @@ class CatalogStore:
             gate_sha256 = _sha256(_canonical_json(gate_digest_payload))
             staged_manifest: dict[str, object] = {
                 "schema_version": 1,
-                "catalog_id": ref.id,
+                "catalog_id": self.catalog_id,
                 "board_ref": ref.format(),
                 "status": "CANDIDATE_PENDING_HUMAN_REVIEW",
                 "source_manifest_sha256": source_manifest_sha,
@@ -387,20 +450,40 @@ class CatalogStore:
             stage_digest = _sha256(manifest_bytes)
             destination = self.entry_path(ref)
             destination.parent.mkdir(parents=True, exist_ok=True)
+            if self.entry_path(ref) != destination:
+                raise CatalogError("catalog entry path changed while staging")
             async with self._writer_lock():
+                registry = self._load_registry()
+                entry_digests = _mapping(registry.get("entry_digests"), "entry digests")
+                prior_digest = entry_digests.get(ref.format())
+                if prior_digest is not None and prior_digest != stage_digest:
+                    raise CatalogConflictError(
+                        "same catalog board ID/version already has a different immutable identity"
+                    )
                 if destination.exists() or destination.is_symlink():
                     existing = self.load_entry(ref)
                     if existing.stage_digest != stage_digest:
                         raise CatalogConflictError(
                             "same catalog board ID/version already contains different content"
                         )
-                    return self._entry_report(existing, status="already-staged")
-                await asyncio.to_thread(os.rename, staging, destination)
-            entry = self.load_entry(ref)
-            return self._entry_report(entry, status="staged")
+                    entry = existing
+                    result_status = "already-staged"
+                else:
+                    await _thread_call_uncancellable(os.rename, staging, destination)
+                    entry = self.load_entry(ref)
+                    result_status = "staged"
+                if prior_digest is None:
+                    entry_digests[ref.format()] = entry.stage_digest
+                    registry["entry_digests"] = entry_digests
+                    entry_revisions = _mapping(registry.get("entry_revisions"), "entry revisions")
+                    entry_revisions.setdefault(ref.format(), 0)
+                    registry["entry_revisions"] = entry_revisions
+                    registry["revision"] = _revision(registry) + 1
+                    await self._write_registry(registry)
+                return self._entry_report(entry, status=result_status)
         finally:
             if staging.exists():
-                await asyncio.to_thread(shutil.rmtree, staging, True)
+                await _thread_call_uncancellable(shutil.rmtree, staging, True)
 
     def load_entry(self, board_ref: str | VersionedRef) -> CatalogEntry:
         ref = board_ref if isinstance(board_ref, VersionedRef) else VersionedRef.parse(board_ref)
@@ -411,10 +494,31 @@ class CatalogStore:
         if manifest_path.is_symlink() or not manifest_path.is_file():
             raise CatalogError("catalog manifest is missing or unsafe")
         manifest = _read_json(manifest_path, label="catalog manifest")
-        if manifest.get("schema_version") != 1 or manifest.get("board_ref") != ref.format():
+        if set(manifest) != {
+            "schema_version",
+            "catalog_id",
+            "board_ref",
+            "status",
+            "source_manifest_sha256",
+            "package_identity",
+            "gate_sha256",
+            "scenarios",
+            "files",
+        }:
+            raise CatalogError("catalog manifest has missing or unsupported fields")
+        if (
+            type(manifest.get("schema_version")) is not int
+            or manifest.get("schema_version") != 1
+            or manifest.get("board_ref") != ref.format()
+            or manifest.get("status") != "CANDIDATE_PENDING_HUMAN_REVIEW"
+        ):
             raise CatalogError("catalog manifest identity does not match requested board")
-        if manifest.get("catalog_id") != ref.id:
-            raise CatalogError("catalog ID does not match board ID")
+        if manifest.get("catalog_id") != self.catalog_id:
+            raise CatalogError("catalog ID does not match this registry instance")
+        for field_name in ("source_manifest_sha256", "package_identity", "gate_sha256"):
+            digest = manifest.get(field_name)
+            if not isinstance(digest, str) or _SHA256_PATTERN.fullmatch(digest) is None:
+                raise CatalogError(f"catalog {field_name} is invalid")
         file_entries = manifest.get("files")
         if not isinstance(file_entries, list):
             raise CatalogError("catalog manifest files are invalid")
@@ -432,6 +536,43 @@ class CatalogStore:
             ):
                 raise CatalogError("catalog file inventory contains invalid identity")
             expected[relative] = digest
+        if list(expected) != sorted(expected):
+            raise CatalogError("catalog file inventory is not canonically ordered")
+        scenario_entries = manifest.get("scenarios")
+        if not isinstance(scenario_entries, list) or not scenario_entries:
+            raise CatalogError("catalog scenario inventory is invalid")
+        scenario_ids: set[str] = set()
+        canonical_scenarios: list[dict[str, str]] = []
+        for item in scenario_entries:
+            if not isinstance(item, Mapping) or set(item) != {"scenario_id", "path", "sha256"}:
+                raise CatalogError("catalog scenario entry is invalid")
+            scenario_id = item.get("scenario_id")
+            relative = _validate_relative(item.get("path"))
+            digest = item.get("sha256")
+            if (
+                not isinstance(scenario_id, str)
+                or _IDENTIFIER.fullmatch(scenario_id) is None
+                or scenario_id in scenario_ids
+                or relative != f"scenarios/{scenario_id}.yaml"
+                or not isinstance(digest, str)
+                or _SHA256_PATTERN.fullmatch(digest) is None
+                or relative not in expected
+            ):
+                raise CatalogError("catalog scenario entry has an invalid identity")
+            scenario_ids.add(scenario_id)
+            canonical_scenarios.append(
+                {"scenario_id": scenario_id, "path": relative, "sha256": digest}
+            )
+        if canonical_scenarios != sorted(canonical_scenarios, key=lambda item: item["scenario_id"]):
+            raise CatalogError("catalog scenarios are not canonically ordered")
+        gate_payload = {
+            "board_ref": ref.format(),
+            "package_identity": manifest["package_identity"],
+            "scenarios": canonical_scenarios,
+            "schema_version": 1,
+        }
+        if manifest.get("gate_sha256") != _sha256(_canonical_json(gate_payload)):
+            raise CatalogError("catalog gate identity does not match its scenario inventory")
         actual_paths: set[str] = set()
         for item in path.rglob("*"):
             if item.is_symlink():
@@ -446,10 +587,8 @@ class CatalogStore:
                 raise CatalogError(f"staged catalog file hash mismatch: {relative}")
         package_identity = manifest.get("package_identity")
         gate_sha256 = manifest.get("gate_sha256")
-        if not isinstance(package_identity, str) or len(package_identity) != 64:
-            raise CatalogError("catalog package identity is invalid")
-        if not isinstance(gate_sha256, str) or len(gate_sha256) != 64:
-            raise CatalogError("catalog gate identity is invalid")
+        assert isinstance(package_identity, str)
+        assert isinstance(gate_sha256, str)
         compiled_path = CompiledKnowledgeStore(path / "compiled").package_path(ref)
         compiled_manifest = _read_json(compiled_path / "manifest.json", label="compiled manifest")
         if (
@@ -460,7 +599,7 @@ class CatalogStore:
             raise CatalogError("staged compiled package identity changed")
         return CatalogEntry(
             ref=ref,
-            catalog_id=ref.id,
+            catalog_id=self.catalog_id,
             path=path,
             manifest=manifest,
             stage_digest=_sha256(manifest_path.read_bytes()),
@@ -483,34 +622,75 @@ class CatalogStore:
             raise CatalogError("catalog selection differs from its immutable staged entry")
         return entry
 
+    def _require_activated_entry(self, registry: Mapping[str, object], entry: CatalogEntry) -> None:
+        runs = _mapping(registry.get("gate_runs"), "catalog gate runs")
+        record = runs.get(entry.ref.format())
+        if not isinstance(record, Mapping) or record.get("status") != "PASS":
+            raise CatalogError("catalog board version has no passing activation gate")
+        if (
+            record.get("stage_digest") != entry.stage_digest
+            or record.get("gate_sha256") != entry.gate_sha256
+        ):
+            raise CatalogError("catalog activation evidence does not match the staged entry")
+        report_value = record.get("report_path")
+        report_digest = record.get("report_sha256")
+        if (
+            not isinstance(report_value, str)
+            or not Path(report_value).is_absolute()
+            or not isinstance(report_digest, str)
+            or _SHA256_PATTERN.fullmatch(report_digest) is None
+        ):
+            raise CatalogError("catalog activation report identity is invalid")
+        report_path = Path(report_value)
+        runs_root = self.root / "runs"
+        try:
+            if runs_root.is_symlink():
+                raise PathSecurityError("catalog runs directory is a symlink")
+            canonical_input = _reject_symlink_components(
+                report_path, label="catalog activation report"
+            )
+            if canonical_input != report_path:
+                raise PathSecurityError("activation report path is not canonical")
+            canonical_report = resolve_contained_path(runs_root, report_path.relative_to(runs_root))
+            raw_report = canonical_report.read_bytes()
+        except (OSError, ValueError, PathSecurityError) as exc:
+            raise CatalogError("catalog activation report is unavailable or unsafe") from exc
+        if _sha256(raw_report) != report_digest:
+            raise CatalogError("catalog activation report hash changed")
+        report = _read_json(canonical_report, label="catalog activation report")
+        if (
+            report.get("status") != "PASS"
+            or report.get("board_ref") != entry.ref.format()
+            or report.get("stage_digest") != entry.stage_digest
+            or report.get("package_identity") != entry.package_identity
+            or report.get("gate_sha256") != entry.gate_sha256
+        ):
+            raise CatalogError("catalog activation report does not prove this staged entry")
+
     def resolve_active(self, board: str) -> tuple[CatalogEntry, CatalogSelection]:
-        """Resolve an active default or an exact active board reference."""
+        """Resolve a board default or an explicitly activated pinned version."""
 
         if "@" in board:
-            requested = VersionedRef.parse(board)
-            board_id = requested.id
-            wanted_version = requested.version
+            requested = _parse_board_ref(board, label="board")
+            ref = requested
         else:
-            if (
-                not board
-                or not board.isascii()
-                or not board.replace("-", "").replace("_", "").isalnum()
-            ):
+            if _IDENTIFIER.fullmatch(board) is None:
                 raise CatalogError("board must be an ID or exact ID@X.Y.Z reference")
-            board_id = board
-            wanted_version = None
         registry = self._load_registry()
         active = _mapping(registry.get("active"), "active catalog pointers")
-        version = active.get(board_id)
-        if not isinstance(version, str):
-            raise CatalogError(f"catalog has no active default for {board_id}")
-        if wanted_version is not None and wanted_version != version:
-            raise CatalogError("requested board version is not the active default")
-        ref = VersionedRef(id=board_id, version=version)
+        if "@" not in board:
+            version = active.get(board)
+            if not isinstance(version, str):
+                raise CatalogError(f"catalog has no active default for {board}")
+            try:
+                ref = VersionedRef(id=board, version=version)
+            except ValueError as exc:
+                raise CatalogError("catalog active default is invalid") from exc
         retired = _string_set(registry.get("retired"), "retired refs")
         if ref.format() in retired:
             raise CatalogError("catalog board is retired and cannot start new games")
         entry = self.load_entry(ref)
+        self._require_activated_entry(registry, entry)
         selection = CatalogSelection(
             schema_version=1,
             catalog_root=str(self.root),
@@ -537,7 +717,11 @@ class CatalogStore:
             raise CatalogError("catalog entry has no staged scenarios")
 
         run_id = f"{ref.id}-{ref.version}-{uuid4().hex[:12]}"
-        run_root = self.root / "runs" / run_id
+        runs_root = self.root / "runs"
+        if runs_root.is_symlink():
+            raise CatalogError("catalog runs directory must not be a symlink")
+        runs_root.mkdir(parents=True, exist_ok=True)
+        run_root = runs_root / run_id
         run_root.mkdir(parents=True, exist_ok=False)
         run_reports: list[dict[str, object]] = []
         player_uses: set[str] = set()
@@ -555,7 +739,7 @@ class CatalogStore:
                     all_scripted=True,
                     board_ref=ref.format(),
                     workbench=entry.candidate_root,
-                    project_root=Path(__file__).resolve().parents[2],
+                    project_root=Path(__file__).resolve().parents[3],
                     game_id=f"cat-{uuid4().hex[:20]}",
                 )
             except (PlaySetupError, OSError, ValueError) as exc:
@@ -600,12 +784,14 @@ class CatalogStore:
         if not isinstance(execution_raw, Mapping):
             raise CatalogError("staged package has no execution language payload")
         execution = ExecutionPackage.model_validate(execution_raw)
-        required_player, required_automatic = _mandatory_skill_ids(execution)
-        required_host = {
-            skill
-            for scenario in (load_scenario(path) for _, path, _ in entry.scenario_paths)
-            for skill in scenario.required_host_skill_ids
-        }
+        required_player, required_host, required_automatic = _mandatory_skill_ids(execution)
+        required_host.update(
+            {
+                skill
+                for scenario in (load_scenario(path) for _, path, _ in entry.scenario_paths)
+                for skill in scenario.required_host_skill_ids
+            }
+        )
         missing_player = sorted(required_player - player_uses)
         missing_automatic = sorted(required_automatic - automatic_uses)
         missing_host = sorted(required_host - host_uses)
@@ -619,7 +805,7 @@ class CatalogStore:
         )
         gate_report = {
             "schema_version": 1,
-            "catalog_id": ref.id,
+            "catalog_id": self.catalog_id,
             "board_ref": ref.format(),
             "stage_digest": entry.stage_digest,
             "package_identity": entry.package_identity,
@@ -668,6 +854,7 @@ class CatalogStore:
                 "stage_digest": entry.stage_digest,
                 "gate_sha256": entry.gate_sha256,
                 "report_path": str(run_root / "activation-report.json"),
+                "report_sha256": _sha256(_canonical_json(gate_report)),
             }
             registry["active"] = active
             registry["retired"] = sorted(retired)
@@ -681,6 +868,9 @@ class CatalogStore:
         ref = board_ref if isinstance(board_ref, VersionedRef) else VersionedRef.parse(board_ref)
         entry = self.load_entry(ref)
         async with self._writer_lock():
+            current_entry = self.load_entry(ref)
+            if current_entry.stage_digest != entry.stage_digest:
+                raise CatalogConflictError("catalog entry changed while retire was waiting")
             registry = self._load_registry()
             active = _mapping(registry.get("active"), "active catalog pointers")
             if active.get(ref.id) == ref.version:
@@ -698,6 +888,9 @@ class CatalogStore:
         ref = board_ref if isinstance(board_ref, VersionedRef) else VersionedRef.parse(board_ref)
         entry = self.load_entry(ref)
         async with self._writer_lock():
+            current_entry = self.load_entry(ref)
+            if current_entry.stage_digest != entry.stage_digest:
+                raise CatalogConflictError("catalog entry changed while unload was waiting")
             registry = self._load_registry()
             active = _mapping(registry.get("active"), "active catalog pointers")
             if active.get(ref.id) == ref.version:
@@ -711,18 +904,33 @@ class CatalogStore:
                     continue
                 if record.get("board_ref") == ref.format():
                     raise CatalogError(f"catalog version has a live game lease: {game_id}")
-            await asyncio.to_thread(shutil.rmtree, entry.path)
             retired.discard(ref.format())
             registry["retired"] = sorted(retired)
             revisions = _mapping(registry.get("entry_revisions"), "entry revisions")
-            revisions.pop(ref.format(), None)
+            current_revision = revisions.get(ref.format(), 0)
+            if type(current_revision) is not int or current_revision < 0:
+                raise CatalogError("catalog entry revision is invalid")
+            revisions[ref.format()] = current_revision + 1
             registry["entry_revisions"] = revisions
             runs = _mapping(registry.get("gate_runs"), "catalog gate runs")
             runs.pop(ref.format(), None)
             registry["gate_runs"] = runs
             registry["revision"] = _revision(registry) + 1
-            await self._write_registry(registry)
+            await _await_uncancellable(self._unload_transaction(current_entry.path, registry))
         return {"status": "unloaded", "board_ref": ref.format(), "stage_digest": entry.stage_digest}
+
+    async def _unload_transaction(self, entry_path: Path, registry: Mapping[str, object]) -> None:
+        """Move an entry aside, commit registry state, then remove the moved tree."""
+
+        quarantine = self.root / f".catalog-unload-{uuid4().hex}"
+        await asyncio.to_thread(os.rename, entry_path, quarantine)
+        try:
+            await self._write_registry(registry)
+        except BaseException:
+            if quarantine.exists() and not entry_path.exists():
+                await asyncio.to_thread(os.rename, quarantine, entry_path)
+            raise
+        await asyncio.to_thread(shutil.rmtree, quarantine)
 
     async def acquire_lease(
         self,
@@ -738,64 +946,76 @@ class CatalogStore:
             raise CatalogAdmissionError(
                 "game compiled package identity differs from staged version"
             )
-        async with self._writer_lock():
-            registry = self._load_registry()
-            # This short digest check occurs under the same exclusive lock as
-            # insertion. Long-running gate work never holds this lock.
-            if self.load_entry(entry.ref).stage_digest != selection.stage_digest:
-                raise CatalogAdmissionError("staged package changed before game admission")
-            retired = _string_set(registry.get("retired"), "retired refs")
-            active = _mapping(registry.get("active"), "active catalog pointers")
-            if entry.ref.format() in retired or active.get(entry.ref.id) != entry.ref.version:
-                raise CatalogAdmissionError("catalog version is retired or no longer active")
-            tombstones = _mapping(registry.get("tombstones"), "game tombstones")
-            if game_id in tombstones:
-                raise CatalogAdmissionError("CLOSED_ARCHIVE game IDs cannot be reused")
-            leases = _mapping(registry.get("leases"), "catalog leases")
-            previous = leases.get(game_id)
-            if isinstance(previous, Mapping):
-                same_identity = all(
-                    previous.get(name) == value
-                    for name, value in {
-                        "catalog_id": selection.catalog_id,
-                        "board_ref": selection.board_ref.format(),
-                        "package_identity": package_identity,
-                        "gate_sha256": selection.gate_sha256,
-                    }.items()
-                )
-                if not same_identity:
+        admission: CatalogAdmission | None = None
+        try:
+            async with self._writer_lock():
+                registry = self._load_registry()
+                # This short digest check occurs under the same exclusive lock
+                # as insertion. Gate work never holds this lock.
+                if self.load_entry(entry.ref).stage_digest != selection.stage_digest:
+                    raise CatalogAdmissionError("staged package changed before game admission")
+                retired = _string_set(registry.get("retired"), "retired refs")
+                if entry.ref.format() in retired:
+                    raise CatalogAdmissionError("catalog version is retired")
+                try:
+                    self._require_activated_entry(registry, entry)
+                except CatalogError as exc:
                     raise CatalogAdmissionError(
-                        "game ID is already bound to a different catalog identity"
+                        "catalog version has no current passing gate"
+                    ) from exc
+                tombstones = _mapping(registry.get("tombstones"), "game tombstones")
+                if game_id in tombstones:
+                    raise CatalogAdmissionError("CLOSED_ARCHIVE game IDs cannot be reused")
+                leases = _mapping(registry.get("leases"), "catalog leases")
+                previous = leases.get(game_id)
+                if isinstance(previous, Mapping):
+                    same_identity = all(
+                        previous.get(name) == value
+                        for name, value in {
+                            "catalog_id": selection.catalog_id,
+                            "board_ref": selection.board_ref.format(),
+                            "package_identity": package_identity,
+                            "gate_sha256": selection.gate_sha256,
+                        }.items()
                     )
-                if previous.get("status") == "ACTIVE":
-                    raise CatalogAdmissionError("game already has an active catalog lease")
-                if previous.get("status") == "RELEASED":
-                    raise CatalogAdmissionError("released catalog game IDs cannot be reused")
-            counters = _mapping(registry.get("lease_generations"), "lease generations")
-            current_generation = counters.get(game_id, 0)
-            if type(current_generation) is not int or not 0 <= current_generation < 2**31 - 1:
-                raise CatalogAdmissionError("lease generation counter is invalid or exhausted")
-            generation = current_generation + 1
-            admission = CatalogAdmission.build(
-                catalog_id=selection.catalog_id,
-                game_id=game_id,
-                board_id=selection.board_id,
-                board_version=selection.board_version,
-                package_identity=package_identity,
-                gate_sha256=selection.gate_sha256,
-                lease_generation=generation,
-            )
-            leases[game_id] = {
-                **admission.model_dump(mode="json"),
-                "board_ref": selection.board_ref.format(),
-                "status": "ACTIVE",
-            }
-            counters[game_id] = generation
-            registry["leases"] = leases
-            registry["lease_generations"] = counters
-            registry["revision"] = _revision(registry) + 1
-            await self._write_registry(registry)
-            return admission
+                    if not same_identity:
+                        raise CatalogAdmissionError(
+                            "game ID is already bound to a different catalog identity"
+                        )
+                    if previous.get("status") == "ACTIVE":
+                        raise CatalogAdmissionError("game already has an active catalog lease")
+                    if previous.get("status") == "RELEASED":
+                        raise CatalogAdmissionError("released catalog game IDs cannot be reused")
+                counters = _mapping(registry.get("lease_generations"), "lease generations")
+                current_generation = counters.get(game_id, 0)
+                if type(current_generation) is not int or not 0 <= current_generation < 2**31 - 1:
+                    raise CatalogAdmissionError("lease generation counter is invalid or exhausted")
+                generation = current_generation + 1
+                admission = CatalogAdmission.build(
+                    catalog_id=selection.catalog_id,
+                    game_id=game_id,
+                    board_id=selection.board_id,
+                    board_version=selection.board_version,
+                    package_identity=package_identity,
+                    gate_sha256=selection.gate_sha256,
+                    lease_generation=generation,
+                )
+                leases[game_id] = {
+                    **admission.model_dump(mode="json"),
+                    "board_ref": selection.board_ref.format(),
+                    "status": "ACTIVE",
+                }
+                counters[game_id] = generation
+                registry["leases"] = leases
+                registry["lease_generations"] = counters
+                registry["revision"] = _revision(registry) + 1
+                await self._write_registry(registry)
+        except asyncio.CancelledError:
+            if admission is not None:
+                await _await_uncancellable(self.cancel_lease(admission, game_id))
+            raise
+        assert admission is not None
+        return admission
 
     async def cancel_lease(self, admission: CatalogAdmission, game_id: str) -> bool:
         """Release only this failed start's exact lease; retries advance generation."""
@@ -883,17 +1103,25 @@ class CatalogStore:
         refs: tuple[VersionedRef, ...]
         if board is not None:
             if "@" in board:
-                refs = (VersionedRef.parse(board),)
+                refs = (_parse_board_ref(board, label="board"),)
             else:
+                if _IDENTIFIER.fullmatch(board) is None:
+                    raise CatalogError("board must be an ID or exact ID@X.Y.Z reference")
+                entries_root = self.root / "entries"
+                if entries_root.is_symlink():
+                    raise CatalogError("catalog entries directory must not be a symlink")
                 refs = tuple(
                     VersionedRef(id=board, version=path.name)
-                    for path in (self.root / "entries" / board).glob("*")
+                    for path in (entries_root / board).glob("*")
                     if path.is_dir() and not path.is_symlink()
                 )
         else:
+            entries_root = self.root / "entries"
+            if entries_root.is_symlink():
+                raise CatalogError("catalog entries directory must not be a symlink")
             refs = tuple(
                 VersionedRef(id=board_path.name, version=version_path.name)
-                for board_path in (self.root / "entries").glob("*")
+                for board_path in entries_root.glob("*")
                 if board_path.is_dir() and not board_path.is_symlink()
                 for version_path in board_path.glob("*")
                 if version_path.is_dir() and not version_path.is_symlink()
@@ -915,6 +1143,7 @@ class CatalogStore:
             )
         return {
             "schema_version": 1,
+            "catalog_id": self.catalog_id,
             "revision": _revision(registry),
             "active": dict(active),
             "candidates": candidates,
@@ -930,43 +1159,219 @@ class CatalogStore:
     def _load_registry(self) -> dict[str, object]:
         path = self.root / "registry.json"
         if not path.exists():
-            return _registry_template()
+            return _registry_template(self.catalog_id)
         if path.is_symlink() or not path.is_file():
             raise CatalogError("catalog registry is unsafe")
         loaded = dict(_read_json(path, label="catalog registry"))
-        if loaded.get("schema_version") != _REGISTRY_SCHEMA:
+        template = _registry_template(self.catalog_id)
+        if set(loaded) != set(template):
+            raise CatalogError("catalog registry has missing or unsupported fields")
+        if (
+            type(loaded.get("schema_version")) is not int
+            or loaded.get("schema_version") != _REGISTRY_SCHEMA
+        ):
             raise CatalogError("catalog registry schema_version is unsupported")
-        template = _registry_template()
-        for key, default in template.items():
-            if key not in loaded:
-                loaded[key] = default
+        if loaded.get("catalog_id") != self.catalog_id:
+            raise CatalogError("catalog registry belongs to a different root path")
+        _revision(loaded)
         for key in (
             "active",
             "leases",
             "lease_generations",
             "tombstones",
             "entry_revisions",
+            "entry_digests",
             "gate_runs",
         ):
             if not isinstance(loaded.get(key), Mapping):
                 raise CatalogError(f"catalog registry {key} is invalid")
         if not isinstance(loaded.get("retired"), list):
             raise CatalogError("catalog registry retired list is invalid")
+
+        active = _mapping(loaded["active"], "active catalog pointers")
+        for board_id, version in active.items():
+            if _IDENTIFIER.fullmatch(board_id) is None or not isinstance(version, str):
+                raise CatalogError("catalog active pointer identity is invalid")
+            _parse_board_ref(f"{board_id}@{version}", label="catalog active pointer")
+
+        retired_values = cast(list[object], loaded["retired"])
+        retired = _string_set(retired_values, "retired refs")
+        if len(retired) != len(retired_values):
+            raise CatalogError("catalog retired list contains duplicates")
+        for retired_ref in retired:
+            _parse_board_ref(retired_ref, label="catalog retired ref")
+
+        leases = _mapping(loaded["leases"], "catalog leases")
+        counters = _mapping(loaded["lease_generations"], "lease generations")
+        if set(leases) != set(counters):
+            raise CatalogError("catalog lease generation index does not match leases")
+        lease_fields = set(CatalogAdmission.model_fields) | {"board_ref", "status"}
+        for game_id, lease_record in leases.items():
+            if not isinstance(lease_record, Mapping) or set(lease_record) != lease_fields:
+                raise CatalogError("catalog lease record has missing or unsupported fields")
+            admission_payload = {
+                name: lease_record[name] for name in CatalogAdmission.model_fields
+            }
+            try:
+                admission = CatalogAdmission.model_validate(admission_payload, strict=True)
+                admission.validate_for_game(game_id)
+            except (TypeError, ValueError) as exc:
+                raise CatalogError("catalog lease identity is invalid") from exc
+            lease_board_ref = f"{admission.board_id}@{admission.board_version}"
+            if lease_record.get("board_ref") != lease_board_ref or lease_record.get("status") not in {
+                "ACTIVE",
+                "CANCELLED",
+                "RELEASED",
+            }:
+                raise CatalogError("catalog lease status or board reference is invalid")
+            generation = counters.get(game_id)
+            if type(generation) is not int or generation != admission.lease_generation:
+                raise CatalogError("catalog lease generation index is invalid")
+
+        tombstones = _mapping(loaded["tombstones"], "game tombstones")
+        tombstone_fields = {
+            "status",
+            "lease_id",
+            "catalog_id",
+            "board_ref",
+            "package_identity",
+            "gate_sha256",
+            "lease_generation",
+            "archive_id",
+            "snapshot_id",
+            "final_state_revision",
+        }
+        for game_id, tombstone in tombstones.items():
+            if not isinstance(tombstone, Mapping) or set(tombstone) != tombstone_fields:
+                raise CatalogError("catalog game tombstone has missing or unsupported fields")
+            if tombstone.get("status") != "CLOSED_ARCHIVE":
+                raise CatalogError("catalog game tombstone status is invalid")
+            tombstone_ref = _parse_board_ref(
+                tombstone.get("board_ref"), label="catalog tombstone ref"
+            )
+            catalog_id = tombstone.get("catalog_id")
+            package_identity = tombstone.get("package_identity")
+            gate_sha256 = tombstone.get("gate_sha256")
+            lease_generation = tombstone.get("lease_generation")
+            lease_id = tombstone.get("lease_id")
+            archive_id = tombstone.get("archive_id")
+            snapshot_id = tombstone.get("snapshot_id")
+            final_state_revision = tombstone.get("final_state_revision")
+            if (
+                not isinstance(catalog_id, str)
+                or _IDENTIFIER.fullmatch(catalog_id) is None
+                or not isinstance(package_identity, str)
+                or _SHA256_PATTERN.fullmatch(package_identity) is None
+                or not isinstance(gate_sha256, str)
+                or _SHA256_PATTERN.fullmatch(gate_sha256) is None
+                or type(lease_generation) is not int
+                or not 1 <= lease_generation <= 2**31 - 1
+                or not isinstance(lease_id, str)
+                or _SHA256_PATTERN.fullmatch(lease_id) is None
+                or not isinstance(archive_id, str)
+                or not archive_id
+                or not isinstance(snapshot_id, str)
+                or not snapshot_id
+                or type(final_state_revision) is not int
+                or final_state_revision < 0
+            ):
+                raise CatalogError("catalog game tombstone identity is invalid")
+            try:
+                admission = CatalogAdmission.build(
+                    catalog_id=catalog_id,
+                    game_id=game_id,
+                    board_id=tombstone_ref.id,
+                    board_version=tombstone_ref.version,
+                    package_identity=package_identity,
+                    gate_sha256=gate_sha256,
+                    lease_generation=lease_generation,
+                )
+            except (TypeError, ValueError) as exc:
+                raise CatalogError("catalog game tombstone identity is invalid") from exc
+            lease = leases.get(game_id)
+            if (
+                admission.lease_id != lease_id
+                or not isinstance(lease, Mapping)
+                or lease.get("status") != "RELEASED"
+                or lease.get("lease_id") != lease_id
+            ):
+                raise CatalogError("catalog game tombstone does not match its released lease")
+
+        entry_digests = _mapping(loaded["entry_digests"], "entry digests")
+        for ref_value, digest in entry_digests.items():
+            _parse_board_ref(ref_value, label="catalog entry digest ref")
+            if not isinstance(digest, str) or _SHA256_PATTERN.fullmatch(digest) is None:
+                raise CatalogError("catalog entry digest is invalid")
+
+        entry_revisions = _mapping(loaded["entry_revisions"], "entry revisions")
+        for ref_value, revision in entry_revisions.items():
+            _parse_board_ref(ref_value, label="catalog entry revision ref")
+            if type(revision) is not int or revision < 0:
+                raise CatalogError("catalog entry revision is invalid")
+
+        gate_runs = _mapping(loaded["gate_runs"], "catalog gate runs")
+        for ref_value, gate_record in gate_runs.items():
+            _parse_board_ref(ref_value, label="catalog gate run ref")
+            if not isinstance(gate_record, Mapping) or set(gate_record) != {
+                "status",
+                "stage_digest",
+                "gate_sha256",
+                "report_path",
+                "report_sha256",
+            }:
+                raise CatalogError("catalog gate record has missing or unsupported fields")
+            if (
+                gate_record.get("status") != "PASS"
+                or not isinstance(gate_record.get("stage_digest"), str)
+                or _SHA256_PATTERN.fullmatch(
+                    cast(str, gate_record.get("stage_digest"))
+                )
+                is None
+                or not isinstance(gate_record.get("gate_sha256"), str)
+                or _SHA256_PATTERN.fullmatch(cast(str, gate_record.get("gate_sha256"))) is None
+                or not isinstance(gate_record.get("report_path"), str)
+                or not isinstance(gate_record.get("report_sha256"), str)
+                or _SHA256_PATTERN.fullmatch(cast(str, gate_record.get("report_sha256"))) is None
+            ):
+                raise CatalogError("catalog gate record identity is invalid")
+            if entry_digests.get(ref_value) != gate_record.get("stage_digest"):
+                raise CatalogError("catalog gate record differs from the immutable entry digest")
+
+        for board_id, version in active.items():
+            ref_value = f"{board_id}@{version}"
+            if ref_value in retired or ref_value not in gate_runs:
+                raise CatalogError("catalog active default is retired or has no passing gate")
         return loaded
 
     async def _write_registry(self, registry: Mapping[str, object]) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
-        await atomic_write_bytes(self.root / "registry.json", _canonical_json(registry))
+        await _await_uncancellable(
+            atomic_write_bytes(self.root / "registry.json", _canonical_json(registry))
+        )
 
     @asynccontextmanager
     async def _writer_lock(self) -> AsyncIterator[None]:
         self.root.mkdir(parents=True, exist_ok=True)
         lock_path = self.root / ".catalog-writer.lock"
-        await asyncio.to_thread(_acquire_exclusive, lock_path)
+        if lock_path.is_symlink():
+            raise CatalogError("catalog writer lock is unsafe")
+        acquisition = asyncio.create_task(asyncio.to_thread(_acquire_exclusive, lock_path))
+        cancelled = False
+        while True:
+            try:
+                await asyncio.shield(acquisition)
+                break
+            except asyncio.CancelledError:
+                if acquisition.cancelled():
+                    raise
+                cancelled = True
+        if cancelled:
+            await _thread_call_uncancellable(_release_exclusive, lock_path)
+            raise asyncio.CancelledError
         try:
             yield
         finally:
-            await asyncio.to_thread(_release_exclusive, lock_path)
+            await _thread_call_uncancellable(_release_exclusive, lock_path)
 
     @staticmethod
     def _entry_report(entry: CatalogEntry, *, status: str) -> dict[str, object]:
@@ -986,9 +1391,18 @@ def _acquire_exclusive(path: Path) -> None:
     while True:
         try:
             descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            os.write(descriptor, f"{os.getpid()}\n".encode("ascii"))
-            os.fsync(descriptor)
-            os.close(descriptor)
+            try:
+                os.write(descriptor, f"{os.getpid()}\n".encode("ascii"))
+                os.fsync(descriptor)
+            except BaseException:
+                os.close(descriptor)
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+                raise
+            else:
+                os.close(descriptor)
             return
         except FileExistsError:
             if time.monotonic() >= deadline:
@@ -1044,7 +1458,9 @@ def _bump_entry_revision(registry: dict[str, object], ref: VersionedRef) -> int:
     return current + 1
 
 
-def _mandatory_skill_ids(execution: ExecutionPackage) -> tuple[set[str], set[str]]:
+def _mandatory_skill_ids(
+    execution: ExecutionPackage,
+) -> tuple[set[str], set[str], set[str]]:
     skill_modes = {item.skill_id: item.mode for item in execution.skills}
     skills_by_id = {item.skill_id: item for item in execution.skills}
     required_player = {
@@ -1052,28 +1468,27 @@ def _mandatory_skill_ids(execution: ExecutionPackage) -> tuple[set[str], set[str
         for skill in execution.skills
         if skill.mode == "PLAYER" and skill.action_code != 299 and skill.grants
     }
+    required_host = {skill.skill_id for skill in execution.skills if skill.mode == "HOST"}
     all_effects = [
-        effect
-        for skill in execution.skills
-        for effect in (*skill.effects, *skill.pass_effects)
+        effect for skill in execution.skills for effect in (*skill.effects, *skill.pass_effects)
     ]
     all_effects.extend(
-        effect
-        for interaction in execution.interactions
-        for effect in interaction.effects
+        effect for interaction in execution.interactions for effect in interaction.effects
     )
     for effect in all_effects:
         grant_id = effect.grant_skill_id if effect.effect_type == "ABILITY_GRANT" else None
         if (
             isinstance(grant_id, str)
-            and skill_modes.get(grant_id) == "PLAYER"
+            and grant_id in skills_by_id
             and skills_by_id[grant_id].action_code != 299
         ):
-            required_player.add(grant_id)
-    required_automatic = {
-        skill.skill_id for skill in execution.skills if skill.mode == "AUTOMATIC"
-    }
-    return required_player, required_automatic
+            mode = skill_modes[grant_id]
+            if mode == "PLAYER":
+                required_player.add(grant_id)
+            elif mode == "HOST":
+                required_host.add(grant_id)
+    required_automatic = {skill.skill_id for skill in execution.skills if skill.mode == "AUTOMATIC"}
+    return required_player, required_host, required_automatic
 
 
 __all__ = [

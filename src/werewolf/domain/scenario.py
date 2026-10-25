@@ -330,6 +330,14 @@ def load_scenario(path: str | Path) -> ScenarioDefinition:
         raw_bytes = source.read_bytes()
     except OSError as exc:
         raise ScenarioError("scenario file could not be read") from exc
+    return load_scenario_bytes(raw_bytes, source_name=source.name)
+
+
+def load_scenario_bytes(raw_bytes: bytes, *, source_name: str) -> ScenarioDefinition:
+    """Validate scenario bytes directly so identity and staged bytes cannot diverge."""
+
+    if not isinstance(raw_bytes, bytes):
+        raise ScenarioError("scenario contents must be bytes")
     if len(raw_bytes) > 1_048_576:
         raise ScenarioError("scenario file exceeds the 1 MiB limit")
     try:
@@ -337,7 +345,7 @@ def load_scenario(path: str | Path) -> ScenarioDefinition:
     except UnicodeDecodeError as exc:
         raise ScenarioError("scenario file must be UTF-8") from exc
     try:
-        if source.suffix.lower() == ".json":
+        if Path(source_name).suffix.lower() == ".json":
             raw: object = json.loads(
                 text,
                 object_pairs_hook=_json_unique_pairs,
@@ -601,5 +609,6 @@ __all__ = [
     "build_host_command",
     "host_command_matches",
     "load_scenario",
+    "load_scenario_bytes",
     "scenario_sha256",
 ]

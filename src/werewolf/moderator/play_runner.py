@@ -514,6 +514,59 @@ class ClassicPlayRunner:
             await self._drain_rule_workflow()
 
     async def _day_announce(self) -> None:
+        schedule = (
+            self.shell.manager.execution_package.night_boundary_schedule
+            if self.shell.manager is not None
+            and self.shell.manager.execution_package is not None
+            else None
+        )
+        if schedule is not None:
+            state = self.shell.state
+            required = schedule.required_for_round(state.round_no)
+            prerequisites = (
+                self.shell.manager.night_boundary_prerequisites(
+                    state,
+                    round_no=state.round_no,
+                )
+                if self.shell.manager is not None
+                else ()
+            )
+            results = {item.prerequisite: item.satisfied for item in prerequisites}
+            if (
+                "FIRST_DAY_SHERIFF_ELECTION" in required
+                and not results.get("FIRST_DAY_SHERIFF_ELECTION", False)
+            ):
+                if state.sheriff_election is not None:
+                    raise PlayRunnerError(
+                        "scheduled first-day sheriff election is incomplete outside its phase"
+                    )
+                candidates = self.sheriff_candidates
+                if candidates is None:
+                    candidates = first_day_sheriff_participants(
+                        state,
+                        execution_package=self.shell.manager.execution_package,
+                    )[:2]
+                if len(candidates) < 1:
+                    raise PlayRunnerError("no eligible sheriff candidate is available")
+                await self.command("sheriff start " + " ".join(str(seat) for seat in candidates))
+                return
+
+            # Scheduled dawn remains in DAY_ANNOUNCE until the election,
+            # death speech, badge, and victory prerequisites have all been
+            # checked. DayCoordinator keeps this event idempotent at dawn.
+            await self.command("day announce")
+            if self._badge_required():
+                await self.command("sheriff badge open")
+                await self.command("sheriff badge next")
+                await self.command("sheriff badge resolve")
+                await self.command("sheriff badge finish")
+            await self._last_words()
+            await self.command("victory night-check")
+            if self.shell.state.phase is GamePhase.FINISHED:
+                return
+            await self.command("day speech open")
+            return
+
         # A completed night can already satisfy a unique victory condition.
         # The dedicated boundary snapshots that winner and skips an otherwise
         # meaningless announcement/election; ONGOING returns to normal day.
@@ -587,6 +640,22 @@ class ClassicPlayRunner:
             return
         if phase is GamePhase.SHERIFF_TRANSFER:
             await self.command("sheriff transfer")
+            manager = self.shell.manager
+            schedule = (
+                manager.execution_package.night_boundary_schedule
+                if manager is not None and manager.execution_package is not None
+                else None
+            )
+            if (
+                schedule is not None
+                and self.shell.state.round_no == 0
+                and "FIRST_DAY_SHERIFF_ELECTION" in schedule.required_for_round(0)
+            ):
+                if self.shell.state.phase is not GamePhase.DAY_ANNOUNCE:
+                    raise PlayRunnerError(
+                        "scheduled sheriff transfer did not return to the dawn boundary"
+                    )
+                return
             # The first-day election completes before the death announcement.
             # Publish it while retaining the DAY_SPEECH boundary, then let a
             # dead elected sheriff complete the badge choice before speeches.

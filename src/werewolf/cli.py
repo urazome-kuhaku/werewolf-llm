@@ -7,6 +7,7 @@ from typing import Annotated
 
 import typer
 
+from werewolf.cli_support.checkpoint_cli import verify_private_checkpoint
 from werewolf.cli_support.diagnostics import (
     DiagnosticFailure,
     json_report,
@@ -22,6 +23,7 @@ from werewolf.knowledge.catalog import CatalogError, CatalogStore
 from werewolf.knowledge.preview import experimental_preview
 from werewolf.moderator.play_runner import PlayRunnerError
 from werewolf.moderator.scenario_runner import ScenarioRunError
+from werewolf.moderator.shell import ModeratorError
 
 app = typer.Typer(
     name="werewolf",
@@ -36,6 +38,9 @@ archive_app = typer.Typer(help="Game archive diagnostics.", no_args_is_help=True
 play_app = typer.Typer(help="Experimental playable game setup.", no_args_is_help=True)
 scenario_app = typer.Typer(help="Run declarative scenario gates.", no_args_is_help=True)
 catalog_app = typer.Typer(help="Stage and manage experimental rule catalogs.", no_args_is_help=True)
+checkpoint_app = typer.Typer(
+    help="Verify private waiting-choice checkpoints.", no_args_is_help=True
+)
 app.add_typer(config_app, name="config")
 app.add_typer(rules_app, name="rules")
 app.add_typer(pi_app, name="pi")
@@ -43,6 +48,7 @@ app.add_typer(archive_app, name="archive")
 app.add_typer(play_app, name="play")
 app.add_typer(scenario_app, name="scenario")
 app.add_typer(catalog_app, name="catalog")
+app.add_typer(checkpoint_app, name="checkpoint")
 
 
 def _report_or_exit(
@@ -293,6 +299,27 @@ def catalog_unload(
         typer.echo(f"catalog unload failed: {str(exc)[:500]}", err=True)
         raise typer.Exit(code=1) from None
     typer.echo(json_report(report))
+
+
+@checkpoint_app.command("verify")
+def checkpoint_verify(
+    config_file: Annotated[
+        Path, typer.Option("--config", help="Game configuration YAML used by the checkpoint.")
+    ],
+    selector: Annotated[
+        str, typer.Argument(help="Checkpoint ID, directory name, or private checkpoint path.")
+    ],
+) -> None:
+    """Verify a private waiting-choice checkpoint without starting sessions."""
+
+    try:
+        report = verify_private_checkpoint(config_file, selector)
+    except (ModeratorError, OSError, ValueError) as exc:
+        typer.echo(f"checkpoint verify failed: {str(exc)[:500]}", err=True)
+        raise typer.Exit(code=1) from None
+    typer.echo(json_report(report))
+    if report.get("status") != "verified":
+        raise typer.Exit(code=1)
 
 
 @play_app.command("run")

@@ -1105,10 +1105,18 @@ async def _shielded_to_thread(function: Callable[..., object], *args: object) ->
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
-        try:
-            await task
-        except BaseException:
-            pass
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        if task.done() and not task.cancelled():
+            try:
+                task.exception()
+            except BaseException:
+                pass
         raise
 
 
