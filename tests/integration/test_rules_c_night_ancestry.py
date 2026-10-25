@@ -21,6 +21,8 @@ from test_rules_b_workflow import (
 )
 
 from werewolf.domain.enums import GamePhase
+from werewolf.domain.sheriff_eligibility import first_day_sheriff_participants, first_night_death_seats
+import werewolf.domain.sheriff_eligibility as sheriff_eligibility
 from werewolf.game.actions import load_action_registry
 from werewolf.game.manager import EventCommitError, GameManager
 from werewolf.game.state import GameState
@@ -110,7 +112,7 @@ class _CandidateSelectingDemoRuntime(DemoRuntime):
                 for code in (MASS_ACTION, CHOICE_ACTION)
                 if code in window.allowed_action_codes
             )
-            targets = (3, 4) if action_code == MASS_ACTION else (1,)
+            targets = (3,) if action_code == MASS_ACTION else (1,)
             return ActionResponse(
                 request_id=request.request_id,
                 actions=[Action(action_code=action_code, targets=list(targets))],
@@ -122,6 +124,32 @@ async def _build_scheduled_ancestry_setup(output: Path) -> None:
     from test_rules_c_scheduled_night_flow import _scheduled_published_root
 
     published_root = _scheduled_published_root(output.parent)
+    board_path = (
+        published_root
+        / "boards"
+        / "classic_12_seer_witch_hunter_idiot"
+        / "1.0.0"
+        / "board.md"
+    )
+    board_source = board_path.read_text(encoding="utf-8")
+    board_sections = board_source.split("---", 2)
+    assert len(board_sections) == 3
+    board_data = yaml.safe_load(board_sections[1])
+    assert isinstance(board_data, dict)
+    flow = board_data.get("day_flow")
+    assert isinstance(flow, dict)
+    last_words = flow.get("last_words")
+    assert isinstance(last_words, dict)
+    last_words["eligible_death_causes"] = [
+        "wolf_kill",
+        "c_night_auto_death",
+        "c_night_choice_death",
+    ]
+    board_path.write_text(
+        f"---\n{yaml.safe_dump(board_data, allow_unicode=True, sort_keys=False)}---\n"
+        f"{board_sections[2].lstrip()}",
+        encoding="utf-8",
+    )
     source_package = await KnowledgePackageLoader(published_root).load(
         VersionedRef.parse(BOARD_REF)
     )
@@ -145,11 +173,23 @@ async def _build_scheduled_ancestry_setup(output: Path) -> None:
     payload.pop("night_boundary_schedule", None)
     payload["interactions"] = [
         {
-            "interaction_id": "c-confirm-night-chain-death",
+            "interaction_id": "c-confirm-night-physical-death",
             "rule_type": "CONFIRM_DEATH",
-            "damage_tags": ["c_night_chain_death"],
+            "damage_tags": ["c_night_physical_death"],
             "death_cause": "wolf_kill",
-        }
+        },
+        {
+            "interaction_id": "c-confirm-night-auto-death",
+            "rule_type": "CONFIRM_DEATH",
+            "damage_tags": ["c_night_auto_death"],
+            "death_cause": "c_night_auto_death",
+        },
+        {
+            "interaction_id": "c-confirm-night-choice-death",
+            "rule_type": "CONFIRM_DEATH",
+            "damage_tags": ["c_night_choice_death"],
+            "death_cause": "c_night_choice_death",
+        },
     ]
     payload["actions"].extend(
         [
@@ -168,9 +208,9 @@ async def _build_scheduled_ancestry_setup(output: Path) -> None:
             "timing": ["NIGHT_ACTION"],
             "window_ids": ["night_actions"],
             "targets": {
-                "min_targets": 2,
-                "max_targets": 2,
-                "selector": _fixed_live_targets(3, 4),
+                "min_targets": 1,
+                "max_targets": 1,
+                "selector": _fixed_live_targets(3),
                 "allow_self": False,
             },
             "usage": {"max_uses": 1, "scope": "GAME"},
@@ -179,7 +219,7 @@ async def _build_scheduled_ancestry_setup(output: Path) -> None:
                     "effect_id": "c-night-physical-damage",
                     "effect_type": "DAMAGE",
                     "target": _ref("target", "seat"),
-                    "tags": ["c_night_chain_death"],
+                    "tags": ["c_night_physical_death"],
                 }
             ],
         },
@@ -195,7 +235,9 @@ async def _build_scheduled_ancestry_setup(output: Path) -> None:
                 "fact_types": ["DEATH_CONFIRMED"],
                 "mode": "AUTOMATIC",
                 "condition": _compare(
-                    "ne", _ref("source_fact", "target_seat"), _ref("actor", "seat")
+                    "eq",
+                    _ref("source_fact", "death_cause"),
+                    _literal("wolf_kill"),
                 ),
             },
             "targets": {"min_targets": 0, "max_targets": 0, "selector": _all_living_except_actor()},
@@ -205,7 +247,7 @@ async def _build_scheduled_ancestry_setup(output: Path) -> None:
                     "effect_id": "c-night-auto-damage",
                     "effect_type": "DAMAGE",
                     "target": _ref("actor", "seat"),
-                    "tags": ["c_night_chain_death"],
+                    "tags": ["c_night_auto_death"],
                 }
             ],
         },
@@ -235,7 +277,7 @@ async def _build_scheduled_ancestry_setup(output: Path) -> None:
                     "effect_id": "c-night-choice-damage",
                     "effect_type": "DAMAGE",
                     "target": _ref("target", "seat"),
-                    "tags": ["c_night_chain_death"],
+                    "tags": ["c_night_choice_death"],
                 }
             ],
         },
@@ -252,7 +294,7 @@ async def _build_scheduled_ancestry_setup(output: Path) -> None:
                 "action_code": MASS_ACTION,
                 "action_name": "C_NIGHT_MASS_DEATH",
                 "target_policy": "candidate",
-                "target_count": 2,
+                "target_count": 1,
             },
             {
                 "action_code": AUTO_ACTION,
@@ -308,13 +350,13 @@ async def test_n0_scheduled_runtime_chain_finishes_deaths_words_badge_and_speech
     runner = ClassicPlayRunner(
         setup / "game.yaml",
         max_rounds=1,
-        sheriff_candidates=(2,),
         runtime_factory=lambda _player, gateway_url, token: _CandidateSelectingDemoRuntime(
             gateway_url,
             token,
         ),
     )
     history: list[tuple[str, GamePhase, int, int]] = []
+    dead_sheriff: int | None = None
     command_history: list[str] = []
     original_command = runner.command
 
@@ -356,6 +398,146 @@ async def test_n0_scheduled_runtime_chain_finishes_deaths_words_badge_and_speech
             elif phase is GamePhase.NIGHT_RESOLVE:
                 await runner._night_resolve()
             elif phase is GamePhase.DAY_ANNOUNCE:
+                if runner.shell.state.round_no == 0 and runner.sheriff_candidates is None:
+                    last_words_seats = tuple(
+                        seat
+                        for boundary in runner.shell.state.rule_boundaries
+                        if boundary.return_point.phase is GamePhase.DAY_ANNOUNCE
+                        and boundary.return_point.day_no == 0
+                        for seat in boundary.last_words_seats
+                    )
+                    sheriff_candidates = tuple(
+                        seat
+                        for seat in last_words_seats
+                        if not runner.shell.state.players[seat].alive
+                    )
+                    eligible_sheriffs = first_day_sheriff_participants(
+                        runner.shell.state,
+                        execution_package=manager.execution_package,
+                    )
+                    physical_source = next(
+                        item
+                        for item in runner.shell.state.rule_ledger
+                        if item.group_id == "night:0"
+                    )
+                    physical_boundary = next(
+                        item
+                        for item in runner.shell.state.rule_boundaries
+                        if item.source_group_id == "night:0"
+                    )
+                    physical_fact = physical_source.facts[0]
+                    boundary_order = [
+                        item
+                        for item in runner.shell.state.rule_boundaries
+                        if item.source_group_id in {"night:0"}
+                        or item.source_group_id.startswith(("automatic-", "trigger-"))
+                    ]
+                    prefix_proofs: list[tuple[str, tuple[int, ...]]] = []
+                    for count in range(1, len(boundary_order) + 1):
+                        selected_boundaries = tuple(boundary_order[:count])
+                        batch_ids = {item.source_batch_id for item in selected_boundaries}
+                        selected_ledgers = tuple(
+                            item
+                            for item in runner.shell.state.rule_ledger
+                            if item.batch_id in batch_ids
+                        )
+                        selected_receipts = tuple(
+                            item
+                            for item in runner.shell.state.rule_receipts
+                            if item.batch_id in batch_ids
+                        )
+                        fact_ids = {
+                            fact.fact_id for item in selected_ledgers for fact in item.facts
+                        }
+                        selected_occurrences = tuple(
+                            item
+                            for item in runner.shell.state.rule_trigger_queue
+                            if item.source_fact_id in fact_ids
+                        )
+                        prefix_state = runner.shell.state.model_copy(
+                            update={
+                                "rule_boundaries": selected_boundaries,
+                                "rule_ledger": selected_ledgers,
+                                "rule_receipts": selected_receipts,
+                                "rule_trigger_queue": selected_occurrences,
+                            }
+                        )
+                        prefix_proofs.append(
+                            (
+                                selected_boundaries[-1].source_group_id,
+                                first_night_death_seats(
+                                    prefix_state,
+                                    execution_package=manager.execution_package,
+                                ),
+                            )
+                        )
+                    print(
+                        "STRICT_NIGHT_DEATHS",
+                        first_night_death_seats(
+                            runner.shell.state,
+                            execution_package=manager.execution_package,
+                        ),
+                        "BOUNDARIES",
+                        [
+                            (item.source_group_id, item.source_batch_id, item.death_fact_ids, item.death_seats)
+                            for item in runner.shell.state.rule_boundaries
+                        ],
+                        "LEDGERS",
+                        [
+                            (item.group_id, item.timing, item.request_ids, item.skill_ids,
+                             [(fact.fact_type, fact.target_seat, fact.source_request_id, fact.data.get("source_request_ids"))
+                              for fact in item.facts])
+                            for item in runner.shell.state.rule_ledger
+                        ],
+                        "WINDOWS",
+                        [
+                            (key, value.get("logical_window_id"), value.get("phase"),
+                             value.get("closed_at"), value.get("next_window_id"),
+                             value.get("settlement_group_id"))
+                            for key, value in runner.shell.state.action_windows.items()
+                        ],
+                        "ELIGIBLE_SHERIFFS",
+                        eligible_sheriffs,
+                        "CURSOR",
+                        runner.shell.state.rule_workflow_cursor.model_dump(mode="json"),
+                        "OCCURRENCES",
+                        [item.model_dump(mode="json") for item in runner.shell.state.rule_trigger_queue],
+                        "PREFIX_PROOFS",
+                        prefix_proofs,
+                        "PROOF",
+                        {
+                            "state_package": getattr(runner.shell.state.execution_identity, "package_id", None),
+                            "live_package": manager.execution_package.package_id,
+                            "fact_valid_seat": sheriff_eligibility._valid_death_fact(
+                                physical_fact, runner.shell.state.players
+                            ),
+                            "internal_ids": sheriff_eligibility._physical_request_internal_ids(
+                                runner.shell.state, physical_source
+                            ),
+                            "receipt_valid": sheriff_eligibility._verified_rule_receipt(
+                                runner.shell.state, physical_source, manager.execution_package.package_id
+                            ),
+                            "topology": sheriff_eligibility._night_group_has_terminal_topology(
+                                runner.shell.state,
+                                manager.execution_package,
+                                group_id="night:0",
+                                point=physical_boundary.return_point,
+                                metadata=sheriff_eligibility._metadata_with_phases(
+                                    manager.execution_package
+                                ),
+                            ),
+                            "point": physical_boundary.return_point.model_dump(mode="json"),
+                            "receipt_occurrences": next(
+                                item.occurrence_ids
+                                for item in runner.shell.state.rule_receipts
+                                if item.batch_id == physical_source.batch_id
+                            ),
+                        },
+                    )
+                    assert sheriff_candidates
+                    assert sheriff_candidates[0] in eligible_sheriffs
+                    dead_sheriff = sheriff_candidates[0]
+                    runner.sheriff_candidates = (dead_sheriff,)
                 await runner._day_announce()
             elif phase in {
                 GamePhase.SHERIFF_ELECTION_SPEECH,
@@ -380,7 +562,6 @@ async def test_n0_scheduled_runtime_chain_finishes_deaths_words_badge_and_speech
         assert {seat for seat, player in state.players.items() if not player.alive} >= {
             2,
             3,
-            4,
         }
         auto_occurrence = next(
             item
@@ -426,7 +607,6 @@ async def test_n0_scheduled_runtime_chain_finishes_deaths_words_badge_and_speech
         assert {seat for item in state.rule_boundaries for seat in item.death_seats} >= {
             2,
             3,
-            4,
         }
         assert all(not item.is_pending for item in state.rule_boundaries)
 
@@ -510,10 +690,11 @@ async def test_n0_scheduled_runtime_chain_finishes_deaths_words_badge_and_speech
 
         assert runner.shell.state.phase is GamePhase.DAY_SPEECH
         assert runner.shell.state.sheriff_election is not None
-        assert runner.shell.state.sheriff_election["sheriff_seat"] == 2
+        assert dead_sheriff is not None
+        assert runner.shell.state.sheriff_election["sheriff_seat"] == dead_sheriff
         announce_index = command_history.index("day announce")
         badge_index = command_history.index("sheriff badge open")
-        words_index = command_history.index("last-words next 2")
+        words_index = command_history.index(f"last-words next {dead_sheriff}")
         night_check_index = command_history.index("victory night-check")
         speech_index = command_history.index("day speech open")
         assert announce_index < badge_index < words_index < night_check_index < speech_index

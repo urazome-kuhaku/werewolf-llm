@@ -484,11 +484,47 @@ def _strict_first_night_death_seats(state: Any, execution_package: object) -> tu
                 return False
         else:
             internal_ids = _physical_request_internal_ids(state, ledger)
+            occurrence_window_id = _mapping_value(occurrence, "window_id")
+            action_windows = getattr(state, "action_windows", {})
+            action_requests = getattr(state, "action_requests", {})
+            trigger_window = (
+                action_windows.get(occurrence_window_id)
+                if isinstance(action_windows, Mapping)
+                and isinstance(occurrence_window_id, str)
+                else None
+            )
+            trigger_request = (
+                action_requests.get(request_ids[0])
+                if len(request_ids) == 1
+                and isinstance(request_ids[0], str)
+                and isinstance(action_requests, Mapping)
+                else None
+            )
+            trigger_context = _mapping_value(trigger_window, "visible_context")
+            occurrence_request_id = _mapping_value(occurrence, "request_id")
             if (
                 len(request_ids) != 1
-                or _mapping_value(occurrence, "request_id") not in request_ids
                 or internal_ids is None
                 or not causal_ids.issubset(internal_ids)
+                or not isinstance(occurrence_window_id, str)
+                or not isinstance(trigger_window, Mapping)
+                or _value(_mapping_value(trigger_window, "phase")) != "TRIGGER_ACTION"
+                or _mapping_value(trigger_window, "closed_at") is None
+                or _mapping_value(trigger_window, "settlement_group_id") != expected_group_id
+                or _mapping_value(trigger_context, "rule_occurrence_id") != occurrence_id
+                or _mapping_value(trigger_context, "rule_source_fact_id")
+                != _mapping_value(occurrence, "source_fact_id")
+                or _mapping_value(trigger_context, "rule_actor_seat")
+                != _mapping_value(occurrence, "actor_seat")
+                or _mapping_value(trigger_context, "rule_ability_instance_id")
+                != _mapping_value(occurrence, "ability_instance_id")
+                or _mapping_value(trigger_context, "rule_skill_id")
+                != _mapping_value(occurrence, "skill_id")
+                or not isinstance(trigger_request, Mapping)
+                or _mapping_value(trigger_request, "window_id") != occurrence_window_id
+                or _mapping_value(trigger_request, "seat")
+                != _mapping_value(occurrence, "actor_seat")
+                or (occurrence_request_id is not None and occurrence_request_id not in request_ids)
             ):
                 return False
         source_fact_id = _mapping_value(occurrence, "source_fact_id")

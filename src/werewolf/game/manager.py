@@ -12387,7 +12387,6 @@ class GameManager:
             and all(
                 item.return_point.phase is GamePhase.DAY_ANNOUNCE
                 and item.return_point.day_no == 0
-                and item.source_group_id.startswith("night:0")
                 and set(item.death_seats).issubset(death_seats)
                 for item in pending
             )
