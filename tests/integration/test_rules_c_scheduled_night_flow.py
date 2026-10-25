@@ -11,14 +11,28 @@ import yaml
 
 from werewolf.cli_support.play_setup import build_play_setup
 from werewolf.domain.enums import GamePhase
+from werewolf.domain.night_boundaries import NightBoundarySchedule
 from werewolf.game.actions import load_action_registry
 from werewolf.game.events import EventType
 from werewolf.game.manager import EventCommitError, GameManager
+from werewolf.game.sheriff import SheriffElectionStatus
 from werewolf.game.state import GameState
+from werewolf.moderator.sheriff_flow import ModeratorSheriffFlow
 from werewolf.knowledge.compiler import KnowledgePackageCompiler
 from werewolf.knowledge.package_loader import KnowledgePackageLoader
 from werewolf.knowledge.refs import VersionedRef
 from werewolf.moderator.play_runner import ClassicPlayRunner
+from werewolf.rules.models import ExecutionPackage
+from werewolf.runtime.player_runtime import (
+    Action,
+    ActionResponse,
+    InitialContext,
+    RuntimeConfig,
+    Speech,
+    SpeechResponse,
+    TurnRequest,
+)
+from werewolf.runtime.scripted_runtime import ScriptedRuntime
 
 PROJECT_ROOT = Path(__file__).parents[2]
 PUBLISHED_ROOT = PROJECT_ROOT / "vault" / "published"
@@ -101,7 +115,6 @@ async def _build_scheduled_setup(output: Path) -> None:
 @pytest.mark.asyncio
 async def test_first_night_dead_elected_sheriff_completes_announcement_badge_words_then_speech(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     setup = tmp_path / "scheduled-night"
     await _build_scheduled_setup(setup)
@@ -109,16 +122,6 @@ async def test_first_night_dead_elected_sheriff_completes_announcement_badge_wor
     history: list[tuple[str, GamePhase, int, int]] = []
     first_night_deaths: tuple[int, ...] = ()
     original_command = runner.command
-    original_validate = GameManager._validate_rule_batch
-
-    def inspect_batch(manager, state, batch, requests, **kwargs):
-        facts = (*batch.outcomes, *batch.facts)
-        if any(fact.fact_type.upper() in {"DEATH_CONFIRMED", "RULE_FLOW_QUEUED"} for fact in facts):
-            print("RULE_RESERVED_FACTS", [fact.fact_type for fact in facts])
-            print("RULE_INTERACTIONS", [item.interaction_id for item in manager.execution_package.interactions])
-        return original_validate(manager, state, batch, requests, **kwargs)
-
-    monkeypatch.setattr(GameManager, "_validate_rule_batch", inspect_batch)
 
     async def record_command(line: str):
         nonlocal first_night_deaths
@@ -134,8 +137,20 @@ async def test_first_night_dead_elected_sheriff_completes_announcement_badge_wor
                 seat for seat, player in sorted(state.players.items()) if not player.alive
             )
             assert first_night_deaths
-            # Bind the election to an actual, proven first-night casualty.
-            runner.sheriff_candidates = (first_night_deaths[0],)
+            last_words_seats = tuple(
+                seat
+                for boundary in state.rule_boundaries
+                if boundary.return_point.phase is GamePhase.DAY_ANNOUNCE
+                and boundary.return_point.day_no == 0
+                for seat in boundary.last_words_seats
+            )
+            sheriff_candidates = tuple(
+                seat for seat in last_words_seats if seat in first_night_deaths
+            )
+            assert sheriff_candidates
+            # Elect a proven night casualty whose configured cause also earns
+            # last words, so badge and words resume on the same dawn boundary.
+            runner.sheriff_candidates = (sheriff_candidates[0],)
         return result
 
     runner.command = record_command  # type: ignore[method-assign]
@@ -165,6 +180,7 @@ async def test_first_night_dead_elected_sheriff_completes_announcement_badge_wor
     speech_open_index = next(
         index for index, row in enumerate(history) if row[0] == "day speech open"
     )
+    print("SCHEDULED_HISTORY", list(enumerate(history)))
     assert announcement_index < badge_open_index < last_words_index < night_check_index < speech_open_index
     assert history[badge_open_index][1] is GamePhase.DAY_ANNOUNCE
     assert history[last_words_index][1] is GamePhase.DAY_ANNOUNCE
@@ -215,4 +231,87 @@ async def test_schedule_rejects_a_forged_dawn_speech_edge_before_prerequisites(
     finally:
         if runner.shell.session_service is not None:
             await runner.shell.session_service.close()
+
+
+@pytest.mark.asyncio
+async def test_scheduled_sheriff_no_sheriff_on_tie_uses_existing_election_path() -> None:
+    from test_sheriff_flow import _board, _manager
+
+    base_manager = _manager()
+    execution = ExecutionPackage(
+        board_id="sheriff-manager-board",
+        board_version="1.0.0",
+        actions=(),
+        skills=(),
+        night_boundary_schedule=NightBoundarySchedule(
+            prerequisites=("FIRST_DAY_SHERIFF_ELECTION", "DAY_ANNOUNCEMENT")
+        ),
+    )
+    manager = GameManager(
+        base_manager.state,
+        registry=base_manager.registry,
+        execution_package=execution,
+    )
+    board_data = _board(tie_policy="no_sheriff_on_tie", pk_enabled=False).model_dump(
+        mode="python"
+    )
+    board_data["day_flow"]["vote"]["allow_abstain"] = True
+    board_data["night_boundary_schedule"] = {
+        "prerequisites": ["DAY_ANNOUNCEMENT", "FIRST_DAY_SHERIFF_ELECTION"]
+    }
+    board = _board(tie_policy="no_sheriff_on_tie", pk_enabled=False).model_validate(
+        board_data
+    )
+    runtimes: dict[int, ScriptedRuntime] = {}
+    for seat in (1, 2, 3):
+        def response(request: TurnRequest, *, seat: int = seat) -> object:
+            if request.expected_kind.value == "speech":
+                return SpeechResponse(
+                    request_id=request.request_id,
+                    speech=Speech(text=f"{seat}号竞选发言。"),
+                )
+            if seat == 3:
+                return ActionResponse(
+                    request_id=request.request_id,
+                    actions=[Action(action_code=202, targets=[])],
+                )
+            target = 2 if seat == 1 else 1
+            return ActionResponse(
+                request_id=request.request_id,
+                actions=[Action(action_code=201, targets=[target])],
+            )
+
+        runtime = ScriptedRuntime([response] * 6)
+        await runtime.start(
+            RuntimeConfig(session_id=f"scheduled-sheriff-tie-{seat}"),
+            InitialContext(game_id=manager.state.game_id, seat=seat, session_epoch=0),
+        )
+        runtimes[seat] = runtime
+
+    try:
+        flow = ModeratorSheriffFlow(manager, board, runtimes)
+        await flow.start((1, 2))
+        await flow.speech_next()
+        await flow.speech_next()
+        await flow.open_vote()
+        for seat in (1, 2, 3):
+            await flow.vote_next(seat)
+        await flow.collect()
+        pending = await flow.confirm()
+        assert pending.phase is GamePhase.SHERIFF_TRANSFER
+        assert pending.sheriff_election is not None
+        assert pending.sheriff_election["status"] == SheriffElectionStatus.NO_SHERIFF
+
+        returned = await flow.transfer()
+        assert returned.phase is GamePhase.DAY_ANNOUNCE
+        assert returned.round_no == 0
+        assert returned.day_no == 1
+        results = manager.night_boundary_prerequisites(returned, round_no=0)
+        assert [(item.prerequisite, item.satisfied) for item in results] == [
+            ("FIRST_DAY_SHERIFF_ELECTION", True),
+            ("DAY_ANNOUNCEMENT", False),
+        ]
+    finally:
+        for runtime in runtimes.values():
+            await runtime.close("scheduled sheriff tie test complete")
 

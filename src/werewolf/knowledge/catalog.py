@@ -460,30 +460,60 @@ class CatalogStore:
                     raise CatalogConflictError(
                         "same catalog board ID/version already has a different immutable identity"
                     )
-                if destination.exists() or destination.is_symlink():
-                    existing = self.load_entry(ref)
-                    if existing.stage_digest != stage_digest:
-                        raise CatalogConflictError(
-                            "same catalog board ID/version already contains different content"
-                        )
-                    entry = existing
-                    result_status = "already-staged"
-                else:
-                    await _thread_call_uncancellable(os.rename, staging, destination)
-                    entry = self.load_entry(ref)
-                    result_status = "staged"
-                if prior_digest is None:
-                    entry_digests[ref.format()] = entry.stage_digest
-                    registry["entry_digests"] = entry_digests
-                    entry_revisions = _mapping(registry.get("entry_revisions"), "entry revisions")
-                    entry_revisions.setdefault(ref.format(), 0)
-                    registry["entry_revisions"] = entry_revisions
-                    registry["revision"] = _revision(registry) + 1
-                    await self._write_registry(registry)
-                return self._entry_report(entry, status=result_status)
+                entry_revisions = _mapping(registry.get("entry_revisions"), "entry revisions")
+                registry_update_needed = prior_digest is None or ref.format() not in entry_revisions
+                return await _await_uncancellable(
+                    self._commit_stage(
+                        staging=staging,
+                        destination=destination,
+                        ref=ref,
+                        stage_digest=stage_digest,
+                        registry=registry,
+                        update_registry=registry_update_needed,
+                    )
+                )
         finally:
             if staging.exists():
                 await _thread_call_uncancellable(shutil.rmtree, staging, True)
+
+    async def _commit_stage(
+        self,
+        *,
+        staging: Path,
+        destination: Path,
+        ref: VersionedRef,
+        stage_digest: str,
+        registry: dict[str, object],
+        update_registry: bool,
+    ) -> dict[str, object]:
+        renamed = False
+        if destination.exists() or destination.is_symlink():
+            entry = self.load_entry(ref)
+            if entry.stage_digest != stage_digest:
+                raise CatalogConflictError(
+                    "same catalog board ID/version already contains different content"
+                )
+            status = "already-staged"
+        else:
+            await asyncio.to_thread(os.rename, staging, destination)
+            renamed = True
+            entry = self.load_entry(ref)
+            status = "staged"
+        if update_registry:
+            entry_digests = _mapping(registry.get("entry_digests"), "entry digests")
+            entry_digests.setdefault(ref.format(), entry.stage_digest)
+            registry["entry_digests"] = entry_digests
+            entry_revisions = _mapping(registry.get("entry_revisions"), "entry revisions")
+            entry_revisions.setdefault(ref.format(), 0)
+            registry["entry_revisions"] = entry_revisions
+            registry["revision"] = _revision(registry) + 1
+            try:
+                await self._write_registry(registry)
+            except BaseException:
+                if renamed and destination.exists() and not staging.exists():
+                    await asyncio.to_thread(os.rename, destination, staging)
+                raise
+        return self._entry_report(entry, status=status)
 
     def load_entry(self, board_ref: str | VersionedRef) -> CatalogEntry:
         ref = board_ref if isinstance(board_ref, VersionedRef) else VersionedRef.parse(board_ref)
@@ -1209,16 +1239,16 @@ class CatalogStore:
         for game_id, lease_record in leases.items():
             if not isinstance(lease_record, Mapping) or set(lease_record) != lease_fields:
                 raise CatalogError("catalog lease record has missing or unsupported fields")
-            admission_payload = {
-                name: lease_record[name] for name in CatalogAdmission.model_fields
-            }
+            admission_payload = {name: lease_record[name] for name in CatalogAdmission.model_fields}
             try:
                 admission = CatalogAdmission.model_validate(admission_payload, strict=True)
                 admission.validate_for_game(game_id)
             except (TypeError, ValueError) as exc:
                 raise CatalogError("catalog lease identity is invalid") from exc
             lease_board_ref = f"{admission.board_id}@{admission.board_version}"
-            if lease_record.get("board_ref") != lease_board_ref or lease_record.get("status") not in {
+            if lease_record.get("board_ref") != lease_board_ref or lease_record.get(
+                "status"
+            ) not in {
                 "ACTIVE",
                 "CANCELLED",
                 "RELEASED",
@@ -1323,10 +1353,7 @@ class CatalogStore:
             if (
                 gate_record.get("status") != "PASS"
                 or not isinstance(gate_record.get("stage_digest"), str)
-                or _SHA256_PATTERN.fullmatch(
-                    cast(str, gate_record.get("stage_digest"))
-                )
-                is None
+                or _SHA256_PATTERN.fullmatch(cast(str, gate_record.get("stage_digest"))) is None
                 or not isinstance(gate_record.get("gate_sha256"), str)
                 or _SHA256_PATTERN.fullmatch(cast(str, gate_record.get("gate_sha256"))) is None
                 or not isinstance(gate_record.get("report_path"), str)
@@ -1389,25 +1416,30 @@ class CatalogStore:
 def _acquire_exclusive(path: Path) -> None:
     deadline = time.monotonic() + 30.0
     while True:
+        descriptor: int | None = None
         try:
             descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            try:
-                os.write(descriptor, f"{os.getpid()}\n".encode("ascii"))
-                os.fsync(descriptor)
-            except BaseException:
-                os.close(descriptor)
-                try:
-                    path.unlink()
-                except FileNotFoundError:
-                    pass
-                raise
-            else:
-                os.close(descriptor)
-            return
+            os.write(descriptor, f"{os.getpid()}\n".encode("ascii"))
+            os.fsync(descriptor)
         except FileExistsError:
             if time.monotonic() >= deadline:
                 raise CatalogError("catalog writer lock timed out")
             time.sleep(0.025)
+            continue
+        except BaseException:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+        assert descriptor is not None
+        os.close(descriptor)
+        return
 
 
 def _release_exclusive(path: Path) -> None:

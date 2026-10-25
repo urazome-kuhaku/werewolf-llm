@@ -2293,11 +2293,6 @@ class GameManager:
         async with self._lock:
             current = self._state
             _revision_check(current, expected_revision)
-            self._validate_catalog_admission_value(
-                current,
-                admission,
-                package_identity=self._package_identity,
-            )
             if current.phase is not GamePhase.ASSIGNED or current.players:
                 raise EventCommitError(
                     "CATALOG_ADMISSION_INVALID: lease can only bind before player startup"
@@ -2307,6 +2302,12 @@ class GameManager:
                     return current
                 raise EventCommitError("CATALOG_ADMISSION_INVALID: game is already bound")
             data = _state_data(current)
+            if current.execution_identity is None:
+                if self._rules is None:
+                    raise EventCommitError(
+                        "CATALOG_ADMISSION_INVALID: game has no frozen execution package"
+                    )
+                data["execution_identity"] = self._rules.identity
             data["catalog_admission"] = admission
             data["state_revision"] = current.state_revision + 1
             data["updated_at"] = commit_time
@@ -2323,6 +2324,11 @@ class GameManager:
                 },
             )
             committed = GameState.model_validate(data)
+            self._validate_catalog_admission_value(
+                committed,
+                admission,
+                package_identity=self._package_identity,
+            )
             self._state = committed
             return committed
 
@@ -2627,7 +2633,8 @@ class GameManager:
             or (fact.source_request_id is not None and fact.source_request_id not in causal_ids)
         ):
             raise EventCommitError(
-                "CHECKPOINT_SOURCE: fact has no unique causal request proof or exceeds ancestry limit"
+                "CHECKPOINT_SOURCE: fact has no unique causal request proof or exceeds "
+                "ancestry limit"
             )
         source_records_value = fact.data.get("sources")
         source_records: tuple[Mapping[str, object], ...] = ()
@@ -3308,12 +3315,12 @@ class GameManager:
         if self._rules is None:
             raise ResolutionError("RULE_PACKAGE_MISSING", "game has no pinned rule interpreter")
         if any(
-            fact.fact_type.upper() in {"DEATH_CONFIRMED", "RULE_FLOW_QUEUED"}
+            fact.fact_type.upper() == "RULE_FLOW_QUEUED"
             for fact in (*batch.outcomes, *batch.facts)
         ):
             raise ResolutionError(
                 "RULE_RESERVED_FACT",
-                "reserved manager facts cannot be emitted by a rule batch",
+                "RULE_FLOW_QUEUED cannot be emitted by a rule batch",
             )
         if (
             batch.package_id != package.package_id
@@ -6360,7 +6367,7 @@ class GameManager:
         state: GameState,
         boundary: RuleBoundary,
     ) -> bool:
-        """Prove that a DAY_ANNOUNCE boundary resumes after the final night window."""
+        """Prove that a DAY_ANNOUNCE boundary follows a closed final night group."""
 
         point = boundary.return_point
         package = self._execution_package
@@ -6383,42 +6390,27 @@ class GameManager:
             or not package.window_metadata
             or point.phase is not GamePhase.DAY_ANNOUNCE
             or point.window_id is None
-            or point.logical_window_id is not None
             or point.day_no is None
             or (state.day_no != point.day_no and not already_staged)
         ):
             return False
 
-        raw_source = state.action_windows.get(point.window_id)
-        if raw_source is None:
-            return False
-        try:
-            source = _load_action_window(raw_source)
-        except (TypeError, ValueError):
-            return False
-        if (
-            source.game_id != state.game_id
-            or source.phase not in night_phases
-            or source.closed_at is None
-            or source.logical_window_id is None
-            or source.next_window_id is not None
-            or (source.settlement_group_id or source.window_id) != boundary.source_group_id
-        ):
-            return False
+        rows = tuple(sorted(package.window_metadata, key=lambda item: item.order))
+        groups = package.window_settlement_groups
 
-        rows = tuple(package.window_metadata)
-        source_row = next(
-            (row for row in rows if row.window_id == source.logical_window_id),
-            None,
+        def group_id_for(logical_id: str) -> str:
+            if not groups:
+                return f"night:{state.round_no}"
+            return f"night:{state.round_no}:{groups.get(logical_id)}"
+
+        expected_rows = tuple(
+            row for row in rows if group_id_for(row.window_id) == boundary.source_group_id
         )
-        if (
-            source_row is None
-            or source_row.phase != source.phase.value
-            or source_row.order != max(row.order for row in rows)
-        ):
+        if not expected_rows or group_id_for(rows[-1].window_id) != boundary.source_group_id:
             return False
 
         group_windows: list[ActionWindow] = []
+        group_windows_by_id: dict[str, ActionWindow] = {}
         for raw in state.action_windows.values():
             if not isinstance(raw, Mapping):
                 continue
@@ -6426,10 +6418,45 @@ class GameManager:
             if raw_group != boundary.source_group_id:
                 continue
             try:
-                group_windows.append(_load_action_window(raw))
+                window = _load_action_window(raw)
             except (TypeError, ValueError):
                 return False
-        if not group_windows or any(window.closed_at is None for window in group_windows):
+            if window.logical_window_id is None or window.logical_window_id in group_windows_by_id:
+                return False
+            group_windows.append(window)
+            group_windows_by_id[window.logical_window_id] = window
+        if (
+            not group_windows
+            or any(window.closed_at is None for window in group_windows)
+            or set(group_windows_by_id) != {row.window_id for row in expected_rows}
+        ):
+            return False
+        for row in expected_rows:
+            window = group_windows_by_id[row.window_id]
+            index = rows.index(row)
+            expected_next = rows[index + 1].window_id if index + 1 < len(rows) else None
+            if (
+                window.game_id != state.game_id
+                or window.phase not in night_phases
+                or window.phase.value != row.phase
+                or window.next_window_id != expected_next
+            ):
+                return False
+
+        anchor = group_windows_by_id.get(
+            next(
+                (
+                    window.logical_window_id
+                    for window in group_windows
+                    if window.window_id == point.window_id
+                ),
+                "",
+            )
+        )
+        if anchor is None or (
+            point.logical_window_id is not None
+            and point.logical_window_id != anchor.next_window_id
+        ):
             return False
 
         matching_ledgers = tuple(
@@ -8882,7 +8909,8 @@ class GameManager:
                 for item in current.rule_trigger_queue
                 if cursor is not None and item.occurrence_id == cursor.active_occurrence_id
             )
-            windows = dict(current.action_windows)
+            data = _state_data(current)
+            windows = cast(dict[str, Any], data["action_windows"])
             raw_window = windows.get(occurrence.window_id or "")
             if not isinstance(raw_window, Mapping):
                 raise EventCommitError("CHECKPOINT_RESTORE: active choice window disappeared")
@@ -8905,7 +8933,6 @@ class GameManager:
                 )
                 for seat, delivery in current.delivery_cursors.items()
             }
-            data = _state_data(current)
             data["players"] = players
             data["action_windows"] = windows
             data["delivery_cursors"] = deliveries

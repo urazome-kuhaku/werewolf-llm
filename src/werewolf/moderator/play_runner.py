@@ -726,7 +726,10 @@ class ClassicPlayRunner:
                 if type(value) is int:
                     target = value
         await self.command(f"day confirm-exile {target if target is not None else 'none'}")
-        if self.shell.state.phase is GamePhase.TRIGGER_ACTION:
+        if (
+            self.shell.state.phase is GamePhase.TRIGGER_ACTION
+            or self._rule_workflow_managed()
+        ):
             await self._trigger()
             return
         await self._last_words()

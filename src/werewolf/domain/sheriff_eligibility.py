@@ -136,6 +136,96 @@ def _package_night_window_order(execution_package: object) -> tuple[tuple[str, i
     return tuple(rows)
 
 
+def _night_group_has_terminal_topology(
+    state: Any,
+    execution_package: object,
+    *,
+    group_id: str,
+    point: object,
+    metadata: tuple[tuple[str, int], ...],
+) -> bool:
+    """Prove the source group is closed and includes the frozen final night window."""
+
+    settlement_groups = _mapping_value(execution_package, "window_settlement_groups")
+    if not isinstance(settlement_groups, Mapping):
+        return False
+
+    def frozen_group_id(window_id: str) -> str:
+        if settlement_groups:
+            return f"night:0:{settlement_groups.get(window_id)}"
+        return "night:0"
+
+    expected_rows = tuple(
+        (window_id, order)
+        for window_id, order in metadata
+        if frozen_group_id(window_id) == group_id
+    )
+    if not expected_rows or frozen_group_id(metadata[-1][0]) != group_id:
+        return False
+
+    windows = _group_windows(state, group_id)
+    if not windows or any(_mapping_value(row, "closed_at") is None for _, row in windows):
+        return False
+    by_logical_id: dict[str, list[tuple[str, object]]] = {}
+    for physical_id, row in windows:
+        logical_id = _mapping_value(row, "logical_window_id")
+        if not isinstance(logical_id, str):
+            return False
+        by_logical_id.setdefault(logical_id, []).append((physical_id, row))
+    if set(by_logical_id) != {window_id for window_id, _order in expected_rows}:
+        return False
+    if any(len(rows) != 1 for rows in by_logical_id.values()):
+        return False
+
+    metadata_by_id = {window_id: (index, order) for index, (window_id, order) in enumerate(metadata)}
+    for window_id, _order in expected_rows:
+        _index, _metadata_order = metadata_by_id[window_id]
+        physical_id, row = by_logical_id[window_id][0]
+        expected_next = metadata[_index + 1][0] if _index + 1 < len(metadata) else None
+        if (
+            physical_id != _mapping_value(row, "window_id")
+            or _value(_mapping_value(row, "phase"))
+            != next(
+                phase
+                for logical_id, phase, _order in _metadata_with_phases(execution_package)
+                if logical_id == window_id
+            )
+            or _mapping_value(row, "next_window_id") != expected_next
+        ):
+            return False
+
+    # The boundary may retain the group anchor as its physical source.  Bind
+    # that anchor to the proven chain, while the chain itself establishes that
+    # the final frozen night window has closed.
+    point_window_id = _mapping_value(point, "window_id")
+    if not isinstance(point_window_id, str):
+        return False
+    point_match = next(
+        ((physical_id, row) for physical_id, row in windows if physical_id == point_window_id),
+        None,
+    )
+    if point_match is None:
+        return False
+    _physical_id, point_window = point_match
+    point_logical_id = _mapping_value(point, "logical_window_id")
+    return point_logical_id is None or point_logical_id == _mapping_value(
+        point_window, "next_window_id"
+    )
+
+
+def _metadata_with_phases(
+    execution_package: object,
+) -> tuple[tuple[str, str, int], ...]:
+    result: list[tuple[str, str, int]] = []
+    for row in _rows(_mapping_value(execution_package, "window_metadata")):
+        window_id = _mapping_value(row, "window_id")
+        phase = _value(_mapping_value(row, "phase"))
+        order = _mapping_value(row, "order")
+        if isinstance(window_id, str) and isinstance(phase, str) and type(order) is int:
+            result.append((window_id, phase, order))
+    return tuple(sorted(result, key=lambda item: item[2]))
+
+
 def _group_windows(state: Any, group_id: str) -> tuple[tuple[str, object], ...]:
     windows = getattr(state, "action_windows", {})
     if not isinstance(windows, Mapping):
@@ -338,28 +428,15 @@ def _strict_first_night_death_seats(state: Any, execution_package: object) -> tu
                 if (
                     _value(_mapping_value(point, "phase")) == "DAY_ANNOUNCE"
                     and _mapping_value(point, "day_no") == 0
-                    and _mapping_value(point, "logical_window_id") is None
+                    and _night_group_has_terminal_topology(
+                        state,
+                        execution_package,
+                        group_id=expected_group_id,
+                        point=point,
+                        metadata=metadata,
+                    )
                 ):
-                    source_window_id = _mapping_value(point, "window_id")
-                    source_window = getattr(state, "action_windows", {}).get(source_window_id)
-                    logical_id = _mapping_value(source_window, "logical_window_id")
-                    if (
-                        isinstance(source_window_id, str)
-                        and isinstance(source_window, Mapping)
-                        and _mapping_value(source_window, "closed_at") is not None
-                        and _value(_mapping_value(source_window, "phase")) == timing
-                        and (
-                            _mapping_value(source_window, "settlement_group_id") or source_window_id
-                        )
-                        == expected_group_id
-                        and _mapping_value(source_window, "next_window_id") is None
-                        and isinstance(logical_id, str)
-                        and any(
-                            window_id == logical_id and order == package_last_order
-                            for window_id, order in metadata
-                        )
-                    ):
-                        terminal = True
+                    terminal = True
             internal_ids = _physical_request_internal_ids(state, ledger)
             if not terminal or internal_ids is None or not causal_ids.issubset(internal_ids):
                 return False

@@ -373,9 +373,7 @@ async def _build(
                 # execution.yaml is deliberately outside the Markdown document
                 # index, but it is still part of the candidate closure and
                 # must be named and hash-checked by publish-manifest.json.
-                package_paths.append(
-                    f"boards/{board_ref.id}/{board_ref.version}/execution.yaml"
-                )
+                package_paths.append(f"boards/{board_ref.id}/{board_ref.version}/execution.yaml")
                 package_paths.sort()
             listed_paths = [cast(str, item["path"]) for item in manifest_paths]
             if listed_paths != package_paths:
@@ -428,7 +426,11 @@ async def _build(
                 compiled.package_identity if compiled is not None else preview_load.package_identity
             ),
             "compiled_manifest_sha256": (
-                compiled.manifest_sha256 if compiled is not None else preview_load.manifest_sha256
+                compiled.manifest_sha256
+                if compiled is not None
+                else hashlib.sha256(
+                    _canonical_json(dict(preview_load.manifest_payload))
+                ).hexdigest()
             ),
             "config_path": "game.yaml",
             "preview_compiled_root": "preview/compiled",

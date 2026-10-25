@@ -248,8 +248,15 @@ class StateAssertionStep(ScenarioModel):
             raise ValueError("assertion selectors do not match the selected typed field")
         if self.field is AssertionField.GAME_STATE_VALUE and type(self.expected) is not bool:
             raise ValueError("GAME_STATE_VALUE assertions require a boolean expected value")
-        if self.field in {AssertionField.SKILL_USE_COUNT, AssertionField.RESOURCE_BALANCE,
-                          AssertionField.RELATION_COUNT} and type(self.expected) is not int:
+        if (
+            self.field
+            in {
+                AssertionField.SKILL_USE_COUNT,
+                AssertionField.RESOURCE_BALANCE,
+                AssertionField.RELATION_COUNT,
+            }
+            and type(self.expected) is not int
+        ):
             raise ValueError("count and resource assertions require an integer expected value")
 
 
@@ -423,7 +430,7 @@ def _materialize_step(raw: object) -> object:
                 {
                     **dict(action),
                     **(
-                        {"targets": tuple(action.get("targets", ())) }
+                        {"targets": tuple(action.get("targets", ()))}
                         if isinstance(action, Mapping)
                         and isinstance(action.get("targets", ()), list)
                         else {}

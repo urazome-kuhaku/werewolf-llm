@@ -271,6 +271,7 @@ def compile_execution_definition(package: KnowledgePackage) -> CompiledExecution
         execution = execution.model_copy(update={"player_field_values": player_field_values})
     has_window_features = (
         _requires_frozen_window_metadata(window_metadata)
+        or execution.night_boundary_schedule is not None
         or bool(execution.window_settlement_groups)
         or _has_window_disclosure_hook(execution, window_ids)
         or any(

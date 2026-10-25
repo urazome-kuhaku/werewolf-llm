@@ -11,7 +11,7 @@ from werewolf.domain.sheriff_eligibility import (
 
 def _scheduled_first_night_state(*, valid_receipt: bool = True) -> tuple[object, object]:
     package_id = "night-package"
-    group_id = "night-group-r0"
+    group_id = "night:0"
     batch_id = "night-batch-r0"
     digest = "a" * 64
     death_fact = SimpleNamespace(
@@ -118,6 +118,7 @@ def _scheduled_first_night_state(*, valid_receipt: bool = True) -> tuple[object,
         window_metadata=(
             SimpleNamespace(window_id="night-last", phase="NIGHT_ACTION", order=10),
         ),
+        window_settlement_groups={},
     )
     return state, package
 
