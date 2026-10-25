@@ -21,10 +21,10 @@ from test_rules_b_workflow import (
 )
 
 from werewolf.domain.enums import GamePhase
-from werewolf.domain.sheriff_eligibility import first_day_sheriff_participants, first_night_death_seats
-import werewolf.domain.sheriff_eligibility as sheriff_eligibility
+from werewolf.domain.sheriff_eligibility import first_day_sheriff_participants
 from werewolf.game.actions import load_action_registry
 from werewolf.game.manager import EventCommitError, GameManager
+from werewolf.game.sheriff import SheriffElectionError
 from werewolf.game.state import GameState
 from werewolf.knowledge.compiler import KnowledgePackageCompiler
 from werewolf.knowledge.package_loader import KnowledgePackageLoader
@@ -42,6 +42,7 @@ from werewolf.runtime.demo_runtime import DemoRuntime
 PROJECT_ROOT = Path(__file__).parents[2]
 PUBLISHED_ROOT = PROJECT_ROOT / "vault" / "published"
 BOARD_REF = "classic_12_seer_witch_hunter_idiot@1.0.0"
+N0_PROTECT_ACTION = 984
 
 
 def _ref(source: str, name: str) -> dict[str, object]:
@@ -120,7 +121,91 @@ class _CandidateSelectingDemoRuntime(DemoRuntime):
         return super()._action_for(request, status)
 
 
-async def _build_scheduled_ancestry_setup(output: Path) -> None:
+class _LaterNightDemoRuntime(DemoRuntime):
+    def _action_for(self, request: TurnRequest, status: dict[str, Any]) -> ActionResponse:
+        window = request.action_window
+        if window is not None:
+            round_no = request.observation.payload.get("round_no")
+            if round_no == 0 and N0_PROTECT_ACTION in window.allowed_action_codes:
+                return ActionResponse(
+                    request_id=request.request_id,
+                    actions=[Action(action_code=N0_PROTECT_ACTION, targets=[3])],
+                )
+            action_code = next(
+                (
+                    code
+                    for code in (MASS_ACTION, CHOICE_ACTION)
+                    if code in window.allowed_action_codes
+                ),
+                None,
+            )
+            if action_code is not None:
+                target = 3 if action_code == MASS_ACTION else min(window.candidate_seats)
+                return ActionResponse(
+                    request_id=request.request_id,
+                    actions=[Action(action_code=action_code, targets=[target])],
+                )
+        return super()._action_for(request, status)
+
+
+async def _assert_scheduled_badge_rejects_broken_choice_ancestry(
+    manager: GameManager,
+) -> None:
+    state = manager.state
+    assert isinstance(state.sheriff_badge, dict)
+    assert state.sheriff_badge.get("status") == "COMPLETE"
+    choice_occurrence = next(
+        item
+        for item in state.rule_trigger_queue
+        if item.skill_id == "c_night_choice_death" and item.mode == "PLAYER_CHOICE"
+    )
+    choice_ledger = next(
+        item
+        for item in state.rule_ledger
+        if "c_night_choice_death" in item.skill_ids
+        and item.timing == GamePhase.TRIGGER_ACTION.value
+    )
+    physical_fact = next(
+        fact
+        for item in state.rule_ledger
+        for fact in item.facts
+        if fact.fact_type == "DEATH_CONFIRMED" and fact.death_cause == "wolf_kill"
+    )
+
+    tampered_receipt_state = state.model_copy(
+        update={
+            "rule_receipts": tuple(
+                item for item in state.rule_receipts if item.batch_id != choice_ledger.batch_id
+            )
+        }
+    )
+    tampered_source_queue = tuple(
+        item.model_copy(update={"source_fact_id": physical_fact.fact_id})
+        if item.occurrence_id == choice_occurrence.occurrence_id
+        else item
+        for item in state.rule_trigger_queue
+    )
+    tampered_source_state = state.model_copy(
+        update={"rule_trigger_queue": tampered_source_queue}
+    )
+    for tampered_state in (tampered_receipt_state, tampered_source_state):
+        probe = GameManager(
+            GameState.model_validate_json(tampered_state.model_dump_json()),
+            registry=manager.registry,
+            execution_package=manager.execution_package,
+            package_identity=manager.package_identity,
+            legacy_compatibility=manager.legacy_compatibility,
+        )
+        with pytest.raises(SheriffElectionError):
+            await probe.complete_sheriff_badge(
+                expected_revision=probe.state.state_revision,
+                now=NOW,
+            )
+
+
+async def _build_scheduled_ancestry_setup(
+    output: Path, *, exercise_later_night: bool = False
+) -> None:
     from test_rules_c_scheduled_night_flow import _scheduled_published_root
 
     published_root = _scheduled_published_root(output.parent)
@@ -171,6 +256,7 @@ async def _build_scheduled_ancestry_setup(output: Path) -> None:
     execution = compiled.execution
     payload = execution.model_dump(mode="json")
     payload.pop("night_boundary_schedule", None)
+    usage_scope = "ROUND" if exercise_later_night else "GAME"
     payload["interactions"] = [
         {
             "interaction_id": "c-confirm-night-physical-death",
@@ -213,7 +299,7 @@ async def _build_scheduled_ancestry_setup(output: Path) -> None:
                 "selector": _fixed_live_targets(3),
                 "allow_self": False,
             },
-            "usage": {"max_uses": 1, "scope": "GAME"},
+            "usage": {"max_uses": 1, "scope": usage_scope},
             "effects": [
                 {
                     "effect_id": "c-night-physical-damage",
@@ -241,7 +327,7 @@ async def _build_scheduled_ancestry_setup(output: Path) -> None:
                 ),
             },
             "targets": {"min_targets": 0, "max_targets": 0, "selector": _all_living_except_actor()},
-            "usage": {"max_uses": 1, "scope": "GAME"},
+            "usage": {"max_uses": 1, "scope": usage_scope},
             "effects": [
                 {
                     "effect_id": "c-night-auto-damage",
@@ -271,7 +357,7 @@ async def _build_scheduled_ancestry_setup(output: Path) -> None:
                 "selector": _all_living_except_actor(),
                 "allow_self": False,
             },
-            "usage": {"max_uses": 1, "scope": "GAME"},
+            "usage": {"max_uses": 1, "scope": usage_scope},
             "effects": [
                 {
                     "effect_id": "c-night-choice-damage",
@@ -282,6 +368,38 @@ async def _build_scheduled_ancestry_setup(output: Path) -> None:
             ],
         },
     ]
+    if exercise_later_night:
+        payload["skills"].append(
+            {
+                "skill_id": "c_night_n0_prevent_death",
+                "action_code": N0_PROTECT_ACTION,
+                "grants": [
+                    {
+                        "grant_id": "c_night_n0_protect_grant",
+                        "actor_selector": _seat_selector(11),
+                    }
+                ],
+                "timing": ["NIGHT_ACTION"],
+                "window_ids": ["night_actions"],
+                "targets": {
+                    "min_targets": 1,
+                    "max_targets": 1,
+                    "selector": _fixed_live_targets(3),
+                    "allow_self": False,
+                },
+                "usage": {"max_uses": 1, "scope": "GAME"},
+                "effects": [
+                    {
+                        "effect_id": "c-night-n0-prevent-death",
+                        "effect_type": "PREVENT_DEATH",
+                        "target": _ref("target", "seat"),
+                    }
+                ],
+            }
+        )
+        payload["actions"].append(
+            {"action_code": N0_PROTECT_ACTION, "action_id": "C_NIGHT_N0_PREVENT_DEATH"}
+        )
     base_codes = {item.action_code for item in load_action_registry().actions}
     action_definitions = [
         item.model_dump(mode="json")
@@ -310,6 +428,15 @@ async def _build_scheduled_ancestry_setup(output: Path) -> None:
             },
         ]
     )
+    if exercise_later_night:
+        action_definitions.append(
+            {
+                "action_code": N0_PROTECT_ACTION,
+                "action_name": "C_NIGHT_N0_PREVENT_DEATH",
+                "target_policy": "candidate",
+                "target_count": 1,
+            }
+        )
     board_path = (
         published_root
         / "boards"
@@ -361,6 +488,9 @@ async def test_n0_scheduled_runtime_chain_finishes_deaths_words_badge_and_speech
     original_command = runner.command
 
     async def record_command(line: str) -> Any:
+        if line == "sheriff badge finish":
+            assert manager is not None
+            await _assert_scheduled_badge_rejects_broken_choice_ancestry(manager)
         result = await original_command(line)
         command_history.append(line)
         return result
@@ -415,125 +545,6 @@ async def test_n0_scheduled_runtime_chain_finishes_deaths_words_badge_and_speech
                         runner.shell.state,
                         execution_package=manager.execution_package,
                     )
-                    physical_source = next(
-                        item
-                        for item in runner.shell.state.rule_ledger
-                        if item.group_id == "night:0"
-                    )
-                    physical_boundary = next(
-                        item
-                        for item in runner.shell.state.rule_boundaries
-                        if item.source_group_id == "night:0"
-                    )
-                    physical_fact = physical_source.facts[0]
-                    boundary_order = [
-                        item
-                        for item in runner.shell.state.rule_boundaries
-                        if item.source_group_id in {"night:0"}
-                        or item.source_group_id.startswith(("automatic-", "trigger-"))
-                    ]
-                    prefix_proofs: list[tuple[str, tuple[int, ...]]] = []
-                    for count in range(1, len(boundary_order) + 1):
-                        selected_boundaries = tuple(boundary_order[:count])
-                        batch_ids = {item.source_batch_id for item in selected_boundaries}
-                        selected_ledgers = tuple(
-                            item
-                            for item in runner.shell.state.rule_ledger
-                            if item.batch_id in batch_ids
-                        )
-                        selected_receipts = tuple(
-                            item
-                            for item in runner.shell.state.rule_receipts
-                            if item.batch_id in batch_ids
-                        )
-                        fact_ids = {
-                            fact.fact_id for item in selected_ledgers for fact in item.facts
-                        }
-                        selected_occurrences = tuple(
-                            item
-                            for item in runner.shell.state.rule_trigger_queue
-                            if item.source_fact_id in fact_ids
-                        )
-                        prefix_state = runner.shell.state.model_copy(
-                            update={
-                                "rule_boundaries": selected_boundaries,
-                                "rule_ledger": selected_ledgers,
-                                "rule_receipts": selected_receipts,
-                                "rule_trigger_queue": selected_occurrences,
-                            }
-                        )
-                        prefix_proofs.append(
-                            (
-                                selected_boundaries[-1].source_group_id,
-                                first_night_death_seats(
-                                    prefix_state,
-                                    execution_package=manager.execution_package,
-                                ),
-                            )
-                        )
-                    print(
-                        "STRICT_NIGHT_DEATHS",
-                        first_night_death_seats(
-                            runner.shell.state,
-                            execution_package=manager.execution_package,
-                        ),
-                        "BOUNDARIES",
-                        [
-                            (item.source_group_id, item.source_batch_id, item.death_fact_ids, item.death_seats)
-                            for item in runner.shell.state.rule_boundaries
-                        ],
-                        "LEDGERS",
-                        [
-                            (item.group_id, item.timing, item.request_ids, item.skill_ids,
-                             [(fact.fact_type, fact.target_seat, fact.source_request_id, fact.data.get("source_request_ids"))
-                              for fact in item.facts])
-                            for item in runner.shell.state.rule_ledger
-                        ],
-                        "WINDOWS",
-                        [
-                            (key, value.get("logical_window_id"), value.get("phase"),
-                             value.get("closed_at"), value.get("next_window_id"),
-                             value.get("settlement_group_id"))
-                            for key, value in runner.shell.state.action_windows.items()
-                        ],
-                        "ELIGIBLE_SHERIFFS",
-                        eligible_sheriffs,
-                        "CURSOR",
-                        runner.shell.state.rule_workflow_cursor.model_dump(mode="json"),
-                        "OCCURRENCES",
-                        [item.model_dump(mode="json") for item in runner.shell.state.rule_trigger_queue],
-                        "PREFIX_PROOFS",
-                        prefix_proofs,
-                        "PROOF",
-                        {
-                            "state_package": getattr(runner.shell.state.execution_identity, "package_id", None),
-                            "live_package": manager.execution_package.package_id,
-                            "fact_valid_seat": sheriff_eligibility._valid_death_fact(
-                                physical_fact, runner.shell.state.players
-                            ),
-                            "internal_ids": sheriff_eligibility._physical_request_internal_ids(
-                                runner.shell.state, physical_source
-                            ),
-                            "receipt_valid": sheriff_eligibility._verified_rule_receipt(
-                                runner.shell.state, physical_source, manager.execution_package.package_id
-                            ),
-                            "topology": sheriff_eligibility._night_group_has_terminal_topology(
-                                runner.shell.state,
-                                manager.execution_package,
-                                group_id="night:0",
-                                point=physical_boundary.return_point,
-                                metadata=sheriff_eligibility._metadata_with_phases(
-                                    manager.execution_package
-                                ),
-                            ),
-                            "point": physical_boundary.return_point.model_dump(mode="json"),
-                            "receipt_occurrences": next(
-                                item.occurrence_ids
-                                for item in runner.shell.state.rule_receipts
-                                if item.batch_id == physical_source.batch_id
-                            ),
-                        },
-                    )
                     assert sheriff_candidates
                     assert sheriff_candidates[0] in eligible_sheriffs
                     dead_sheriff = sheriff_candidates[0]
@@ -578,9 +589,9 @@ async def test_n0_scheduled_runtime_chain_finishes_deaths_words_badge_and_speech
             if fact.fact_type == "DEATH_CONFIRMED" and fact.target_seat == 2
         )
         assert auto_death.source_request_id == f"automatic-{auto_occurrence.occurrence_id}"
-        assert auto_death.data["source_request_ids"] == [
-            f"automatic-{auto_occurrence.occurrence_id}"
-        ]
+        assert auto_death.data["source_request_ids"] == (
+            f"automatic-{auto_occurrence.occurrence_id}",
+        )
         choice_occurrence = next(
             item
             for item in state.rule_trigger_queue
@@ -685,7 +696,7 @@ async def test_n0_scheduled_runtime_chain_finishes_deaths_words_badge_and_speech
             package_identity=manager.package_identity,
             legacy_compatibility=manager.legacy_compatibility,
         )
-        with pytest.raises(EventCommitError, match="CHECKPOINT_SOURCE"):
+        with pytest.raises(EventCommitError, match="CHECKPOINT_BOUNDARY|CHECKPOINT_SOURCE"):
             await forged_manager.assert_private_checkpoint_waiting_choice(forged_manager.state)
 
         assert runner.shell.state.phase is GamePhase.DAY_SPEECH
@@ -876,9 +887,9 @@ async def test_night_physical_auto_and_choice_deaths_keep_exact_ancestry() -> No
         if item.fact_type == "DEATH_CONFIRMED" and item.target_seat == 2
     )
     assert auto_death.source_request_id == f"automatic-{automatic_occurrence.occurrence_id}"
-    assert auto_death.data["source_request_ids"] == [
-        f"automatic-{automatic_occurrence.occurrence_id}"
-    ]
+    assert auto_death.data["source_request_ids"] == (
+        f"automatic-{automatic_occurrence.occurrence_id}",
+    )
 
     assert choice_step.actor_seat == 2
     assert choice_step.occurrence_id is not None
@@ -956,80 +967,177 @@ async def test_night_physical_auto_and_choice_deaths_keep_exact_ancestry() -> No
 
 
 @pytest.mark.asyncio
-async def test_previous_day_host_exile_boundary_does_not_block_later_scheduled_night(
+async def test_n1_scheduled_runtime_chain_runs_after_n0_day_without_exile(
     tmp_path: Path,
 ) -> None:
-    from test_rules_c_scheduled_night_flow import _build_scheduled_setup
-
-    setup = tmp_path / "later-night-scheduled"
-    await _build_scheduled_setup(setup)
-    runner = __import__(
-        "werewolf.moderator.play_runner", fromlist=["ClassicPlayRunner"]
-    ).ClassicPlayRunner(setup / "game.yaml", max_rounds=20)
-    history: list[tuple[str, GamePhase, int, int, int]] = []
+    setup = tmp_path / "n1-night-chain"
+    await _build_scheduled_ancestry_setup(setup, exercise_later_night=True)
+    runner = ClassicPlayRunner(
+        setup / "game.yaml",
+        max_rounds=2,
+        runtime_factory=lambda _player, gateway_url, token: _LaterNightDemoRuntime(
+            gateway_url,
+            token,
+        ),
+    )
+    history: list[tuple[str, GamePhase, int, int]] = []
     original_command = runner.command
 
     async def record_command(line: str) -> Any:
         result = await original_command(line)
         state = runner.shell.state
-        history.append(
-            (
-                line,
-                state.phase,
-                state.round_no,
-                state.day_no,
-                sum(not player.alive for player in state.players.values()),
-            )
-        )
+        history.append((line, state.phase, state.round_no, state.day_no))
         return result
 
     runner.command = record_command  # type: ignore[method-assign]
     try:
-        summary = await runner.run()
+        await runner.command("new")
+        await runner.command("next")
+        await runner.command("next")
+        await runner.command("start")
+        await runner._prepare()
+        await runner.command("next")
+        manager = runner.shell.manager
+        assert manager is not None
+        assert manager.execution_package is not None
+        schedule = manager.execution_package.night_boundary_schedule
+        assert schedule is not None
+        assert schedule.required_for_round(0) == (
+            "FIRST_DAY_SHERIFF_ELECTION",
+            "DAY_ANNOUNCEMENT",
+        )
+        assert schedule.required_for_round(1) == ("DAY_ANNOUNCEMENT",)
+        # Seat 8 survives N0 and is elected before the first announcement.
+        runner.sheriff_candidates = (8,)
+
+        while not (
+            runner.shell.state.round_no == 1
+            and runner.shell.state.phase is GamePhase.NIGHT_TEAM_CHAT
+        ):
+            phase = runner.shell.state.phase
+            if phase is GamePhase.NIGHT_TEAM_CHAT:
+                await runner._night_team()
+            elif phase is GamePhase.NIGHT_ACTION:
+                await runner._night_actions()
+            elif phase is GamePhase.NIGHT_RESOLVE:
+                await runner._night_resolve()
+            elif phase is GamePhase.DAY_ANNOUNCE:
+                await runner._day_announce()
+            elif phase in {
+                GamePhase.SHERIFF_ELECTION_SPEECH,
+                GamePhase.SHERIFF_ELECTION,
+                GamePhase.SHERIFF_ELECTION_PK_SPEECH,
+                GamePhase.SHERIFF_ELECTION_PK,
+                GamePhase.SHERIFF_TRANSFER,
+            }:
+                await runner._sheriff()
+            elif phase in {
+                GamePhase.DAY_SPEECH,
+                GamePhase.VOTE,
+                GamePhase.VOTE_PK_SPEECH,
+                GamePhase.VOTE_PK,
+            }:
+                await runner._day_vote()
+            elif phase is GamePhase.DAY_RESOLVE:
+                assert runner.shell.state.round_no == 0
+                await runner.command("day confirm-exile none")
+                assert all(player.alive for player in runner.shell.state.players.values())
+                await runner._last_words()
+                await runner.command("day finish")
+            elif phase is GamePhase.VICTORY_CHECK:
+                await runner.command("victory check")
+            else:
+                raise AssertionError(
+                    f"unexpected phase before N1 scheduled night: {phase.value}"
+                )
+
+        assert runner.shell.state.round_no == 1
+        assert runner.shell.state.phase is GamePhase.NIGHT_TEAM_CHAT
+        assert all(player.alive for player in runner.shell.state.players.values())
+        assert runner.shell.state.sheriff_seat == 8
+        assert any(
+            row[0] == "day confirm-exile none" and row[2] == 0 for row in history
+        )
+
+        await runner._night_team()
+        await runner._night_actions()
+        await runner._night_resolve()
+        assert runner.shell.state.round_no == 1
+        assert runner.shell.state.phase is GamePhase.DAY_ANNOUNCE
+        assert {seat for seat, player in runner.shell.state.players.items() if not player.alive} >= {
+            2,
+            3,
+        }
+
+        physical_ledger = next(
+            item
+            for item in runner.shell.state.rule_ledger
+            if item.group_id == "night:1"
+            and item.timing == GamePhase.NIGHT_ACTION.value
+            and "c_night_physical_group_death" in item.skill_ids
+        )
+        physical_death = next(
+            fact
+            for fact in physical_ledger.facts
+            if fact.fact_type == "DEATH_CONFIRMED" and fact.target_seat == 3
+        )
+        auto_occurrence = next(
+            item
+            for item in runner.shell.state.rule_trigger_queue
+            if item.skill_id == "c_night_automatic_death"
+            and item.mode == "AUTOMATIC"
+            and item.status == "COMPLETED"
+        )
+        assert auto_occurrence.source_fact_id == physical_death.fact_id
+        auto_ledger = next(
+            item
+            for item in runner.shell.state.rule_ledger
+            if item.group_id == f"automatic-{auto_occurrence.occurrence_id}"
+        )
+        auto_death = next(
+            fact
+            for fact in auto_ledger.facts
+            if fact.fact_type == "DEATH_CONFIRMED" and fact.target_seat == 2
+        )
+        choice_occurrence = next(
+            item
+            for item in runner.shell.state.rule_trigger_queue
+            if item.skill_id == "c_night_choice_death" and item.mode == "PLAYER_CHOICE"
+        )
+        assert choice_occurrence.status == "COMPLETED"
+        assert choice_occurrence.source_fact_id == auto_death.fact_id
+        assert choice_occurrence.source_batch_id == auto_ledger.batch_id
+        choice_ledger = next(
+            item
+            for item in runner.shell.state.rule_ledger
+            if "c_night_choice_death" in item.skill_ids
+            and item.timing == GamePhase.TRIGGER_ACTION.value
+        )
+        choice_death = next(
+            fact
+            for fact in choice_ledger.facts
+            if fact.fact_type == "DEATH_CONFIRMED"
+        )
+        assert choice_death.target_seat not in {2, 3}
+        assert {physical_death.target_seat, auto_death.target_seat, choice_death.target_seat} <= {
+            seat
+            for boundary in runner.shell.state.rule_boundaries
+            for seat in boundary.death_seats
+        }
+        assert physical_ledger.round_no == 1
+
+        await runner._day_announce()
+        state = runner.shell.state
+        assert state.phase is GamePhase.DAY_SPEECH
+        assert state.round_no == 1
+        assert state.day_no == 2
+        assert state.rule_boundaries
+        assert all(not item.is_pending for item in state.rule_boundaries)
+        assert any(
+            getattr(event, "event_type", None).value == "ANNOUNCEMENT"
+            and getattr(event, "correlation_id", None) == "day-announce-r1-d2"
+            for event in state.events
+        )
     finally:
         if runner.shell.session_service is not None:
-            await runner.shell.session_service.close("night ancestry test complete")
-
-    assert summary["status"] == "finished"
-    assert summary["phase"] == GamePhase.FINISHED.value
-    first_exile = next(
-        index
-        for index, row in enumerate(history)
-        if row[0].startswith("day confirm-exile ") and row[2] == 0
-    )
-    later_night = next(
-        index
-        for index, row in enumerate(history)
-        if row[0] == "night auto-resolve" and row[2] == 1
-    )
-    later_announcement = next(
-        index
-        for index, row in enumerate(history)
-        if row[0] == "day announce" and row[2] == 1
-    )
-    later_night_check = next(
-        index
-        for index, row in enumerate(history)
-        if row[0] == "victory night-check" and row[2] == 1
-    )
-    assert first_exile < later_night < later_announcement < later_night_check
-    assert history[later_night][3] == history[later_night][2]
-    assert history[later_night][4] > history[first_exile][4]
-
-    state = runner.shell.state
-    assert any(
-        item.return_point.phase is GamePhase.DAY_RESOLVE
-        and item.return_point.day_no == 1
-        and not item.is_pending
-        for item in state.rule_boundaries
-    )
-    assert any(
-        item.source_group_id == "night:1"
-        and item.return_point.phase is GamePhase.DAY_ANNOUNCE
-        and not item.is_pending
-        for item in state.rule_boundaries
-    )
-    # The winner reached through the later terminal night boundary proves the
-    # previous DAY_RESOLVE boundary did not steal the new round's ancestry.
-    assert state.winner is not None
-    assert state.winner.resolved_by == "night_boundary"
+            await runner.shell.session_service.close("N1 scheduled ancestry test complete")

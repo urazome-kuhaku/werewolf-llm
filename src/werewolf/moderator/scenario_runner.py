@@ -9,6 +9,7 @@ from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from pathlib import Path
 
+from werewolf.domain.enums import GamePhase
 from werewolf.domain.scenario import (
     AssertionField,
     HostCommandStep,
@@ -20,7 +21,7 @@ from werewolf.domain.scenario import (
     load_scenario,
     scenario_sha256,
 )
-from werewolf.game.state import GamePhase, GameState
+from werewolf.game.state import GameState
 from werewolf.knowledge.preview import experimental_preview
 from werewolf.moderator.config import PlayerSessionConfig
 from werewolf.moderator.play_runner import (

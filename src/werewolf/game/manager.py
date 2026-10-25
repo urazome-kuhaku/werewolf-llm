@@ -10784,9 +10784,18 @@ class GameManager:
     def _completed_trigger_marker_matches_badge_boundary(
         self,
         state: GameState,
-        boundary: RuleBoundary,
+        boundary: RuleBoundary | None,
+        *,
+        proven_output_seats: frozenset[int] | None = None,
     ) -> bool:
-        """Prove a held choice marker belongs to this boundary's completed cause."""
+        """Prove a held choice marker belongs to one completed trigger batch.
+
+        When ``boundary`` is supplied, the manager must currently be waiting on
+        that exact output boundary.  A scheduled first-dawn election can hold a
+        different, already-proven night boundary at the cursor, so its badge
+        path uses the same receipt and output proof without binding that cursor
+        to the choice occurrence's output boundary.
+        """
 
         pending = state.pending_resolution
         cursor = state.rule_workflow_cursor
@@ -10797,7 +10806,18 @@ class GameManager:
             or cursor is None
             or cursor.status != "WAITING_BOUNDARY"
             or cursor.active_occurrence_id is not None
-            or cursor.pending_boundary_id != boundary.boundary_id
+        ):
+            return False
+        cursor_boundary = next(
+            (
+                item
+                for item in state.rule_boundaries
+                if item.boundary_id == cursor.pending_boundary_id and item.is_pending
+            ),
+            None,
+        )
+        if cursor_boundary is None or (
+            boundary is not None and cursor_boundary.boundary_id != boundary.boundary_id
         ):
             return False
         occurrence_id = pending.get("occurrence_id")
@@ -10808,11 +10828,11 @@ class GameManager:
         if (
             not isinstance(occurrence_id, str)
             or not isinstance(source_fact_id, str)
-            or source_fact_id not in boundary.death_fact_ids
             or not isinstance(window_id, str)
             or type(actor_seat) is not int
             or type(base_revision) is not int
             or base_revision >= state.state_revision
+            or cursor.settlement_group_id != f"trigger-{occurrence_id}"
         ):
             return False
         occurrences = tuple(
@@ -10898,18 +10918,119 @@ class GameManager:
             or ledger.committed_revision != receipt.committed_revision
             or ledger.request_ids != receipt.request_ids
             or ledger.outcome_digest != receipt.outcome_digest
-            or not any(
-                produced.source_batch_id == ledger.batch_id
-                and produced.source_group_id == ledger.group_id
-                and bool(produced.death_fact_ids)
-                and set(produced.death_fact_ids).issubset(
-                    {fact.fact_id for fact in ledger.facts}
-                )
-                for produced in state.rule_boundaries
-            )
         ):
             return False
+        death_fact_ids = {
+            fact.fact_id for fact in ledger.facts if fact.fact_type.upper() == "DEATH_CONFIRMED"
+        }
+        output_boundaries = tuple(
+            item
+            for item in state.rule_boundaries
+            if item.is_pending
+            and item.source_batch_id == ledger.batch_id
+            and item.source_group_id == ledger.group_id
+            and item.return_point.phase is GamePhase.DAY_ANNOUNCE
+            and item.return_point.day_no == 0
+            and bool(item.death_fact_ids)
+            and set(item.death_fact_ids).issubset(death_fact_ids)
+        )
+        if len(output_boundaries) != 1:
+            return False
+        output_boundary = output_boundaries[0]
+        if boundary is not None and output_boundary.boundary_id != boundary.boundary_id:
+            return False
+        if proven_output_seats is not None and not set(
+            output_boundary.death_seats
+        ).issubset(proven_output_seats):
+            return False
+        try:
+            self._assert_private_checkpoint_trigger_source(state, occurrence)
+        except (EventCommitError, TypeError, ValueError):
+            return False
         return True
+
+    def _scheduled_first_dawn_badge_may_hold_completed_trigger(
+        self,
+        state: GameState,
+    ) -> bool:
+        """Allow first-dawn badge completion while a proven night boundary waits."""
+
+        package = self._execution_package
+        schedule = package.night_boundary_schedule if package is not None else None
+        marker = state.sheriff_badge
+        try:
+            election = _load_sheriff_election(state.sheriff_election)
+        except EventCommitError:
+            return False
+        sheriff_seat = election.sheriff_seat
+        if (
+            schedule is None
+            or "FIRST_DAY_SHERIFF_ELECTION" not in schedule.required_for_round(0)
+            or state.phase is not GamePhase.DAY_ANNOUNCE
+            or state.round_no != 0
+            or state.day_no != 1
+            or sheriff_seat is None
+            or self._completed_sheriff_election_source(state, 0) is None
+            or self._day_announcement_source(state, 0) is None
+            or not isinstance(marker, Mapping)
+            or marker.get("status") != "COMPLETE"
+            or marker.get("source_seat") != sheriff_seat
+            or marker.get("rule_boundary_id") is not None
+        ):
+            return False
+        player = state.players.get(sheriff_seat)
+        if player is None or player.alive:
+            return False
+        first_night_deaths = set(first_night_death_seats(state, execution_package=package))
+        if sheriff_seat not in first_night_deaths:
+            return False
+        cursor = state.rule_workflow_cursor
+        pending_boundary = next(
+            (
+                item
+                for item in state.rule_boundaries
+                if cursor is not None
+                and item.boundary_id == cursor.pending_boundary_id
+                and item.is_pending
+            ),
+            None,
+        )
+        pending = state.pending_resolution
+        occurrence_id = pending.get("occurrence_id") if isinstance(pending, Mapping) else None
+        occurrence = next(
+            (
+                item
+                for item in state.rule_trigger_queue
+                if item.occurrence_id == occurrence_id
+                and item.status == "COMPLETED"
+                and item.mode == "PLAYER_CHOICE"
+            ),
+            None,
+        )
+        source_boundaries = tuple(
+            item
+            for item in state.rule_boundaries
+            if occurrence is not None
+            and item.is_pending
+            and occurrence.source_fact_id in item.death_fact_ids
+            and item.return_point.phase is GamePhase.DAY_ANNOUNCE
+            and item.return_point.day_no == 0
+        )
+        if (
+            pending_boundary is None
+            or pending_boundary.return_point.phase is not GamePhase.DAY_ANNOUNCE
+            or pending_boundary.return_point.day_no != 0
+            or not set(pending_boundary.death_seats).issubset(first_night_deaths)
+            or occurrence is None
+            or len(source_boundaries) != 1
+            or not set(source_boundaries[0].death_seats).issubset(first_night_deaths)
+        ):
+            return False
+        return self._completed_trigger_marker_matches_badge_boundary(
+            state,
+            None,
+            proven_output_seats=frozenset(first_night_deaths),
+        )
 
     async def complete_sheriff_badge(
         self,
@@ -11088,7 +11209,14 @@ class GameManager:
                     current, typed_boundary
                 )
             )
-            if current.pending_resolution is not None and not completed_trigger_marker:
+            scheduled_first_dawn_marker = bool(
+                current.pending_resolution is not None
+                and typed_boundary is None
+                and self._scheduled_first_dawn_badge_may_hold_completed_trigger(current)
+            )
+            if current.pending_resolution is not None and not (
+                completed_trigger_marker or scheduled_first_dawn_marker
+            ):
                 raise SheriffElectionError(
                     "BADGE_PENDING", "trigger resolution is still pending"
                 )

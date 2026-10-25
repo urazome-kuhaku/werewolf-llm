@@ -264,6 +264,93 @@ async def test_expired_game_bool_uses_its_frozen_initial_value_after_next_night_
     assert after_expiry.winner == "wolf"
 
 
+@pytest.mark.asyncio
+async def test_next_night_expiring_game_bool_survives_victory_and_final_snapshot() -> None:
+    program = _program(
+        VictoryCondition(
+            condition_id="charm-complete",
+            side_id="wolf",
+            priority=10,
+            when=VictoryGameState(key="gate"),
+        )
+    )
+    execution = _execution(program).model_copy(
+        update={
+            "state_declarations": (
+                StateDeclaration(
+                    skill_id="victory-state",
+                    key="gate",
+                    value_type="bool",
+                    initial=False,
+                    scope="GAME",
+                    expiry_policy="NEXT_NIGHT_START",
+                ),
+            )
+        }
+    )
+    manager = _manager(execution)
+    manager._state = manager.state.model_copy(
+        update={
+            "phase": GamePhase.VICTORY_CHECK,
+            "round_no": 1,
+            "rule_state": (
+                RuleStateValue(
+                    scope="GAME",
+                    key="gate",
+                    value_type="bool",
+                    value=True,
+                    source_batch_id="charm-chain-complete",
+                    skill_id="victory-state",
+                    expiry_policy="NEXT_NIGHT_START",
+                    expires_at_round=1,
+                    expires_at_hook=GamePhase.NIGHT_TEAM_CHAT.value,
+                ),
+            ),
+        }
+    )
+    board = _board(program)
+
+    before_commit = evaluate_victory(
+        manager.state,
+        board,
+        execution_package=execution,
+    )
+    assert before_commit.status == "WINNER"
+    assert before_commit.winner == "wolf"
+
+    archived_states: list[GameState] = []
+
+    async def capture_snapshot(candidate: GameState) -> dict[str, object]:
+        archived_states.append(candidate)
+        return {
+            "snapshot_id": "snapshot-c" * 8,
+            "snapshot_revision": 1,
+            "state_revision": candidate.state_revision,
+            "created_at": NOW.isoformat(),
+            "manifest_sha256": "c" * 64,
+        }
+
+    committed = await manager.commit_victory_check(
+        board,
+        now=NOW,
+        snapshot_writer=capture_snapshot,
+    )
+
+    assert committed.phase is GamePhase.FINISHED
+    assert committed.winner is not None and committed.winner["side"] == "wolf"
+    assert len(archived_states) == 1
+    assert archived_states[0].phase is GamePhase.FINISHED
+    assert archived_states[0].winner == committed.winner
+    for finished_state in (archived_states[0], committed):
+        after_commit = evaluate_victory(
+            finished_state,
+            board,
+            execution_package=execution,
+        )
+        assert after_commit.status == "WINNER"
+        assert after_commit.winner == "wolf"
+
+
 @pytest.mark.parametrize(
     ("conflict_policy", "expected_status", "requires_moderator"),
     [

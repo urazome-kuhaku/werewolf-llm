@@ -120,7 +120,7 @@ def _rule_value_expired(
         # before the next night. Once that hook has been crossed, keep the
         # value expired for every later phase even if an older snapshot still
         # contains the row.
-        return state.phase.value != "VICTORY_CHECK"
+        return state.phase.value not in {"VICTORY_CHECK", "FINISHED"}
     return expires_at_hook is not None and state.phase.value == expires_at_hook
 
 
