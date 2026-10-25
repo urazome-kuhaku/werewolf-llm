@@ -1202,6 +1202,10 @@ class ModeratorTriggerFlow:
                 "boundary_id": None
                 if cursor is None or cursor.pending_boundary_id is None
                 else cursor.pending_boundary_id,
+                "boundary_prerequisites": [
+                    item.model_dump(mode="json")
+                    for item in self._manager.night_boundary_prerequisites(state)
+                ],
             }
 
         payload: dict[str, object] = {
@@ -1209,6 +1213,10 @@ class ModeratorTriggerFlow:
             "operation": None,
             "window": None,
             "submitted_seats": [],
+            "boundary_prerequisites": [
+                item.model_dump(mode="json")
+                for item in self._manager.night_boundary_prerequisites(self.state)
+            ],
         }
         if self.state.phase is not GamePhase.TRIGGER_ACTION:
             return payload

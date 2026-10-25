@@ -1,11 +1,13 @@
 """Command-line entry point for Werewolf Arena."""
 
+import asyncio
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Annotated
 
 import typer
 
+from werewolf.cli_support.checkpoint_cli import verify_private_checkpoint
 from werewolf.cli_support.diagnostics import (
     DiagnosticFailure,
     json_report,
@@ -15,7 +17,13 @@ from werewolf.cli_support.diagnostics import (
     verify_archive_path,
 )
 from werewolf.cli_support.play_setup import PlaySetupError, build_play_setup
+from werewolf.cli_support.scenario_cli import execute_scenario
+from werewolf.domain.scenario import ScenarioError
+from werewolf.knowledge.catalog import CatalogError, CatalogStore
 from werewolf.knowledge.preview import experimental_preview
+from werewolf.moderator.play_runner import PlayRunnerError
+from werewolf.moderator.scenario_runner import ScenarioRunError
+from werewolf.moderator.shell import ModeratorError
 
 app = typer.Typer(
     name="werewolf",
@@ -28,11 +36,19 @@ rules_app = typer.Typer(help="Published rules diagnostics.", no_args_is_help=Tru
 pi_app = typer.Typer(help="Pi runtime diagnostics.", no_args_is_help=True)
 archive_app = typer.Typer(help="Game archive diagnostics.", no_args_is_help=True)
 play_app = typer.Typer(help="Experimental playable game setup.", no_args_is_help=True)
+scenario_app = typer.Typer(help="Run declarative scenario gates.", no_args_is_help=True)
+catalog_app = typer.Typer(help="Stage and manage experimental rule catalogs.", no_args_is_help=True)
+checkpoint_app = typer.Typer(
+    help="Verify private waiting-choice checkpoints.", no_args_is_help=True
+)
 app.add_typer(config_app, name="config")
 app.add_typer(rules_app, name="rules")
 app.add_typer(pi_app, name="pi")
 app.add_typer(archive_app, name="archive")
 app.add_typer(play_app, name="play")
+app.add_typer(scenario_app, name="scenario")
+app.add_typer(catalog_app, name="catalog")
+app.add_typer(checkpoint_app, name="checkpoint")
 
 
 def _report_or_exit(
@@ -131,6 +147,14 @@ def play_init(
         Path | None,
         typer.Option("--compiled-root", help="Root of a verified compiled package store."),
     ] = None,
+    catalog_root: Annotated[
+        Path | None,
+        typer.Option("--catalog-root", help="Use an activated experimental catalog entry."),
+    ] = None,
+    catalog_board: Annotated[
+        str | None,
+        typer.Option("--board", help="Catalog board ID or exact active ID@X.Y.Z reference."),
+    ] = None,
     pi_seats: Annotated[
         str,
         typer.Option(
@@ -161,6 +185,17 @@ def play_init(
         typer.echo("play init failed: --pi-seats must be a comma-separated integer list", err=True)
         raise typer.Exit(code=2) from None
     try:
+        catalog_selection = None
+        if catalog_root is not None:
+            if workbench is not None or published_root is not None or compiled_root is not None:
+                raise PlaySetupError("--catalog-root cannot be combined with another rules source")
+            catalog_store = CatalogStore(catalog_root)
+            entry, selection = catalog_store.resolve_active(catalog_board or board_ref)
+            board_ref = entry.ref.format()
+            compiled_root = entry.compiled_root
+            catalog_selection = selection.model_dump(mode="json")
+        elif catalog_board is not None:
+            raise PlaySetupError("--board requires --catalog-root")
         report = build_play_setup(
             output,
             pi_seats=values,
@@ -174,11 +209,117 @@ def play_init(
             workbench=workbench,
             published_root=published_root,
             compiled_root=compiled_root,
+            catalog_selection=catalog_selection,
         )
     except (PlaySetupError, OSError, ValueError) as exc:
         typer.echo(f"play init failed: {str(exc)[:500]}", err=True)
         raise typer.Exit(code=1) from None
     typer.echo(json_report(report))
+
+
+@catalog_app.command("stage")
+def catalog_stage(
+    root: Annotated[Path, typer.Option("--root", help="Catalog registry directory.")],
+    board: Annotated[str, typer.Option("--board", help="Pinned board ID@X.Y.Z.")],
+    workbench: Annotated[Path, typer.Option("--workbench", help="Pending candidate workbench.")],
+    scenarios: Annotated[
+        list[Path], typer.Option("--scenario", help="Required declarative scenario file.")
+    ],
+) -> None:
+    """Stage a complete pending candidate closure and its immutable scenarios."""
+
+    try:
+        report = asyncio.run(CatalogStore(root).stage(workbench, board, scenarios))
+    except (CatalogError, OSError, ValueError) as exc:
+        typer.echo(f"catalog stage failed: {str(exc)[:500]}", err=True)
+        raise typer.Exit(code=1) from None
+    typer.echo(json_report(report))
+
+
+@catalog_app.command("activate")
+def catalog_activate(
+    root: Annotated[Path, typer.Option("--root", help="Catalog registry directory.")],
+    board: Annotated[str, typer.Option("--board", help="Exact staged board ID@X.Y.Z.")],
+) -> None:
+    """Run the production scenario gate and atomically activate a passing entry."""
+
+    try:
+        report = asyncio.run(CatalogStore(root).activate(board))
+    except (CatalogError, OSError, ValueError) as exc:
+        typer.echo(f"catalog activate failed: {str(exc)[:500]}", err=True)
+        raise typer.Exit(code=1) from None
+    typer.echo(json_report(report))
+    if report.get("status") != "ACTIVE":
+        raise typer.Exit(code=1)
+
+
+@catalog_app.command("status")
+def catalog_status(
+    root: Annotated[Path, typer.Option("--root", help="Catalog registry directory.")],
+    board: Annotated[
+        str | None,
+        typer.Option("--board", help="Optional board ID or exact board reference."),
+    ] = None,
+) -> None:
+    """Read staged, active, retired, lease, and archive state."""
+
+    try:
+        report = CatalogStore(root).status(board)
+    except (CatalogError, OSError, ValueError) as exc:
+        typer.echo(f"catalog status failed: {str(exc)[:500]}", err=True)
+        raise typer.Exit(code=1) from None
+    typer.echo(json_report(report))
+
+
+@catalog_app.command("retire")
+def catalog_retire(
+    root: Annotated[Path, typer.Option("--root", help="Catalog registry directory.")],
+    board: Annotated[str, typer.Option("--board", help="Exact board ID@X.Y.Z.")],
+) -> None:
+    """Block new game starts while admitted games remain frozen."""
+
+    try:
+        report = asyncio.run(CatalogStore(root).retire(board))
+    except (CatalogError, OSError, ValueError) as exc:
+        typer.echo(f"catalog retire failed: {str(exc)[:500]}", err=True)
+        raise typer.Exit(code=1) from None
+    typer.echo(json_report(report))
+
+
+@catalog_app.command("unload")
+def catalog_unload(
+    root: Annotated[Path, typer.Option("--root", help="Catalog registry directory.")],
+    board: Annotated[str, typer.Option("--board", help="Exact retired board ID@X.Y.Z.")],
+) -> None:
+    """Remove only a retired entry with no live game lease."""
+
+    try:
+        report = asyncio.run(CatalogStore(root).unload(board))
+    except (CatalogError, OSError, ValueError) as exc:
+        typer.echo(f"catalog unload failed: {str(exc)[:500]}", err=True)
+        raise typer.Exit(code=1) from None
+    typer.echo(json_report(report))
+
+
+@checkpoint_app.command("verify")
+def checkpoint_verify(
+    config_file: Annotated[
+        Path, typer.Option("--config", help="Game configuration YAML used by the checkpoint.")
+    ],
+    selector: Annotated[
+        str, typer.Argument(help="Checkpoint ID, directory name, or private checkpoint path.")
+    ],
+) -> None:
+    """Verify a private waiting-choice checkpoint without starting sessions."""
+
+    try:
+        report = verify_private_checkpoint(config_file, selector)
+    except (ModeratorError, OSError, ValueError) as exc:
+        typer.echo(f"checkpoint verify failed: {str(exc)[:500]}", err=True)
+        raise typer.Exit(code=1) from None
+    typer.echo(json_report(report))
+    if report.get("status") != "verified":
+        raise typer.Exit(code=1)
 
 
 @play_app.command("run")
@@ -240,6 +381,36 @@ def play_run(
         typer.echo(f"play run failed: {str(exc)[:500]}", err=True)
         raise typer.Exit(code=1) from None
     typer.echo(json_report(summary))
+
+
+@scenario_app.command("run")
+def scenario_run(
+    config_file: Annotated[Path, typer.Option("--config", help="Playable game.yaml.")],
+    scenario_file: Annotated[Path, typer.Option("--scenario", help="Closed YAML/JSON scenario.")],
+    output_path: Annotated[Path, typer.Option("--output", help="Report file or output directory.")],
+    experimental_preview_enabled: Annotated[
+        bool,
+        typer.Option(
+            "--experimental-preview",
+            help="Run an explicitly marked pending-review candidate package.",
+        ),
+    ] = False,
+) -> None:
+    """Run one data-only scenario through real player sessions and the game manager."""
+
+    try:
+        report = execute_scenario(
+            config_file,
+            scenario_file,
+            output_path,
+            experimental_preview_enabled=experimental_preview_enabled,
+        )
+    except (ScenarioError, ScenarioRunError, PlayRunnerError, OSError, ValueError) as exc:
+        typer.echo(f"scenario run failed: {str(exc)[:500]}", err=True)
+        raise typer.Exit(code=1) from None
+    typer.echo(json_report(report))
+    if report.get("status") != "PASS":
+        raise typer.Exit(code=1)
 
 
 @app.command()

@@ -593,6 +593,7 @@ def validate_sheriff_start(
     state: GameState,
     *,
     candidates: tuple[int, ...],
+    execution_package: object | None = None,
 ) -> None:
     """Validate the first-day boundary before a coordinator creates a record."""
 
@@ -621,7 +622,7 @@ def validate_sheriff_start(
         raise SheriffElectionError(
             "SHERIFF_DISABLED", "the board does not enable first-day election"
         )
-    eligible = first_day_sheriff_participants(state)
+    eligible = first_day_sheriff_participants(state, execution_package=execution_package)
     if tuple(sorted(candidates)) != tuple(candidates) or not candidates:
         raise SheriffElectionError(
             "CANDIDATES_INVALID", "candidate seats must be a non-empty sorted tuple"

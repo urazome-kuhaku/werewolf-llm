@@ -1,0 +1,13 @@
+schema_version: 1
+scenario_id: quasar-command-assertion-fail
+board_ref: quasar_echo_lab@1.0.0
+mode: COMMAND
+steps:
+  - kind: HOST_COMMAND
+    step_id: create
+    command: NEW
+  - kind: ASSERT
+    step_id: impossible-phase
+    field: phase
+    operator: EQ
+    expected: ASSIGNED

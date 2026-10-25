@@ -1,0 +1,14 @@
+schema_version: 1
+scenario_id: quasar-command-assert-unknown-state
+board_ref: quasar_echo_lab@1.0.0
+mode: COMMAND
+steps:
+  - kind: HOST_COMMAND
+    step_id: create
+    command: NEW
+  - kind: ASSERT
+    step_id: undeclared-state-is-not-false
+    field: game_state_value
+    operator: NE
+    expected: false
+    state_key: undeclared_gate

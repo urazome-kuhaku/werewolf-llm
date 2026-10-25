@@ -374,6 +374,12 @@ class DayCoordinator:
         if state.phase is not GamePhase.DAY_ANNOUNCE:
             raise DayCoordinatorError("PHASE_NOT_ALLOWED", "day announcement requires DAY_ANNOUNCE")
         await self.commit_announcement(content, now=now)
+        # A scheduled board keeps the dawn phase active while the moderator
+        # completes its frozen prerequisites, death speeches, badge decision,
+        # and night victory check.  ``open_speech`` is the one later edge into
+        # ordinary daytime speech; repeating the announcement stays idempotent.
+        if self._board.night_boundary_schedule is not None:
+            return await self._manager.snapshot()
         timestamp = now or utc_now()
         return await self._manager.commit_phase_transition(GamePhase.DAY_SPEECH, now=timestamp)
 

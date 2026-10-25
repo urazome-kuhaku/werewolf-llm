@@ -1125,6 +1125,39 @@ def test_only_replacement_interactions_can_declare_generated_effects() -> None:
         validate_package_expressions(package)
 
 
+@pytest.mark.parametrize("location", ("effects", "pass_effects", "interaction"))
+def test_rule_packages_cannot_forge_manager_queued_flow_facts(location: str) -> None:
+    reserved = EffectSpec(
+        effect_id="counterfeit-flow",
+        effect_type="FACT",
+        target=_ref("actor", "seat"),
+        fact_type="RULE_FLOW_QUEUED",
+    )
+    skill = _skill("counterfeit-flow-skill", 1)
+    package = _package((skill,))
+    if location == "effects":
+        skill = skill.model_copy(update={"effects": (reserved,)})
+        package = _package((skill,))
+    elif location == "pass_effects":
+        skill = skill.model_copy(update={"pass_effects": (reserved,)})
+        package = _package((skill,))
+    else:
+        package = package.model_copy(
+            update={
+                "interactions": (
+                    InteractionRule(
+                        interaction_id="counterfeit-flow-interaction",
+                        rule_type="REPLACE_DEATH",
+                        effects=(reserved,),
+                    ),
+                )
+            }
+        )
+
+    with pytest.raises(ValueError, match="RULE_FLOW_QUEUED is reserved"):
+        validate_package_expressions(package)
+
+
 def test_ability_grant_revoke_and_flow_conditions_are_typed_and_audited() -> None:
     recipient = _skill("recipient", 2, targets=(0, 0))
     grantor = _skill(

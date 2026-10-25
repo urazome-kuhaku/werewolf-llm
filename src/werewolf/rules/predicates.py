@@ -889,8 +889,12 @@ def validate_package_expressions(package: object) -> None:
                     )
             if effect.effect_type == "FACT" and effect.fact_type is None:
                 raise ValueError(f"effect {effect.effect_id} requires fact_type")
-            if effect.effect_type == "FACT" and effect.fact_type == "DEATH_CONFIRMED":
-                raise ValueError("DEATH_CONFIRMED is reserved for confirmed mortality outcomes")
+            if effect.effect_type == "FACT" and effect.fact_type is not None:
+                reserved_fact = effect.fact_type.upper()
+                if reserved_fact == "DEATH_CONFIRMED":
+                    raise ValueError("DEATH_CONFIRMED is reserved for confirmed mortality outcomes")
+                if reserved_fact == "RULE_FLOW_QUEUED":
+                    raise ValueError("RULE_FLOW_QUEUED is reserved for manager FlowUpdate records")
             if effect.effect_type == "DAMAGE" and effect.target is None:
                 raise ValueError(f"damage effect {effect.effect_id} requires a target")
             vote_value = effect.value
@@ -1060,8 +1064,12 @@ def validate_package_expressions(package: object) -> None:
                     raise ValueError("PASS state update value does not match declared state type")
             if effect.effect_type == "FACT" and effect.fact_type is None:
                 raise ValueError("PASS fact effect requires fact_type")
-            if effect.effect_type == "FACT" and effect.fact_type == "DEATH_CONFIRMED":
-                raise ValueError("DEATH_CONFIRMED is reserved for confirmed mortality outcomes")
+            if effect.effect_type == "FACT" and effect.fact_type is not None:
+                reserved_fact = effect.fact_type.upper()
+                if reserved_fact == "DEATH_CONFIRMED":
+                    raise ValueError("DEATH_CONFIRMED is reserved for confirmed mortality outcomes")
+                if reserved_fact == "RULE_FLOW_QUEUED":
+                    raise ValueError("RULE_FLOW_QUEUED is reserved for manager FlowUpdate records")
     for interaction in package.interactions:
         if interaction.effects and interaction.rule_type != "REPLACE_DEATH":
             raise ValueError("interaction effects are supported only for REPLACE_DEATH")
@@ -1077,8 +1085,12 @@ def validate_package_expressions(package: object) -> None:
             }:
                 raise ValueError("typed B effects are supported only on skill declarations")
             _validate_typed_payload(effect)
-            if effect.effect_type == "FACT" and effect.fact_type == "DEATH_CONFIRMED":
-                raise ValueError("DEATH_CONFIRMED is reserved for confirmed mortality outcomes")
+            if effect.effect_type == "FACT" and effect.fact_type is not None:
+                reserved_fact = effect.fact_type.upper()
+                if reserved_fact == "DEATH_CONFIRMED":
+                    raise ValueError("DEATH_CONFIRMED is reserved for confirmed mortality outcomes")
+                if reserved_fact == "RULE_FLOW_QUEUED":
+                    raise ValueError("RULE_FLOW_QUEUED is reserved for manager FlowUpdate records")
         source_skills = tuple(
             skill
             for skill in package.skills

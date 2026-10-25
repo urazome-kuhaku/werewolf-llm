@@ -381,6 +381,7 @@ def _load_executable_artifact(
         validate_execution_package(
             execution,
             action_registry,
+            board=board,
             role_ids=set(effective_roles),
             available_windows=execution_windows_from_board(board),
             expected_boundary_policy=(

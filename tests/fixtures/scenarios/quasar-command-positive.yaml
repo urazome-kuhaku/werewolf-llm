@@ -1,0 +1,53 @@
+schema_version: 1
+scenario_id: quasar-command-positive
+board_ref: quasar_echo_lab@1.0.0
+mode: COMMAND
+budget:
+  max_commands: 20
+  max_turns: 100
+  max_rounds: 10
+steps:
+  - kind: HOST_COMMAND
+    step_id: create
+    command: NEW
+  - kind: ASSERT
+    step_id: created-phase
+    field: phase
+    operator: EQ
+    expected: CREATED
+  - kind: HOST_COMMAND
+    step_id: assign-1
+    command: NEXT
+  - kind: HOST_COMMAND
+    step_id: assign-2
+    command: NEXT
+  - kind: ASSERT
+    step_id: assigned-phase
+    field: phase
+    operator: EQ
+    expected: ASSIGNED
+  - kind: HOST_COMMAND
+    step_id: start
+    command: START
+  - kind: ASSERT
+    step_id: prepare-phase
+    field: phase
+    operator: EQ
+    expected: PLAYER_PREPARE
+  - kind: HOST_COMMAND
+    step_id: prepare-1
+    command: PREPARE_NEXT
+  - kind: HOST_COMMAND
+    step_id: prepare-2
+    command: PREPARE_NEXT
+  - kind: HOST_COMMAND
+    step_id: prepare-3
+    command: PREPARE_NEXT
+  - kind: HOST_COMMAND
+    step_id: begin-night
+    command: NEXT
+  - kind: ASSERT
+    step_id: night-phase
+    field: phase
+    operator: EQ
+    expected: NIGHT_TEAM_CHAT

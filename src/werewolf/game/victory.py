@@ -13,12 +13,27 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
 
+from werewolf.domain.victory_rules import (
+    VictoryAliveCount,
+    VictoryBoolean,
+    VictoryCompare,
+    VictoryExpr,
+    VictoryGameState,
+    VictoryLiteral,
+    VictoryProgram,
+)
 from werewolf.knowledge.board import BoardDefinition
 from werewolf.knowledge.preview import experimental_preview_enabled
+from werewolf.rules.models import (
+    ExecutionPackage,
+    RuleObservation,
+    StateDeclaration,
+)
+from werewolf.rules.models import RuleStateValue as ObservationRuleStateValue
 
 from .state import GameState, PlayerState
 
-VictoryStatus = Literal["ONGOING", "WINNER", "PENDING_MODERATOR"]
+VictoryStatus = Literal["ONGOING", "WINNER", "DRAW", "PENDING_MODERATOR"]
 
 
 class VictoryEvaluationError(ValueError):
@@ -83,9 +98,9 @@ class VictoryEvaluation:
 
     @property
     def is_terminal(self) -> bool:
-        """Whether this result has a single winner that may be committed."""
+        """Whether this result ends the game without moderator selection."""
 
-        return self.status == "WINNER"
+        return self.status in {"WINNER", "DRAW"}
 
 
 # The IDs below describe the semantic vocabulary used by the published board
@@ -229,11 +244,221 @@ def _semantic_group(
     return None
 
 
+def _declarative_observation(
+    state: GameState,
+    board: BoardDefinition,
+    execution_package: ExecutionPackage | None,
+) -> tuple[VictoryProgram, RuleObservation]:
+    """Verify frozen execution binding and build its expiry-filtered view."""
+
+    if not isinstance(execution_package, ExecutionPackage):
+        raise RulesetMismatchError(
+            "declarative victory requires the game's frozen execution package"
+        )
+    program = board.victory.program
+    if program is None or execution_package.victory_program != program:
+        raise RulesetMismatchError(
+            "declarative victory program does not match the frozen execution package"
+        )
+    identity = state.execution_identity
+    if identity is None:
+        raise RulesetMismatchError("declarative victory requires a pinned execution identity")
+    if (
+        execution_package.board_id != board.board_id
+        or execution_package.board_version != board.version
+        or identity.board_id != execution_package.board_id
+        or identity.board_version != execution_package.board_version
+        or identity.package_id != execution_package.package_id
+        or identity.execution_digest != execution_package.package_id
+    ):
+        raise RulesetMismatchError(
+            "execution package does not match the game's frozen execution identity"
+        )
+
+    from werewolf.rules.adapter import RuleAdapterError, RuleExecutionAdapter
+
+    try:
+        adapter = RuleExecutionAdapter(
+            execution_package,
+            action_registry_digest=identity.action_registry_digest,
+        )
+        observation = adapter.observation(
+            state,
+            group_id="victory",
+            timing=state.phase.value,
+        )
+        # NEXT_NIGHT_START values are removed at their real boundary. A
+        # declared GAME bool still has its frozen initial value after that
+        # removal, matching rule-interpreter reads while keeping this view
+        # expiry-filtered. Do not mask duplicate or malformed stored rows:
+        # the evaluator below rejects those explicitly.
+        declarations_by_key: dict[str, list[StateDeclaration]] = {}
+        for declaration in execution_package.state_declarations:
+            if declaration.scope == "GAME":
+                declarations_by_key.setdefault(declaration.key, []).append(declaration)
+        referenced_keys = _victory_game_state_keys(program)
+        state_values = list(observation.state_values)
+        changed = False
+        for key in referenced_keys:
+            matches = declarations_by_key.get(key, [])
+            if len(matches) != 1:
+                continue
+            declaration = matches[0]
+            if declaration.value_type != "bool" or type(declaration.initial) is not bool:
+                continue
+            if any(item.scope == "GAME" and item.key == key for item in state_values):
+                continue
+            state_values.append(
+                ObservationRuleStateValue(
+                    scope="GAME",
+                    skill_id=declaration.skill_id,
+                    key=key,
+                    value=declaration.initial,
+                )
+            )
+            changed = True
+        if changed:
+            observation = observation.model_copy(update={"state_values": tuple(state_values)})
+    except (RuleAdapterError, TypeError, ValueError) as exc:
+        raise RulesetMismatchError(
+            "frozen execution package could not produce its authoritative observation"
+        ) from exc
+    return program, observation
+
+
+def _victory_game_state_keys(program: VictoryProgram) -> set[str]:
+    """Collect the closed set of state keys referenced by the victory AST."""
+
+    keys: set[str] = set()
+
+    def visit(expression: VictoryExpr) -> None:
+        if isinstance(expression, VictoryGameState):
+            keys.add(expression.key)
+        elif isinstance(expression, VictoryCompare):
+            visit(expression.left)
+            visit(expression.right)
+        elif isinstance(expression, VictoryBoolean):
+            for child in expression.values:
+                visit(child)
+
+    for condition in program.conditions:
+        visit(condition.when)
+    return keys
+
+
+def _evaluate_victory_expr(expression: VictoryExpr, observation: RuleObservation) -> bool | int:
+    """Interpret one already compiled finite victory expression."""
+
+    if isinstance(expression, VictoryLiteral):
+        value = expression.value
+        if type(value) not in {bool, int}:
+            raise InvalidVictoryDefinitionError("victory literal has an unsupported value")
+        return value
+    if isinstance(expression, VictoryAliveCount):
+        count = sum(
+            1
+            for player in observation.players
+            if player.alive and getattr(player, expression.field) == expression.value
+        )
+        if not 0 <= count <= 64:
+            raise InvalidVictoryDefinitionError("victory alive count exceeds its 0..64 bound")
+        return count
+    if isinstance(expression, VictoryGameState):
+        matches = tuple(
+            item
+            for item in observation.state_values
+            if item.scope == "GAME" and item.key == expression.key
+        )
+        if len(matches) != 1 or type(matches[0].value) is not bool:
+            raise InvalidVictoryDefinitionError(
+                f"declared GAME bool state {expression.key!r} is missing or malformed"
+            )
+        return matches[0].value
+    if isinstance(expression, VictoryCompare):
+        left = _evaluate_victory_expr(expression.left, observation)
+        right = _evaluate_victory_expr(expression.right, observation)
+        if type(left) is not type(right):
+            raise InvalidVictoryDefinitionError("victory comparison operand types disagree")
+        if expression.op == "eq":
+            return left == right
+        if expression.op == "ne":
+            return left != right
+        if type(left) is not int or type(right) is not int:
+            raise InvalidVictoryDefinitionError(
+                "ordered victory comparisons require integer operands"
+            )
+        if expression.op == "lt":
+            return left < right
+        if expression.op == "le":
+            return left <= right
+        if expression.op == "gt":
+            return left > right
+        if expression.op == "ge":
+            return left >= right
+        raise InvalidVictoryDefinitionError("victory comparison uses an unsupported operator")
+    if isinstance(expression, VictoryBoolean):
+        children = tuple(_evaluate_victory_expr(child, observation) for child in expression.values)
+        if any(type(value) is not bool for value in children):
+            raise InvalidVictoryDefinitionError("victory boolean operator received a non-boolean")
+        if expression.op == "and":
+            return all(children)
+        if expression.op == "or":
+            return any(children)
+        if expression.op == "not" and len(children) == 1:
+            return not children[0]
+        raise InvalidVictoryDefinitionError("victory boolean expression is malformed")
+    raise InvalidVictoryDefinitionError("victory expression uses an unsupported node")
+
+
+def _evaluate_declarative_victory(
+    state: GameState,
+    board: BoardDefinition,
+    execution_package: ExecutionPackage | None,
+) -> VictoryEvaluation:
+    program, observation = _declarative_observation(state, board, execution_package)
+    satisfied = tuple(
+        condition
+        for condition in program.conditions
+        if _evaluate_victory_expr(condition.when, observation) is True
+    )
+    if not satisfied:
+        return VictoryEvaluation(status="ONGOING")
+
+    priority = max(condition.priority for condition in satisfied)
+    top_conditions = tuple(condition for condition in satisfied if condition.priority == priority)
+    conditions_by_side: dict[str, list[str]] = {}
+    for condition in top_conditions:
+        conditions_by_side.setdefault(condition.side_id, []).append(condition.condition_id)
+    candidates = tuple(
+        VictoryCandidate(side, min(condition_ids))
+        for side, condition_ids in sorted(conditions_by_side.items())
+    )
+    if len(candidates) == 1:
+        return VictoryEvaluation(
+            status="WINNER",
+            candidates=candidates,
+            winner=candidates[0].side,
+        )
+    if program.conflict_policy == "DRAW":
+        return VictoryEvaluation(
+            status="DRAW",
+            candidates=candidates,
+            reasons=("TOP_PRIORITY_MULTI_SIDE_DRAW",),
+        )
+    return VictoryEvaluation(
+        status="PENDING_MODERATOR",
+        candidates=candidates,
+        reasons=("TOP_PRIORITY_MULTI_SIDE_CONFLICT",),
+        requires_moderator=True,
+    )
+
+
 def evaluate_victory(
     state: GameState,
     board: BoardDefinition,
     *,
     role_groups: Mapping[str, str] | None = None,
+    execution_package: ExecutionPackage | None = None,
 ) -> VictoryEvaluation:
     """Compute board-declared victory candidates without mutating ``state``.
 
@@ -248,6 +473,8 @@ def evaluate_victory(
         raise TypeError("state must be a GameState")
     board = _published_board(board)
     _bound_board(state, board)
+    if board.victory.mode == "declarative":
+        return _evaluate_declarative_victory(state, board, execution_package)
     if board.victory.mode != "eliminate_side":
         raise UnsupportedVictoryModeError(f"unsupported victory mode: {board.victory.mode!r}")
 
@@ -352,10 +579,16 @@ def compute_victory_candidates(
     board: BoardDefinition,
     *,
     role_groups: Mapping[str, str] | None = None,
+    execution_package: ExecutionPackage | None = None,
 ) -> VictoryEvaluation:
     """Named entry point for callers that treat victory as candidate finding."""
 
-    return evaluate_victory(state, board, role_groups=role_groups)
+    return evaluate_victory(
+        state,
+        board,
+        role_groups=role_groups,
+        execution_package=execution_package,
+    )
 
 
 calculate_victory = evaluate_victory

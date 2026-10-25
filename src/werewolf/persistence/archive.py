@@ -72,6 +72,7 @@ _ACTIVE_ROOT_DIRECTORIES = frozenset({"private", "ruleset", "snapshots"})
 _ACTIVE_EXCLUDED_DIRECTORIES = frozenset({".runtime"})
 _ACTIVE_PRIVATE_FILES = frozenset({"private/gm.md", "private/runtime_refs.json"})
 _ACTIVE_PRIVATE_CHANNEL_FILES = frozenset({"private/channels/wolves.md"})
+_ACTIVE_PRIVATE_CHECKPOINTS_DIRECTORY = "private/checkpoints"
 _RULESET_SNAPSHOT_FILENAME: Final[str] = "snapshot.json"
 
 
@@ -428,6 +429,10 @@ def _source_files(root: Path) -> list[tuple[str, Path]]:
                 raise ArchiveSecurityError("active private projection contains a symlink")
             if item.is_dir():
                 relative_dir = item.relative_to(root).as_posix()
+                if relative_dir == _ACTIVE_PRIVATE_CHECKPOINTS_DIRECTORY or relative_dir.startswith(
+                    f"{_ACTIVE_PRIVATE_CHECKPOINTS_DIRECTORY}/"
+                ):
+                    continue
                 if relative_dir not in {"private", "private/channels"}:
                     raise ArchiveSecurityError(
                         "active private projection contains an unapproved directory: "
@@ -435,6 +440,8 @@ def _source_files(root: Path) -> list[tuple[str, Path]]:
                     )
                 continue
             relative = item.relative_to(root).as_posix()
+            if relative.startswith(f"{_ACTIVE_PRIVATE_CHECKPOINTS_DIRECTORY}/"):
+                continue
             if relative not in _ACTIVE_PRIVATE_FILES | _ACTIVE_PRIVATE_CHANNEL_FILES:
                 raise ArchiveSecurityError(
                     f"active private projection contains an unapproved file: {relative}"

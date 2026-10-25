@@ -396,7 +396,6 @@ class SerialTurnScheduler:
         attempt_no: int,
         events: tuple[GameEvent, ...],
     ) -> TurnRequest:
-        del seat  # The runtime seat is bound by its session, not model text.
         now = datetime.now(UTC)
         timeout = self._timeout_seconds or 120.0
         observation = Observation(
@@ -419,6 +418,12 @@ class SerialTurnScheduler:
                 )
                 for event in events
             ],
+            payload={
+                "seat": seat,
+                "phase": state.phase.value,
+                "round_no": state.round_no,
+                "day_no": state.day_no,
+            },
         )
         return TurnRequest(
             request_id=request_id,

@@ -38,6 +38,7 @@ from werewolf.knowledge.role import TargetKind, TargetRule, UsageLimit
 from werewolf.knowledge.service import KnowledgeService
 from werewolf.moderator.night_flow import ModeratorNightFlow
 from werewolf.moderator.shell import ModeratorShell
+from werewolf.persistence import GameArchiveStore, GameSnapshotStore
 from werewolf.rules.compiler import validate_execution_package
 from werewolf.rules.models import ExecutionPackage
 from werewolf.runtime.demo_runtime import DemoRuntime
@@ -748,6 +749,243 @@ def _write_source_package(
     }
     execution_path = published_root / "boards" / SOURCE_BOARD_ID / version / "execution.yaml"
     execution_path.write_text(yaml.safe_dump(envelope, sort_keys=False), encoding="utf-8")
+
+
+def _write_declarative_victory_package(published_root: Path) -> None:
+    """Add a new board program and GAME bool state to the temporary source fixture."""
+
+    version = "1.0.0"
+    _write_source_package(
+        published_root,
+        version=version,
+        target_count=1,
+        modes=["strike"],
+    )
+    board_path = published_root / "boards" / SOURCE_BOARD_ID / version / "board.md"
+    board_text = board_path.read_text(encoding="utf-8")
+    sections = board_text.split("---", 2)
+    assert len(sections) == 3
+    board = yaml.safe_load(sections[1])
+    assert isinstance(board, dict)
+    victory = board["victory"]
+    assert isinstance(victory, dict)
+    victory["mode"] = "declarative"
+    victory["program"] = {
+        "player_groups": {
+            SOURCE_ORACLE_ROLE_ID: "pack",
+            SOURCE_CITIZEN_ROLE_ID: "town",
+        },
+        "conditions": [
+            {
+                "condition_id": "wolf-side-ready",
+                "side_id": "wolf",
+                "priority": 12,
+                "when": {
+                    "op": "and",
+                    "values": [
+                        {"op": "game_state", "key": "draw_gate"},
+                        {
+                            "op": "eq",
+                            "left": {"op": "literal", "value": True},
+                            "right": {"op": "literal", "value": True},
+                        },
+                    ],
+                },
+            },
+            {
+                "condition_id": "good-side-ready",
+                "side_id": "good",
+                "priority": 12,
+                "when": {
+                    "op": "and",
+                    "values": [
+                        {"op": "game_state", "key": "draw_gate"},
+                        {
+                            "op": "eq",
+                            "left": {"op": "literal", "value": True},
+                            "right": {"op": "literal", "value": True},
+                        },
+                    ],
+                },
+            },
+        ],
+        "conflict_policy": "DRAW",
+    }
+    encoded_board = yaml.safe_dump(board, allow_unicode=True, sort_keys=False)
+    board_path.write_text(f"---\n{encoded_board}---\n{sections[2].lstrip()}", encoding="utf-8")
+
+    execution_path = published_root / "boards" / SOURCE_BOARD_ID / version / "execution.yaml"
+    execution_document = yaml.safe_load(execution_path.read_text(encoding="utf-8"))
+    assert isinstance(execution_document, dict)
+    execution = execution_document["execution"]
+    assert isinstance(execution, dict)
+    execution["state_declarations"] = [
+        {
+            "skill_id": NOVEL_SKILL_ID,
+            "key": "draw_gate",
+            "value_type": "bool",
+            "initial": True,
+            "scope": "GAME",
+            "expiry_policy": "NEVER",
+        }
+    ]
+    execution_path.write_text(
+        yaml.safe_dump(execution_document, sort_keys=False),
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.asyncio
+async def test_experimental_declarative_draw_runs_through_gateway_and_archives_closed_snapshot(
+    tmp_path: Path,
+) -> None:
+    published_root = tmp_path / "experimental-published"
+    _write_declarative_victory_package(published_root)
+    setup_root = tmp_path / "experimental-play"
+    report = await asyncio.to_thread(
+        build_play_setup,
+        setup_root,
+        all_scripted=True,
+        board_ref=f"{SOURCE_BOARD_ID}@1.0.0",
+        published_root=published_root,
+        project_root=PROJECT_ROOT,
+    )
+    assert report["source_kind"] == "published"
+    shell = ModeratorShell(setup_root / "game.yaml", clock=lambda: GAME_NOW)
+
+    try:
+        await shell.new()
+        assert shell.runtime_bundle is not None
+        assert shell.runtime_bundle.board.victory.mode == "declarative"
+        assert shell.runtime_bundle.package.execution is not None
+        assert shell.runtime_bundle.package.execution.victory_program == (
+            shell.runtime_bundle.board.victory.program
+        )
+        assert shell.runtime_bundle.package.execution_source == "declared"
+
+        await shell.next()
+        await shell.next()
+        await shell.execute("start")
+        assert shell.session_service is not None
+        for _ in shell.state.players:
+            await shell.execute("prepare next")
+        assert all(player.knowledge_receipt_ids for player in shell.state.players.values())
+        assert all(
+            isinstance(runtime, DemoRuntime) and runtime.receipts
+            for runtime in shell.session_service.runtimes.values()
+        )
+
+        await shell.next()
+        assert shell.manager is not None
+        assert shell.state.phase is GamePhase.NIGHT_TEAM_CHAT
+
+        await shell.execute("night open")
+        await shell.execute("night team next")
+        await shell.execute("night advance")
+        assert shell.state.phase is GamePhase.NIGHT_ACTION
+        assert shell.session_service is not None
+        oracle_seat = next(
+            seat
+            for seat, player in shell.state.players.items()
+            if player.role_id == SOURCE_ORACLE_ROLE_ID
+        )
+        oracle_runtime = cast(DemoRuntime, shell.session_service.runtimes[oracle_seat])
+        skill_status = await oracle_runtime._read_skill_status()
+        novel_ability = next(
+            item for item in skill_status["abilities"] if item["skill_id"] == NOVEL_SKILL_ID
+        )
+        assert novel_ability["target_rule"]["max_targets"] == 1
+        assert novel_ability["parameters"][0]["choices"] == ["strike"]
+
+        await shell.execute("night open")
+        action_window = next(
+            ActionWindow.model_validate_json(json.dumps(raw))
+            for raw in shell.state.action_windows.values()
+            if isinstance(raw, dict) and raw.get("phase") == GamePhase.NIGHT_ACTION.value
+        )
+        assert action_window.allowed_seats == (oracle_seat,)
+        assert NOVEL_ACTION_CODE in action_window.allowed_action_codes
+        action_result = await shell.execute(f"night action next {oracle_seat}")
+        assert action_result is not None
+        stored_request = next(
+            payload
+            for payload in shell.state.action_requests.values()
+            if isinstance(payload, dict) and payload.get("seat") == oracle_seat
+        )
+        action = stored_request["actions"][0]
+        assert action["action_code"] == NOVEL_ACTION_CODE
+        assert len(action["targets"]) == 1
+        assert action["parameters"] == {"mode": "strike"}
+        assert oracle_runtime.requests
+
+        await shell.execute("night advance")
+        await shell.execute("night open")
+        await shell.execute("night auto-resolve")
+        assert shell.state.phase is GamePhase.DAY_ANNOUNCE
+        assert shell.state.ability_instances[0].uses_consumed == 1
+        assert shell.state.rule_ledger[0].history_updates[0].targets == tuple(
+            sorted(action["targets"])
+        )
+        confirmed_request = shell.state.action_requests[stored_request["request_id"]]
+        assert confirmed_request["status"] == "CONFIRMED"
+        assert confirmed_request["actions"][0]["action_code"] == NOVEL_ACTION_CODE
+        refreshed_skill_status = await oracle_runtime._read_skill_status()
+        assert any(
+            item["skill_id"] == NOVEL_SKILL_ID for item in refreshed_skill_status["abilities"]
+        )
+
+        checked = await shell.execute("victory night-check")
+        assert checked is not None
+        assert checked["victory"]["status"] == "DRAW"  # type: ignore[index]
+        assert checked["victory"]["winner"] is None  # type: ignore[index]
+        assert shell.state.phase is GamePhase.FINISHED
+        assert shell.state.winner is not None
+        assert shell.state.winner["status"] == "DRAW"
+        assert shell.state.winner["side"] is None
+        assert shell.state.last_snapshot is not None
+
+        snapshot_store = GameSnapshotStore(shell.active_root)
+        snapshot_id = shell.state.last_snapshot["snapshot_id"]
+        victory_snapshot_path = next(
+            path
+            for path in snapshot_store.snapshots_root.iterdir()
+            if json.loads((path / "snapshot_manifest.json").read_text(encoding="utf-8"))[
+                "snapshot_id"
+            ]
+            == snapshot_id
+        )
+        victory_manifest = await snapshot_store.verify(victory_snapshot_path)
+        assert {item.relative_path for item in victory_manifest.files} >= {
+            "state.json",
+            "public.md",
+        }
+        victory_snapshot_state = GameState.model_validate_json(
+            (victory_snapshot_path / "state.json").read_bytes()
+        )
+        assert victory_snapshot_state.phase is GamePhase.FINISHED
+        assert victory_snapshot_state.winner == shell.state.winner
+
+        finished = await shell.finish()
+        archive_store = GameArchiveStore(shell.games_root)
+        archive_path = Path(str(finished["path"]))
+        archive_manifest = await archive_store.verify(archive_path)
+        assert archive_manifest.final_snapshot_id == finished["snapshot_id"]
+        archived_snapshot_path = archive_path / archive_manifest.final_snapshot_path
+        archived_manifest = json.loads(
+            (archived_snapshot_path / "snapshot_manifest.json").read_text(encoding="utf-8")
+        )
+        assert archived_manifest["snapshot_id"] == archive_manifest.final_snapshot_id
+        archived_state = GameState.model_validate_json(
+            (archived_snapshot_path / "state.json").read_bytes()
+        )
+        assert archived_state.phase is GamePhase.FINISHED
+        assert archived_state.run_status.value == "CLOSED"
+        assert archived_state.winner is not None
+        assert archived_state.winner["status"] == "DRAW"
+        assert archived_state.winner["side"] is None
+    finally:
+        if shell.session_service is not None:
+            await shell.session_service.close()
 
 
 @pytest.mark.asyncio

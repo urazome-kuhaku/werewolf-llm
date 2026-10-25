@@ -7,14 +7,16 @@ import hashlib
 import json
 import math
 import shlex
-from collections.abc import Callable, Mapping
+import tempfile
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 import yaml  # type: ignore[import-untyped]
 from pydantic import JsonValue
 
+from werewolf.domain.admission import CatalogAdmission
 from werewolf.domain.enums import GamePhase, RunStatus
 from werewolf.game import (
     ALLOWED_PHASE_TRANSITIONS,
@@ -27,9 +29,10 @@ from werewolf.game import (
     RulesetRef,
 )
 from werewolf.game.actions import load_action_registry
-from werewolf.game.setup import build_role_assignment_plan
+from werewolf.game.setup import PlayerAssignmentPlan, build_role_assignment_plan
 from werewolf.game.victory import evaluate_victory
 from werewolf.knowledge.board import BoardDefinition
+from werewolf.knowledge.catalog import CatalogSelection, CatalogStore
 from werewolf.knowledge.compiled_store import CompiledKnowledgeStore
 from werewolf.knowledge.refs import VersionedRef
 from werewolf.knowledge.runtime_loader import (
@@ -46,7 +49,14 @@ from werewolf.moderator.prepare_flow import PlayerPrepareError, PlayerPrepareFlo
 from werewolf.moderator.sessions import PlayerSessionError, PlayerSessionService
 from werewolf.moderator.sheriff_flow import ModeratorSheriffError, ModeratorSheriffFlow
 from werewolf.moderator.trigger_flow import ModeratorTriggerError, ModeratorTriggerFlow
+from werewolf.persistence import resolve_contained_path
 from werewolf.persistence.archive import GameArchiveStore
+from werewolf.persistence.checkpoint import (
+    PrivateCheckpointIdentity,
+    PrivateCheckpointStore,
+    VerifiedPrivateCheckpoint,
+    load_verified_checkpoint_bundle,
+)
 from werewolf.persistence.snapshot import FrozenRulesetSnapshot, GameSnapshotStore
 
 
@@ -57,6 +67,19 @@ class ModeratorError(RuntimeError):
 CommandInput = Callable[[], str]
 CommandOutput = Callable[[str], None]
 Clock = Callable[[], datetime]
+_T = TypeVar("_T")
+
+
+async def _await_uncancellable(awaitable: Awaitable[_T]) -> _T:
+    """Finish a small cleanup or lease operation before re-raising cancellation."""
+
+    task = asyncio.ensure_future(awaitable)
+    while True:
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.cancelled():
+                raise
 
 
 def _project_root() -> Path:
@@ -300,6 +323,10 @@ class ModeratorShell:
         self.snapshot_store: GameSnapshotStore | None = None
         self.archive_store: GameArchiveStore | None = None
         self.runtime_factory = runtime_factory
+        self.catalog_selection: CatalogSelection | None = None
+        self.catalog_store: CatalogStore | None = None
+        self._catalog_archive_path: Path | None = None
+        self._checkpoint_bundle_tempdir: tempfile.TemporaryDirectory[str] | None = None
         self.session_service: PlayerSessionService | None = None
         self.runtime_bundle: RuntimeKnowledgeBundle | None = None
         self.assignment_plan: object | None = None
@@ -329,6 +356,22 @@ class ModeratorShell:
         board = _mapping(game["board"], "game.board")
         game_id = str(game["game_id"])
         board_ref = VersionedRef.parse(f"{board['id']}@{board['version']}")
+        catalog_selection: CatalogSelection | None = None
+        catalog_store: CatalogStore | None = None
+        selection_raw = config.get("catalog_selection")
+        if selection_raw is not None:
+            if not isinstance(selection_raw, Mapping):
+                raise ModeratorError("configuration.catalog_selection must be an object")
+            try:
+                catalog_selection = CatalogSelection.model_validate(
+                    dict(selection_raw), strict=True
+                )
+                catalog_store = CatalogStore(catalog_selection.catalog_root)
+                if catalog_selection.board_ref != board_ref:
+                    raise ValueError("catalog board reference does not match game.board")
+                await asyncio.to_thread(catalog_store.verify_selection, catalog_selection)
+            except (TypeError, ValueError, OSError) as exc:
+                raise ModeratorError(f"catalog selection is invalid: {exc}") from exc
         root = _project_root()
         compiled_root = _path_option(config, "compiled_root", "compiled", "compiled_store")
         games_root = _path_option(config, "games_root", "games")
@@ -355,6 +398,10 @@ class ModeratorShell:
             raise ModeratorError(
                 f"published compiled ruleset is unavailable or invalid: {board_ref.format()}"
             ) from exc
+        if catalog_selection is not None and (
+            package_load.package_identity != catalog_selection.package_identity
+        ):
+            raise ModeratorError("preview package identity does not match staged catalog entry")
         active.mkdir(parents=True, exist_ok=False)
         (active / "private").mkdir()
         (active / "snapshots").mkdir()
@@ -416,10 +463,23 @@ class ModeratorShell:
                 "source_manifest_sha256",
                 "compiled_manifest_sha256",
                 "candidate_manifest_sha256",
+                "catalog_id",
+                "catalog_board_ref",
+                "catalog_gate_sha256",
+                "catalog_stage_digest",
             ):
                 value = play_setup.get(key)
                 if isinstance(value, (str, int, float, bool)) or value is None:
                     audit[f"play_setup_{key}"] = value
+        if catalog_selection is not None:
+            audit.update(
+                {
+                    "catalog_id": catalog_selection.catalog_id,
+                    "catalog_board_ref": catalog_selection.board_ref.format(),
+                    "catalog_gate_sha256": catalog_selection.gate_sha256,
+                    "catalog_stage_digest": catalog_selection.stage_digest,
+                }
+            )
         state = GameState(
             game_id=game_id,
             created_at=timestamp,
@@ -445,11 +505,14 @@ class ModeratorShell:
             # with the pinned legacy registry; schema two must be executable.
             registry=package.action_registry or load_action_registry(),
             execution_package=package.execution,
+            package_identity=package_load.package_identity,
             legacy_compatibility=(
                 package.execution_source is not None
                 and package.execution_source.startswith("compat:")
             ),
         )
+        self.catalog_selection = catalog_selection
+        self.catalog_store = catalog_store
         return self._status_payload(private=False)
 
     async def start(self) -> dict[str, object]:
@@ -526,20 +589,81 @@ class ModeratorShell:
             runtime_factory=self.runtime_factory,
             state_provider=self.manager.snapshot,
         )
+        manager = self.manager
+        admission: CatalogAdmission | None = None
+        lease_task: asyncio.Task[CatalogAdmission] | None = None
+
+        async def cleanup_failed_start() -> list[str]:
+            cleanup_errors: list[str] = []
+            try:
+                await _await_uncancellable(service.close("start failed"))
+            except Exception:
+                pass
+            if admission is not None and self.catalog_store is not None:
+                try:
+                    if not await _await_uncancellable(
+                        self.catalog_store.cancel_lease(admission, self.state.game_id)
+                    ):
+                        cleanup_errors.append("catalog lease was not cancelled")
+                except Exception as cleanup_exc:
+                    cleanup_errors.append(f"catalog lease cleanup failed: {cleanup_exc}")
+                if manager.state.catalog_admission == admission:
+                    try:
+                        await _await_uncancellable(
+                            manager.clear_catalog_admission(
+                                admission,
+                                expected_revision=manager.state.state_revision,
+                                now=self.clock(),
+                            )
+                        )
+                    except Exception as cleanup_exc:
+                        cleanup_errors.append(f"game catalog binding cleanup failed: {cleanup_exc}")
+            return cleanup_errors
+
         try:
+            if self.catalog_selection is not None:
+                if self.catalog_store is None or self.manager.package_identity is None:
+                    raise ModeratorError(
+                        "catalog admission has no verified store or package identity"
+                    )
+                lease_task = asyncio.create_task(
+                    self.catalog_store.acquire_lease(
+                        selection=self.catalog_selection,
+                        game_id=self.state.game_id,
+                        package_identity=self.manager.package_identity,
+                    )
+                )
+                admission = await asyncio.shield(lease_task)
+                await self.manager.bind_catalog_admission(
+                    admission,
+                    expected_revision=self.state.state_revision,
+                    now=self.clock(),
+                )
             records = await service.start(bundle, configuration, assignment_plan)
             refs = {seat: record.runtime_ref.session_id for seat, record in records.items()}
             await self.manager.commit_game_start(
                 assignment_plan=assignment_plan,
                 session_refs=refs,
                 expected_revision=self.state.state_revision,
+                catalog_admission=admission,
                 now=self.clock(),
             )
+        except asyncio.CancelledError as exc:
+            if admission is None and lease_task is not None:
+                try:
+                    admission = await _await_uncancellable(lease_task)
+                except Exception:
+                    admission = None
+            cleanup_errors = await cleanup_failed_start()
+            if cleanup_errors:
+                exc.add_note("catalog startup cleanup issues: " + "; ".join(cleanup_errors))
+            raise
         except Exception as exc:
-            try:
-                await service.close("start failed")
-            except Exception:
-                pass
+            cleanup_errors = await cleanup_failed_start()
+            if cleanup_errors:
+                raise ModeratorError(
+                    "start failed and catalog cleanup was incomplete: " + "; ".join(cleanup_errors)
+                ) from exc
             if isinstance(exc, ModeratorError):
                 raise
             if isinstance(exc, PlayerSessionError):
@@ -1180,6 +1304,35 @@ class ModeratorShell:
             "requires_moderator": bool(getattr(evaluation, "requires_moderator", False)),
         }
 
+    @staticmethod
+    def _committed_victory_payload(state: GameState) -> dict[str, object]:
+        """Serialize the authoritative result written by the manager."""
+
+        winner = state.winner
+        if not isinstance(winner, Mapping):
+            return {"status": "UNKNOWN", "winner": None, "candidate_sides": []}
+        raw_candidates = winner.get("candidates")
+        candidates = (
+            [
+                {"side": item["side"], "condition": item["condition"]}
+                for item in raw_candidates
+                if isinstance(item, Mapping)
+                and isinstance(item.get("side"), str)
+                and isinstance(item.get("condition"), str)
+            ]
+            if isinstance(raw_candidates, (list, tuple))
+            else []
+        )
+        raw_reasons = winner.get("reasons")
+        return {
+            "status": winner.get("status", "UNKNOWN"),
+            "winner": winner.get("side"),
+            "candidate_sides": list(dict.fromkeys(item["side"] for item in candidates)),
+            "candidates": candidates,
+            "reasons": list(raw_reasons) if isinstance(raw_reasons, (list, tuple)) else [],
+            "requires_moderator": False,
+        }
+
     def _evaluate_victory(self) -> dict[str, object]:
         manager, board = self._require_victory_runtime()
         try:
@@ -1187,6 +1340,7 @@ class ModeratorShell:
                 manager.state,
                 board,
                 role_groups=self._victory_role_groups(),
+                execution_package=manager.execution_package,
             )
         except (TypeError, ValueError) as exc:
             raise ModeratorError(str(exc)) from exc
@@ -1264,10 +1418,11 @@ class ModeratorShell:
                 )
             except (EventCommitError, TypeError, ValueError) as exc:
                 raise ModeratorError(str(exc)) from exc
-            victory = self._evaluate_victory()
-            if committed.winner is not None:
-                victory["status"] = "WINNER"
-                victory["winner"] = committed.winner.get("side")
+            victory = (
+                self._committed_victory_payload(committed)
+                if committed.winner is not None
+                else self._evaluate_victory()
+            )
             payload = self._status_payload(private=False)
             payload["victory"] = victory
             return payload
@@ -1302,13 +1457,11 @@ class ModeratorShell:
         except (EventCommitError, TypeError, ValueError) as exc:
             raise ModeratorError(str(exc)) from exc
 
-        victory = self._evaluate_victory()
-        if committed.winner is not None:
-            # A moderator-resolved PENDING result is now a committed winner;
-            # do not expose the stale pure-evaluation status in the command
-            # response.
-            victory["status"] = "WINNER"
-            victory["winner"] = committed.winner.get("side")
+        victory = (
+            self._committed_victory_payload(committed)
+            if committed.winner is not None
+            else self._evaluate_victory()
+        )
         payload = self._status_payload(private=False)
         payload["victory"] = victory
         return payload
@@ -2002,11 +2155,557 @@ class ModeratorShell:
         except (TypeError, ValueError) as exc:
             raise ModeratorError("frozen ruleset files could not be detached") from exc
 
+    def _checkpoint_paths(self) -> tuple[dict[str, object], Path, Path]:
+        config = self.config if self.config is not None else _load_config(self.config_path)
+        game = _mapping(config.get("game"), "game")
+        game_id = game.get("game_id")
+        board = _mapping(game.get("board"), "game.board")
+        if not isinstance(game_id, str):
+            raise ModeratorError("checkpoint configuration has no game_id")
+        board_ref = VersionedRef.parse(f"{board.get('id')}@{board.get('version')}")
+        project = _project_root()
+        configured_games = _path_option(config, "games_root", "games")
+        games = (project / "games") if configured_games is None else configured_games
+        if not games.is_absolute():
+            games = (self.config_path.parent / games).resolve()
+        else:
+            games = games.resolve()
+        active = games / "active" / game_id
+        if active.is_symlink() or not active.is_dir():
+            raise ModeratorError("checkpoint requires an existing regular active game directory")
+        if board_ref.format() != f"{board.get('id')}@{board.get('version')}":
+            raise ModeratorError("checkpoint board reference is not canonical")
+        return config, games, active
+
+    async def _checkpoint_assets(
+        self,
+    ) -> tuple[
+        dict[str, object],
+        Path,
+        Path,
+        KnowledgeSnapshot,
+        RuntimeKnowledgeBundle,
+        Mapping[str, object],
+        dict[str, bytes],
+        PrivateCheckpointIdentity,
+    ]:
+        config, games, active = self._checkpoint_paths()
+        game = _mapping(config.get("game"), "game")
+        board = _mapping(game.get("board"), "game.board")
+        game_id = game.get("game_id")
+        assert isinstance(game_id, str)
+        board_ref = VersionedRef.parse(f"{board['id']}@{board['version']}")
+        builder = KnowledgeSnapshotBuilder.from_game_root(
+            CompiledKnowledgeStore(games / ".compiled-store-not-used-for-recovery"),
+            active,
+            game_id=game_id,
+        )
+        try:
+            snapshot = await builder.load(game_id)
+            bundle = await load_runtime_knowledge_bundle_from_snapshot(snapshot)
+        except Exception as exc:
+            raise ModeratorError("frozen checkpoint ruleset could not be verified") from exc
+        if (
+            snapshot.game_id != game_id
+            or snapshot.board_ref != board_ref
+            or bundle.package.execution is None
+            or bundle.package.action_registry is None
+            or bundle.package.package_identity != snapshot.package_identity
+        ):
+            raise ModeratorError("frozen checkpoint ruleset does not match configuration")
+        frozen_files: dict[str, bytes] = {}
+        root = snapshot.root.resolve(strict=True)
+        for relative, expected_digest in sorted(snapshot.file_digests.items()):
+            candidate = snapshot.root / relative
+            if candidate.is_symlink() or not candidate.is_file():
+                raise ModeratorError(
+                    f"frozen checkpoint artifact is not a regular file: {relative}"
+                )
+            try:
+                resolved = candidate.resolve(strict=True)
+                resolved.relative_to(root)
+                content = resolved.read_bytes()
+            except (OSError, ValueError) as exc:
+                raise ModeratorError("frozen checkpoint artifact escaped its ruleset") from exc
+            if hashlib.sha256(content).hexdigest() != expected_digest:
+                raise ModeratorError(f"frozen checkpoint artifact hash mismatch: {relative}")
+            frozen_files[relative] = content
+        manifest_path = snapshot.root / "snapshot.json"
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            raise ModeratorError("frozen checkpoint snapshot manifest is unavailable")
+        try:
+            manifest_value = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ModeratorError("frozen checkpoint snapshot manifest is invalid") from exc
+        if not isinstance(manifest_value, Mapping):
+            raise ModeratorError("frozen checkpoint snapshot manifest is invalid")
+        execution_bytes = frozen_files.get("execution.json")
+        execution = bundle.package.execution
+        state_identity = self.manager.state.execution_identity if self.manager is not None else None
+        if execution_bytes is None or execution is None:
+            raise ModeratorError("frozen checkpoint execution artifact is missing")
+        try:
+            execution_payload = json.loads(execution_bytes)
+            execution_digest = hashlib.sha256(
+                json.dumps(
+                    execution_payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    allow_nan=False,
+                ).encode("utf-8")
+            ).hexdigest()
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ModeratorError("frozen checkpoint execution artifact is invalid") from exc
+        if state_identity is not None and state_identity.package_id != execution.package_id:
+            raise ModeratorError("checkpoint execution package differs from the active manager")
+        identity = PrivateCheckpointIdentity(
+            game_id=game_id,
+            board_ref=snapshot.board_ref.format(),
+            package_id=snapshot.package_id,
+            execution_package_id=execution.package_id,
+            execution_digest=execution_digest,
+            package_identity=snapshot.package_identity,
+        )
+        return (
+            config,
+            games,
+            active,
+            snapshot,
+            bundle,
+            dict(manifest_value),
+            frozen_files,
+            identity,
+        )
+
+    async def _assert_checkpoint_not_rolled_back(
+        self,
+        *,
+        games: Path,
+        active: Path,
+        checkpoint: VerifiedPrivateCheckpoint,
+    ) -> None:
+        state = checkpoint.state
+        checkpoint_revision = state.state_revision
+        snapshot_store = GameSnapshotStore(active)
+        snapshots_root = active / "snapshots"
+        if snapshots_root.is_symlink() or not snapshots_root.is_dir():
+            raise ModeratorError("public snapshot directory is unavailable or unsafe")
+        for path in sorted(snapshots_root.iterdir()):
+            if path.is_symlink() or not path.is_dir():
+                raise ModeratorError("public snapshot directory contains an unsafe entry")
+            try:
+                manifest = await snapshot_store.verify(path)
+                snapshot_state = GameState.model_validate_json((path / "state.json").read_bytes())
+            except Exception as exc:
+                raise ModeratorError("a public snapshot failed rollback verification") from exc
+            if manifest.game_id != state.game_id or snapshot_state.game_id != state.game_id:
+                raise ModeratorError("a public snapshot belongs to a different game")
+            if (
+                manifest.state_revision >= checkpoint_revision
+                or snapshot_state.phase is GamePhase.FINISHED
+                or snapshot_state.run_status is RunStatus.CLOSED
+            ):
+                raise ModeratorError(
+                    "a newer public snapshot or finished game blocks checkpoint replay"
+                )
+
+        active_state_path = active / "state.json"
+        if active_state_path.exists() or active_state_path.is_symlink():
+            if active_state_path.is_symlink() or not active_state_path.is_file():
+                raise ModeratorError("active public state projection is unsafe")
+            try:
+                active_state = GameState.model_validate_json(active_state_path.read_bytes())
+            except Exception as exc:
+                raise ModeratorError("active public state projection is invalid") from exc
+            if active_state.game_id != state.game_id:
+                raise ModeratorError("active public state belongs to another game")
+            if (
+                active_state.state_revision > checkpoint_revision
+                or active_state.phase is GamePhase.FINISHED
+                or active_state.run_status is RunStatus.CLOSED
+            ):
+                raise ModeratorError("active public state blocks checkpoint replay")
+
+        archive_store = GameArchiveStore(games)
+        archive_root = archive_store.archive_root
+        if archive_root.exists() or archive_root.is_symlink():
+            if archive_root.is_symlink() or not archive_root.is_dir():
+                raise ModeratorError("archive root is unsafe")
+            for path in sorted(archive_root.iterdir()):
+                if path.is_symlink() or not path.is_dir():
+                    raise ModeratorError("archive root contains an unsafe entry")
+                try:
+                    archive_manifest = await archive_store.verify(path)
+                except Exception as exc:
+                    raise ModeratorError("an archive failed rollback verification") from exc
+                if archive_manifest.game_id != state.game_id:
+                    continue
+                final_state_path = path / archive_manifest.final_snapshot_path / "state.json"
+                try:
+                    final_state = GameState.model_validate_json(final_state_path.read_bytes())
+                except Exception as exc:
+                    raise ModeratorError("the archived final state is invalid") from exc
+                if (
+                    archive_manifest.final_state_revision >= checkpoint_revision
+                    or final_state.phase is GamePhase.FINISHED
+                    or final_state.run_status is RunStatus.CLOSED
+                ):
+                    raise ModeratorError("a verified final archive blocks checkpoint replay")
+
+    async def checkpoint_save(self) -> dict[str, object]:
+        if self.manager is None or self.session_service is None or self.active_root is None:
+            raise ModeratorError("checkpoint save requires an active manager and player sessions")
+        try:
+            (
+                _config,
+                _games,
+                active,
+                _snapshot,
+                _bundle,
+                snapshot_manifest,
+                frozen_files,
+                identity,
+            ) = await self._checkpoint_assets()
+            verified = await PrivateCheckpointStore(active).create(
+                self.state,
+                manager=self.manager,
+                knowledge_snapshot_manifest=snapshot_manifest,
+                frozen_files=frozen_files,
+                identity=identity,
+                created_at=self.clock().astimezone(UTC).isoformat().replace("+00:00", "Z"),
+            )
+        except Exception as exc:
+            if isinstance(exc, ModeratorError):
+                raise
+            raise ModeratorError("private checkpoint could not be created") from exc
+        return {
+            "status": "saved",
+            "game_id": identity.game_id,
+            "checkpoint_id": verified.manifest.checkpoint_id,
+            "state_revision": verified.state.state_revision,
+            "path": str(verified.path),
+        }
+
+    async def checkpoint_verify(self, selector: str) -> dict[str, object]:
+        try:
+            (
+                _config,
+                games,
+                active,
+                _snapshot,
+                _bundle,
+                _manifest,
+                _files,
+                identity,
+            ) = await self._checkpoint_assets()
+            verified = await PrivateCheckpointStore(active).verify(
+                selector,
+                expected_identity=identity,
+            )
+            await self._assert_checkpoint_not_rolled_back(
+                games=games,
+                active=active,
+                checkpoint=verified,
+            )
+        except Exception as exc:
+            if isinstance(exc, ModeratorError):
+                raise
+            raise ModeratorError("private checkpoint verification failed") from exc
+        return {
+            "status": "verified",
+            "game_id": identity.game_id,
+            "checkpoint_id": verified.manifest.checkpoint_id,
+            "state_revision": verified.state.state_revision,
+            "board_ref": identity.board_ref,
+            "execution_package_id": identity.execution_package_id,
+        }
+
+    async def checkpoint_cleanup(self) -> dict[str, object]:
+        _config, _games, active = self._checkpoint_paths()
+        try:
+            removed = await PrivateCheckpointStore(active).cleanup_temp()
+        except Exception as exc:
+            raise ModeratorError(
+                "abandoned checkpoint staging entries could not be cleaned"
+            ) from exc
+        return {"status": "cleaned", "removed": list(removed)}
+
+    async def checkpoint_restore(self, selector: str) -> dict[str, object]:
+        if self.manager is not None or self.session_service is not None:
+            raise ModeratorError("checkpoint restore requires an unloaded moderator process")
+        current_temp = getattr(self, "_checkpoint_bundle_tempdir", None)
+        if current_temp is not None:
+            raise ModeratorError("checkpoint restore staging is already owned by this process")
+        service: PlayerSessionService | None = None
+        temporary: tempfile.TemporaryDirectory[str] | None = None
+        recovered_catalog_selection: CatalogSelection | None = None
+        recovered_catalog_store: CatalogStore | None = None
+        try:
+            (
+                config,
+                games,
+                active,
+                _live_snapshot,
+                _live_bundle,
+                _manifest,
+                _files,
+                identity,
+            ) = await self._checkpoint_assets()
+            verified = await PrivateCheckpointStore(active).verify(
+                selector,
+                expected_identity=identity,
+            )
+            await self._assert_checkpoint_not_rolled_back(
+                games=games,
+                active=active,
+                checkpoint=verified,
+            )
+            temporary = tempfile.TemporaryDirectory(prefix="werewolf-checkpoint-bundle-")
+            detached_snapshot, bundle = await load_verified_checkpoint_bundle(
+                verified,
+                temporary.name,
+            )
+            admission = verified.state.catalog_admission
+            selection_raw = config.get("catalog_selection")
+            if admission is None:
+                if selection_raw is not None:
+                    raise ModeratorError(
+                        "checkpoint has no catalog admission for its configured selection"
+                    )
+            else:
+                if not isinstance(selection_raw, Mapping):
+                    raise ModeratorError(
+                        "checkpoint catalog admission has no configured catalog selection"
+                    )
+                try:
+                    recovered_catalog_selection = CatalogSelection.model_validate(
+                        dict(selection_raw), strict=True
+                    )
+                    admission.validate_for_game(verified.state.game_id)
+                except (TypeError, ValueError) as exc:
+                    raise ModeratorError("checkpoint catalog identity is invalid") from exc
+                if (
+                    recovered_catalog_selection.catalog_id != admission.catalog_id
+                    or recovered_catalog_selection.board_ref.format() != identity.board_ref
+                    or f"{admission.board_id}@{admission.board_version}" != identity.board_ref
+                    or recovered_catalog_selection.package_identity != identity.package_identity
+                    or admission.package_identity != identity.package_identity
+                    or recovered_catalog_selection.gate_sha256 != admission.gate_sha256
+                ):
+                    raise ModeratorError(
+                        "checkpoint catalog selection differs from its frozen admission"
+                    )
+                recovered_catalog_store = recovered_catalog_selection.store()
+                if recovered_catalog_store.catalog_id != admission.catalog_id:
+                    raise ModeratorError(
+                        "configured catalog root differs from the admitted catalog identity"
+                    )
+            execution = bundle.package.execution
+            registry = bundle.package.action_registry
+            if execution is None or registry is None:
+                raise ModeratorError("checkpoint package is not executable")
+            manager = GameManager(
+                verified.state,
+                registry=registry,
+                execution_package=execution,
+                legacy_compatibility=(
+                    bundle.package.execution_source is not None
+                    and bundle.package.execution_source.startswith("compat:")
+                ),
+                package_identity=bundle.package.package_identity,
+            )
+            await manager.assert_private_checkpoint_waiting_choice(manager.state)
+            await manager.rotate_recovered_session_epochs(
+                expected_revision=manager.state.state_revision,
+                now=self.clock(),
+            )
+            recovered_state = manager.state
+            if recovered_state.rng is None:
+                raise ModeratorError("checkpoint state has no deterministic role seed")
+            configuration = parse_player_configuration(
+                config,
+                board=bundle.board,
+                game_root=active,
+                game_id=recovered_state.game_id,
+                allow_scripted=True,
+            )
+            seats = tuple(sorted(recovered_state.players))
+            if tuple(player.seat for player in configuration.players) != seats:
+                raise ModeratorError("checkpoint seat roster differs from player configuration")
+            assignments = PlayerAssignmentPlan(
+                board_ref=bundle.board.board_ref,
+                seed=recovered_state.rng.seed,
+                seats=seats,
+                players={
+                    seat: recovered_state.players[seat].model_copy(
+                        update={"runtime_ref": None, "current_request_id": None}
+                    )
+                    for seat in seats
+                },
+            )
+            service = PlayerSessionService(
+                runtime_factory=self.runtime_factory,
+                state_provider=manager.snapshot,
+            )
+            records = await service.start(bundle, configuration, assignments)
+            refs = {seat: record.runtime_ref.session_id for seat, record in records.items()}
+            await manager.bind_recovered_session_refs(
+                refs,
+                expected_revision=manager.state.state_revision,
+                now=self.clock(),
+            )
+        except (Exception, asyncio.CancelledError) as exc:
+            if service is not None:
+                close_task = asyncio.create_task(service.close("checkpoint restore failed"))
+                while not close_task.done():
+                    try:
+                        await asyncio.shield(close_task)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                if close_task.done() and not close_task.cancelled():
+                    try:
+                        close_task.exception()
+                    except BaseException:
+                        pass
+            if temporary is not None:
+                try:
+                    temporary.cleanup()
+                except BaseException:
+                    pass
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            if isinstance(exc, ModeratorError):
+                raise
+            raise ModeratorError("private checkpoint restore failed") from exc
+
+        assert temporary is not None
+        assert service is not None
+        self.config = config
+        self.games_root = games
+        self.active_root = active
+        self.ruleset_snapshot = detached_snapshot
+        self.runtime_bundle = bundle
+        self.manager = manager
+        self.assignment_plan = assignments
+        self.session_refs = dict(refs)
+        self.session_service = service
+        self.catalog_selection = recovered_catalog_selection
+        self.catalog_store = recovered_catalog_store
+        self.snapshot_store = GameSnapshotStore(active)
+        self.archive_store = GameArchiveStore(games)
+        self._schema_one_manual_compat = False
+        self._day_flow = None
+        self._night_flow = None
+        self._prepare_flow = None
+        self._last_words_flow = None
+        self._sheriff_flow = None
+        self._badge_flow = None
+        self._trigger_flow = None
+        self._checkpoint_bundle_tempdir = temporary
+        return {
+            "status": "restored",
+            "game_id": manager.state.game_id,
+            "checkpoint_id": verified.manifest.checkpoint_id,
+            "state_revision": manager.state.state_revision,
+            "session_epochs": {
+                str(seat): player.session_epoch
+                for seat, player in sorted(manager.state.players.items())
+            },
+        }
+
+    async def _verify_catalog_archive_and_release(
+        self,
+        archive_path: Path,
+        admission: CatalogAdmission,
+    ) -> tuple[str, str, int]:
+        if self.archive_store is None or self.catalog_store is None or self.manager is None:
+            raise ModeratorError("catalog finish has no archive store, catalog, or manager")
+        try:
+            manifest = await self.archive_store.verify(archive_path)
+            if manifest.game_id != self.state.game_id:
+                raise ValueError("archive belongs to a different game")
+            final_snapshot_path = resolve_contained_path(archive_path, manifest.final_snapshot_path)
+            snapshot_manifest = await GameSnapshotStore(archive_path).verify(final_snapshot_path)
+            snapshot_state_path = resolve_contained_path(final_snapshot_path, "state.json")
+            snapshot_state = GameState.model_validate_json(
+                await asyncio.to_thread(snapshot_state_path.read_bytes)
+            )
+            archive_state = GameState.model_validate_json(
+                await asyncio.to_thread((archive_path / "state.json").read_bytes)
+            )
+        except Exception as exc:
+            raise ModeratorError(
+                "catalog finish archive or final snapshot failed verification"
+            ) from exc
+        live_state = self.state
+        if (
+            manifest.archive_id != archive_path.name
+            or manifest.final_snapshot_id != snapshot_manifest.snapshot_id
+            or manifest.final_snapshot_manifest_sha256 != snapshot_manifest.manifest_sha256
+            or manifest.final_state_revision != snapshot_manifest.state_revision
+            or snapshot_state.game_id != live_state.game_id
+            or snapshot_state.phase is not GamePhase.FINISHED
+            or snapshot_state.run_status is not RunStatus.CLOSED
+            or snapshot_state.catalog_admission != admission
+            or archive_state.game_id != live_state.game_id
+            or archive_state.phase is not GamePhase.FINISHED
+            or archive_state.run_status is not RunStatus.CLOSED
+            or archive_state.catalog_admission != admission
+            or archive_state.state_revision != live_state.state_revision
+            or archive_state.execution_identity != live_state.execution_identity
+            or live_state.catalog_admission != admission
+            or self.manager.package_identity != admission.package_identity
+        ):
+            raise ModeratorError("catalog finish evidence does not match the live game admission")
+        released = await self.catalog_store.close_lease_after_archive(
+            admission,
+            live_state.game_id,
+            archive_id=manifest.archive_id,
+            snapshot_id=manifest.final_snapshot_id,
+            final_state_revision=manifest.final_state_revision,
+        )
+        if not released:
+            raise ModeratorError("catalog lease does not match the verified final archive")
+        return manifest.archive_id, manifest.final_snapshot_id, manifest.final_state_revision
+
+    async def _find_catalog_archive(
+        self,
+        admission: CatalogAdmission,
+    ) -> tuple[Path, str, str]:
+        if self.archive_store is None:
+            raise ModeratorError("catalog finish has no archive store")
+        candidates = sorted(self.archive_store.archive_root.glob(f"*_{self.state.game_id}"))
+        for candidate in candidates:
+            if candidate.is_symlink() or not candidate.is_dir():
+                continue
+            try:
+                archive_id, snapshot_id, _ = await self._verify_catalog_archive_and_release(
+                    candidate, admission
+                )
+            except ModeratorError:
+                continue
+            return candidate, archive_id, snapshot_id
+        raise ModeratorError("no verified closed archive matches the catalog admission")
+
     async def finish(self) -> dict[str, object]:
         if self.state.phase is not GamePhase.FINISHED:
             raise ModeratorError("finish requires the FINISHED phase; use next after victory check")
         if self.state.run_status is RunStatus.CLOSED:
-            raise ModeratorError("game is already closed")
+            admission = self.state.catalog_admission
+            if admission is None:
+                raise ModeratorError("game is already closed")
+            archive_path, archive_id, snapshot_id = await self._find_catalog_archive(admission)
+            self._catalog_archive_path = archive_path
+            return {
+                "status": "finished",
+                "game_id": self.state.game_id,
+                "archive_id": archive_id,
+                "path": str(archive_path),
+                "snapshot_id": snapshot_id,
+            }
         previous_status = self.state.run_status
         await self._set_run_status(
             RunStatus.CLOSED,
@@ -2026,6 +2725,11 @@ class ModeratorShell:
             if not isinstance(snapshot_path, str):
                 raise ModeratorError("save did not return a snapshot path")
             archive = await self.archive_store.finish(self.active_root, snapshot_path)
+            self._catalog_archive_path = archive.path
+            if self.state.catalog_admission is not None:
+                await self._verify_catalog_archive_and_release(
+                    archive.path, self.state.catalog_admission
+                )
         except Exception as exc:
             if self.manager is not None:
                 try:

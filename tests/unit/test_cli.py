@@ -64,6 +64,30 @@ def test_json_report_is_ascii_safe_and_preserves_unicode_values() -> None:
     assert json.loads(serialized) == report
 
 
+def test_checkpoint_verify_cli_uses_the_readonly_adapter(tmp_path: Path, monkeypatch) -> None:
+    expected = {
+        "status": "verified",
+        "game_id": "game-1",
+        "checkpoint_id": "checkpoint-1",
+    }
+    calls: list[tuple[str, str]] = []
+
+    def verify(config_path: str | Path, selector: str) -> dict[str, object]:
+        calls.append((str(config_path), selector))
+        return expected
+
+    monkeypatch.setattr("werewolf.cli.verify_private_checkpoint", verify)
+    config_path = tmp_path / "game.yaml"
+    result = runner.invoke(
+        app,
+        ["checkpoint", "verify", "--config", str(config_path), "checkpoint-1"],
+    )
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout) == expected
+    assert calls == [(str(config_path), "checkpoint-1")]
+
+
 def test_config_validate_accepts_v1_configuration() -> None:
     result = runner.invoke(app, ["config", "validate", "config/game.example.yaml"])
 

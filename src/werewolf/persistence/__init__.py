@@ -47,6 +47,22 @@ _ARCHIVE_EXPORTS = {
     "RecoveryAssessment",
 }
 
+_CHECKPOINT_EXPORTS = {
+    "CHECKPOINT_DIRECTORY",
+    "CHECKPOINT_MANIFEST_FILENAME",
+    "CHECKPOINT_PAYLOAD_FILENAME",
+    "CHECKPOINT_SCHEMA_VERSION",
+    "CorruptPrivateCheckpointError",
+    "MAX_CHECKPOINT_BYTES",
+    "PrivateCheckpointBoundaryError",
+    "PrivateCheckpointError",
+    "PrivateCheckpointIdentity",
+    "PrivateCheckpointIdentityError",
+    "PrivateCheckpointManifest",
+    "PrivateCheckpointStore",
+    "VerifiedPrivateCheckpoint",
+}
+
 
 def __getattr__(name: str) -> object:
     """Load snapshot types lazily to keep atomic imports cycle-free.
@@ -60,6 +76,8 @@ def __getattr__(name: str) -> object:
         return getattr(import_module(".snapshot", __name__), name)
     if name in _ARCHIVE_EXPORTS:
         return getattr(import_module(".archive", __name__), name)
+    if name in _CHECKPOINT_EXPORTS:
+        return getattr(import_module(".checkpoint", __name__), name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -100,4 +118,17 @@ __all__ = [
     "GameArchiveService",
     "GameArchiveStore",
     "RecoveryAssessment",
+    "CHECKPOINT_DIRECTORY",
+    "CHECKPOINT_MANIFEST_FILENAME",
+    "CHECKPOINT_PAYLOAD_FILENAME",
+    "CHECKPOINT_SCHEMA_VERSION",
+    "CorruptPrivateCheckpointError",
+    "MAX_CHECKPOINT_BYTES",
+    "PrivateCheckpointBoundaryError",
+    "PrivateCheckpointError",
+    "PrivateCheckpointIdentity",
+    "PrivateCheckpointIdentityError",
+    "PrivateCheckpointManifest",
+    "PrivateCheckpointStore",
+    "VerifiedPrivateCheckpoint",
 ]

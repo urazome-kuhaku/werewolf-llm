@@ -1,0 +1,14 @@
+schema_version: 1
+scenario_id: quasar-command-assert-missing-seat
+board_ref: quasar_echo_lab@1.0.0
+mode: COMMAND
+steps:
+  - kind: HOST_COMMAND
+    step_id: create
+    command: NEW
+  - kind: ASSERT
+    step_id: missing-seat-is-not-false
+    field: alive
+    operator: NE
+    expected: false
+    seat: 9
