@@ -163,6 +163,7 @@ def _game_config(
     source_kind: str,
     source_digest: str,
     candidate_status: str | None,
+    catalog_selection: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     pi_set = set(pi_seats)
     players: list[dict[str, object]] = []
@@ -183,7 +184,7 @@ def _game_config(
     if candidate_status is not None:
         setup["candidate_status"] = candidate_status
         setup["source_manifest_sha256"] = source_digest
-    return {
+    result: dict[str, object] = {
         "schema_version": 1,
         "play_setup": setup,
         "game": {
@@ -195,6 +196,9 @@ def _game_config(
         "paths": {"compiled_root": "preview/compiled", "games_root": "games"},
         "players": players,
     }
+    if catalog_selection is not None:
+        result["catalog_selection"] = dict(catalog_selection)
+    return result
 
 
 async def _compile_source(
@@ -250,6 +254,7 @@ async def _build(
     workbench: Path | None,
     published_root: Path | None,
     compiled_root: Path | None,
+    catalog_selection: Mapping[str, object] | None,
 ) -> dict[str, object]:
     output = output.expanduser().resolve()
     if output.exists() or output.is_symlink():
@@ -259,6 +264,10 @@ async def _build(
         published_root is not None,
         compiled_root is not None,
     ]
+    if catalog_selection is not None and (workbench is not None or published_root is not None):
+        raise PlaySetupError("catalog selection cannot be combined with another rules source")
+    if catalog_selection is not None and compiled_root is None:
+        raise PlaySetupError("catalog selection requires its staged compiled package root")
     if sum(selected_sources) > 1:
         raise PlaySetupError(
             "choose only one source: --workbench, --published-root, or --compiled-root"
@@ -373,9 +382,21 @@ async def _build(
                 raise PlaySetupError(
                     "workbench manifest dependency list does not match the loaded package"
                 )
-        is_candidate = manifest is not None
+        is_candidate = manifest is not None or catalog_selection is not None
         setup_status = "EXPERIMENTAL_CANDIDATE" if is_candidate else "FROZEN_RULESET_PREVIEW"
-        candidate_status = str(manifest["status"]) if manifest is not None else None
+        candidate_status = (
+            str(manifest["status"])
+            if manifest is not None
+            else "CANDIDATE_PENDING_HUMAN_REVIEW"
+            if catalog_selection is not None
+            else None
+        )
+        if catalog_selection is not None:
+            selected_stage_digest = catalog_selection.get("stage_digest")
+            if not isinstance(selected_stage_digest, str) or len(selected_stage_digest) != 64:
+                raise PlaySetupError("catalog selection has an invalid stage digest")
+            source_kind = "catalog"
+            source_digest = selected_stage_digest
         config = _game_config(
             game_id=game_id,
             seed=seed,
@@ -389,6 +410,7 @@ async def _build(
             source_kind=source_kind,
             source_digest=source_digest,
             candidate_status=candidate_status,
+            catalog_selection=catalog_selection,
         )
         _write_text(
             staging / "game.yaml",
@@ -450,6 +472,7 @@ def build_play_setup(
     workbench: str | Path | None = None,
     published_root: str | Path | None = None,
     compiled_root: str | Path | None = None,
+    catalog_selection: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Build one isolated preview package from a pinned ruleset source."""
 
@@ -475,6 +498,7 @@ def build_play_setup(
             workbench=Path(workbench) if workbench is not None else None,
             published_root=Path(published_root) if published_root is not None else None,
             compiled_root=Path(compiled_root) if compiled_root is not None else None,
+            catalog_selection=catalog_selection,
         )
     )
 

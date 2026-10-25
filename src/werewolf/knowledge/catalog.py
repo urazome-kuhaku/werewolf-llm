@@ -221,6 +221,23 @@ def _copy_file(source: Path, target: Path) -> None:
     shutil.copyfile(source, target)
 
 
+def _write_bytes(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+
+
+def _draft_file_inventory(draft: Path) -> set[str]:
+    if draft.is_symlink() or not draft.is_dir():
+        raise CatalogError("candidate draft must be a regular directory")
+    result: set[str] = set()
+    for item in draft.rglob("*"):
+        if item.is_symlink():
+            raise CatalogError("candidate closure must not contain symlinks")
+        if item.is_file():
+            result.add(item.relative_to(draft).as_posix())
+    return result
+
+
 class CatalogStore:
     """A local, hash-verified registry of immutable candidate packages."""
 
@@ -251,7 +268,10 @@ class CatalogStore:
         """Validate, compile, and atomically stage one complete candidate closure."""
 
         ref = board_ref if isinstance(board_ref, VersionedRef) else VersionedRef.parse(board_ref)
-        workbench = Path(workbench_root).expanduser().resolve()
+        supplied_workbench = Path(workbench_root).expanduser()
+        if supplied_workbench.is_symlink():
+            raise CatalogError("candidate workbench root must not be a symlink")
+        workbench = supplied_workbench.resolve()
         try:
             manifest, source_manifest_sha, draft = await asyncio.to_thread(
                 _validate_manifest,
@@ -294,12 +314,17 @@ class CatalogStore:
         scenario_records: list[dict[str, str]] = []
         scenario_source_by_id: dict[str, tuple[Path, bytes, str]] = {}
         for supplied_path in scenarios:
-            path = Path(supplied_path).expanduser().resolve()
-            if path.is_symlink() or not path.is_file():
+            scenario_source = Path(supplied_path).expanduser()
+            if scenario_source.is_symlink():
+                raise CatalogError("scenario paths must be regular files")
+            path = scenario_source.resolve()
+            if not path.is_file():
                 raise CatalogError("scenario paths must be regular files")
             try:
-                definition = load_scenario(path)
-                data = path.read_bytes()
+                definition, data = await asyncio.gather(
+                    asyncio.to_thread(load_scenario, path),
+                    asyncio.to_thread(path.read_bytes),
+                )
             except (OSError, ScenarioError) as exc:
                 raise CatalogError(f"catalog scenario is invalid: {path.name}") from exc
             if definition.board_ref != ref.format():

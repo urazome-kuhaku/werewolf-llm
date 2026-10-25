@@ -90,7 +90,9 @@ def project_skill_status(
         action_registry=action_registry,
     )
 
-    mask_first_night_death = should_mask_unannounced_first_night_death(state, seat)
+    mask_first_night_death = should_mask_unannounced_first_night_death(
+        state, seat, execution_package=execution_package
+    )
     return {
         "game_id": state_game_id,
         "phase": getattr(state.phase, "value", state.phase),

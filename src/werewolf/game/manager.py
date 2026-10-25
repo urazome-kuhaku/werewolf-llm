@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Literal, cast
 
 from pydantic import JsonValue
 
+from werewolf.domain.admission import CatalogAdmission
 from werewolf.domain.enums import Channel, GamePhase, RunStatus
 from werewolf.knowledge.board import BoardDefinition
 from werewolf.knowledge.preview import experimental_preview_enabled
@@ -913,6 +914,7 @@ def _authoritative_vote_window(
     window: VoteWindow,
     *,
     allow_first_day_sheriff_participants: bool = False,
+    execution_package: ExecutionPackage | None = None,
 ) -> VoteWindow:
     """Check a proposed window against current player facts.
 
@@ -932,7 +934,11 @@ def _authoritative_vote_window(
     sheriff_exception = allow_first_day_sheriff_participants and is_first_day_sheriff_boundary(
         state
     )
-    sheriff_participants = first_day_sheriff_participants(state) if sheriff_exception else ()
+    sheriff_participants = (
+        first_day_sheriff_participants(state, execution_package=execution_package)
+        if sheriff_exception
+        else ()
+    )
     for seat in window.eligible_voters:
         player = state.players.get(seat)
         if player is None:
@@ -965,6 +971,7 @@ def _authoritative_vote_request(
     request: VoteRequest,
     *,
     allow_first_day_sheriff_participants: bool = False,
+    execution_package: ExecutionPackage | None = None,
 ) -> None:
     """Recheck mutable player authorization before invoking ``VoteState``."""
 
@@ -976,7 +983,11 @@ def _authoritative_vote_request(
     sheriff_exception = allow_first_day_sheriff_participants and is_first_day_sheriff_boundary(
         state
     )
-    sheriff_participants = first_day_sheriff_participants(state) if sheriff_exception else ()
+    sheriff_participants = (
+        first_day_sheriff_participants(state, execution_package=execution_package)
+        if sheriff_exception
+        else ()
+    )
     if request.seat not in sheriff_participants and (not player.alive or not player.can_vote):
         raise VoteError("SEAT_NOT_ELIGIBLE", "player is dead or has no voting right")
     expected = vote_state.window.expected_request_ids.get(request.seat)
@@ -2129,6 +2140,7 @@ class GameManager:
         *,
         registry: ActionRegistry,
         execution_package: ExecutionPackage | None = None,
+        package_identity: str | None = None,
         legacy_compatibility: bool = False,
     ) -> None:
         if not isinstance(state, GameState):
@@ -2137,6 +2149,11 @@ class GameManager:
             raise TypeError("registry must be an ActionRegistry")
         if type(legacy_compatibility) is not bool:
             raise TypeError("legacy_compatibility must be a bool")
+        if package_identity is not None and (
+            len(package_identity) != 64
+            or any(character not in "0123456789abcdef" for character in package_identity)
+        ):
+            raise ValueError("package_identity must be a lowercase SHA-256 digest")
         if legacy_compatibility and execution_package is None:
             raise ValueError("legacy compatibility scheduling requires a frozen execution package")
         if state.execution_identity is not None and execution_package is None:
@@ -2184,9 +2201,16 @@ class GameManager:
                     )
                 )
                 state = GameState.model_validate(migrated_data)
+        if state.catalog_admission is not None:
+            self._validate_catalog_admission_value(
+                state,
+                state.catalog_admission,
+                package_identity=package_identity,
+            )
         self._state = state
         self._registry = registry
         self._execution_package = execution_package
+        self._package_identity = package_identity
         self._legacy_compatibility = legacy_compatibility
         self._rules = (
             RuleExecutionAdapter(
@@ -2212,6 +2236,12 @@ class GameManager:
         return self._execution_package
 
     @property
+    def package_identity(self) -> str | None:
+        """Return the frozen compiled knowledge package digest, when supplied."""
+
+        return self._package_identity
+
+    @property
     def legacy_compatibility(self) -> bool:
         """Whether this snapshot uses its audited pre-schema-two scheduler."""
 
@@ -2222,6 +2252,120 @@ class GameManager:
         """Return the current immutable state reference."""
 
         return self._state
+
+    @staticmethod
+    def _validate_catalog_admission_value(
+        state: GameState,
+        admission: CatalogAdmission,
+        *,
+        package_identity: str | None,
+    ) -> None:
+        if not isinstance(admission, CatalogAdmission):
+            raise EventCommitError("CATALOG_ADMISSION_INVALID: admission is malformed")
+        try:
+            admission.validate_for_game(state.game_id)
+        except ValueError as exc:
+            raise EventCommitError("CATALOG_ADMISSION_INVALID: game identity differs") from exc
+        if (
+            state.ruleset is None
+            or admission.board_id != state.ruleset.board_id
+            or admission.board_version != state.ruleset.version
+        ):
+            raise EventCommitError("CATALOG_ADMISSION_INVALID: board reference differs")
+        if package_identity is None or admission.package_identity != package_identity:
+            raise EventCommitError("CATALOG_ADMISSION_INVALID: package identity differs")
+        if state.execution_identity is None:
+            raise EventCommitError("CATALOG_ADMISSION_INVALID: game has no execution identity")
+
+    async def bind_catalog_admission(
+        self,
+        admission: CatalogAdmission,
+        *,
+        expected_revision: int,
+        now: datetime | None = None,
+    ) -> GameState:
+        """Bind an acquired catalog lease to an unstarted authoritative game."""
+
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise EventCommitError("CATALOG_ADMISSION_INVALID: expected revision is invalid")
+        commit_time = _aware_commit_time(now)
+        async with self._lock:
+            current = self._state
+            _revision_check(current, expected_revision)
+            self._validate_catalog_admission_value(
+                current,
+                admission,
+                package_identity=self._package_identity,
+            )
+            if current.phase is not GamePhase.ASSIGNED or current.players:
+                raise EventCommitError(
+                    "CATALOG_ADMISSION_INVALID: lease can only bind before player startup"
+                )
+            if current.catalog_admission is not None:
+                if current.catalog_admission == admission:
+                    return current
+                raise EventCommitError("CATALOG_ADMISSION_INVALID: game is already bound")
+            data = _state_data(current)
+            data["catalog_admission"] = admission
+            data["state_revision"] = current.state_revision + 1
+            data["updated_at"] = commit_time
+            data["moderator_audit"] = (
+                *current.moderator_audit,
+                {
+                    "operation": "CATALOG_ADMISSION_BOUND",
+                    "moderator_id": "human",
+                    "command": "start",
+                    "reason": "active catalog lease bound before player startup",
+                    "base_revision": current.state_revision,
+                    "committed_revision": current.state_revision + 1,
+                    "created_at": commit_time.isoformat(),
+                },
+            )
+            committed = GameState.model_validate(data)
+            self._state = committed
+            return committed
+
+    async def clear_catalog_admission(
+        self,
+        admission: CatalogAdmission,
+        *,
+        expected_revision: int | None = None,
+        now: datetime | None = None,
+    ) -> GameState:
+        """Clear only a matching pre-start binding after its lease is cancelled."""
+
+        commit_time = _aware_commit_time(now)
+        async with self._lock:
+            current = self._state
+            if expected_revision is not None:
+                _revision_check(current, expected_revision)
+            if current.catalog_admission is None:
+                return current
+            if current.catalog_admission != admission:
+                raise EventCommitError("CATALOG_ADMISSION_INVALID: binding identity differs")
+            if current.phase is not GamePhase.ASSIGNED or current.players:
+                raise EventCommitError(
+                    "CATALOG_ADMISSION_INVALID: a started game's admission cannot be cleared"
+                )
+            data = _state_data(current)
+            data["catalog_admission"] = None
+            data["state_revision"] = current.state_revision + 1
+            data["updated_at"] = commit_time
+            data["moderator_audit"] = (
+                *current.moderator_audit,
+                {
+                    "operation": "CATALOG_ADMISSION_CLEARED",
+                    "moderator_id": "human",
+                    "command": "start",
+                    "reason": "failed player startup released its catalog binding",
+                    "base_revision": current.state_revision,
+                    "committed_revision": current.state_revision + 1,
+                    "created_at": commit_time.isoformat(),
+                },
+            )
+            committed = GameState.model_validate(data)
+            self._state = committed
+            return committed
 
     async def assert_private_checkpoint_waiting_choice(self, state: GameState) -> None:
         """Validate one live, receipt-backed player-choice checkpoint boundary.
@@ -8421,6 +8565,7 @@ class GameManager:
         assignment_plan: PlayerAssignmentPlan,
         session_refs: Mapping[int, str],
         expected_revision: int,
+        catalog_admission: CatalogAdmission | None = None,
         now: datetime | None = None,
     ) -> GameState:
         """Atomically commit initial identities, runtime refs, and prepare phase.
@@ -8448,6 +8593,16 @@ class GameManager:
             _revision_check(current, expected_revision)
             if current.phase is not GamePhase.ASSIGNED:
                 raise EventCommitError("START_INVALID: game must be in ASSIGNED phase before start")
+            if current.catalog_admission != catalog_admission:
+                raise EventCommitError(
+                    "START_INVALID: catalog admission does not match the bound game lease"
+                )
+            if catalog_admission is not None:
+                self._validate_catalog_admission_value(
+                    current,
+                    catalog_admission,
+                    package_identity=self._package_identity,
+                )
             if current.run_status in {RunStatus.PAUSED, RunStatus.FAILED, RunStatus.CLOSED}:
                 raise EventCommitError(f"START_INVALID: game is {current.run_status.value.lower()}")
             ruleset = current.ruleset
@@ -9593,12 +9748,19 @@ class GameManager:
             if current.sheriff_election is not None:
                 raise SheriffElectionError("ELECTION_EXISTS", "a sheriff election already exists")
             try:
-                validate_sheriff_start(board, current, candidates=candidates)
+                validate_sheriff_start(
+                    board,
+                    current,
+                    candidates=candidates,
+                    execution_package=self._execution_package,
+                )
                 election = SheriffElectionState.start(
                     game_id=current.game_id,
                     day_no=current.day_no,
                     candidates=candidates,
-                    eligible_voters=first_day_sheriff_participants(current),
+                    eligible_voters=first_day_sheriff_participants(
+                        current, execution_package=self._execution_package
+                    ),
                     speech_order=speech_order,
                     expected_speech_request_ids=expected_speech_request_ids,
                 )
@@ -9659,7 +9821,9 @@ class GameManager:
                 raise SheriffElectionError("SEAT_NOT_ASSIGNED", "speech seat is not assigned")
             if player.session_epoch != request.session_epoch:
                 raise SheriffElectionError("SESSION_MISMATCH", "speech session is obsolete")
-            if request.seat not in first_day_sheriff_participants(current):
+            if request.seat not in first_day_sheriff_participants(
+                current, execution_package=self._execution_package
+            ):
                 raise SheriffElectionError(
                     "SEAT_NOT_ELIGIBLE", "seat is outside the current sheriff election boundary"
                 )
@@ -9710,6 +9874,7 @@ class GameManager:
                     current,
                     window,
                     allow_first_day_sheriff_participants=True,
+                    execution_package=self._execution_package,
                 )
                 opened = election.open_vote(window)
             except SheriffElectionError:
@@ -9768,6 +9933,7 @@ class GameManager:
                     election.vote,
                     request,
                     allow_first_day_sheriff_participants=True,
+                    execution_package=self._execution_package,
                 )
                 accepted = election.submit_vote(request)
             except SheriffElectionError:
@@ -11891,7 +12057,9 @@ class GameManager:
                 GamePhase.SHERIFF_ELECTION_SPEECH,
                 GamePhase.SHERIFF_ELECTION_PK_SPEECH,
             }:
-                if seat not in first_day_sheriff_participants(state):
+                if seat not in first_day_sheriff_participants(
+                    state, execution_package=self._execution_package
+                ):
                     raise EventCommitError(
                         "SHERIFF_SEAT_NOT_AUTHORIZED: seat is outside the current "
                         "first-day election boundary"
@@ -12227,7 +12395,9 @@ class GameManager:
             if state.current_queue[0] != seat:
                 raise EventCommitError("TURN_NOT_AT_HEAD: only the queue head may speak")
             remaining = _sheriff_serial_speech_queue(state, phase)
-            if seat not in first_day_sheriff_participants(state):
+            if seat not in first_day_sheriff_participants(
+                state, execution_package=self._execution_package
+            ):
                 raise EventCommitError(
                     "SHERIFF_SEAT_NOT_AUTHORIZED: seat is outside the current "
                     "first-day election boundary"
