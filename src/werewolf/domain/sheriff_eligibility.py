@@ -121,28 +121,13 @@ def _verified_rule_receipt(state: Any, ledger: object, package_id: str) -> bool:
     )
 
 
-def _package_night_window_order(execution_package: object) -> tuple[tuple[str, int], ...]:
-    rows: list[tuple[str, int]] = []
-    for row in _rows(_mapping_value(execution_package, "window_metadata")):
-        window_id = _mapping_value(row, "window_id")
-        phase = _value(_mapping_value(row, "phase"))
-        order = _mapping_value(row, "order")
-        if (
-            isinstance(window_id, str)
-            and phase in {"NIGHT_TEAM_CHAT", "NIGHT_ACTION", "NIGHT_RESOLVE"}
-            and type(order) is int
-        ):
-            rows.append((window_id, order))
-    return tuple(rows)
-
-
 def _night_group_has_terminal_topology(
     state: Any,
     execution_package: object,
     *,
     group_id: str,
     point: object,
-    metadata: tuple[tuple[str, int], ...],
+    metadata: tuple[tuple[str, str, int], ...],
 ) -> bool:
     """Prove the source group is closed and includes the frozen final night window."""
 
@@ -156,8 +141,8 @@ def _night_group_has_terminal_topology(
         return "night:0"
 
     expected_rows = tuple(
-        (window_id, order)
-        for window_id, order in metadata
+        (window_id, phase, order)
+        for window_id, phase, order in metadata
         if frozen_group_id(window_id) == group_id
     )
     if not expected_rows or frozen_group_id(metadata[-1][0]) != group_id:
@@ -172,24 +157,22 @@ def _night_group_has_terminal_topology(
         if not isinstance(logical_id, str):
             return False
         by_logical_id.setdefault(logical_id, []).append((physical_id, row))
-    if set(by_logical_id) != {window_id for window_id, _order in expected_rows}:
+    if set(by_logical_id) != {window_id for window_id, _phase, _order in expected_rows}:
         return False
     if any(len(rows) != 1 for rows in by_logical_id.values()):
         return False
 
-    metadata_by_id = {window_id: (index, order) for index, (window_id, order) in enumerate(metadata)}
-    for window_id, _order in expected_rows:
-        _index, _metadata_order = metadata_by_id[window_id]
+    metadata_by_id = {
+        window_id: (index, phase, order)
+        for index, (window_id, phase, order) in enumerate(metadata)
+    }
+    for window_id, phase, _order in expected_rows:
+        index, _metadata_phase, _metadata_order = metadata_by_id[window_id]
         physical_id, row = by_logical_id[window_id][0]
-        expected_next = metadata[_index + 1][0] if _index + 1 < len(metadata) else None
+        expected_next = metadata[index + 1][0] if index + 1 < len(metadata) else None
         if (
             physical_id != _mapping_value(row, "window_id")
-            or _value(_mapping_value(row, "phase"))
-            != next(
-                phase
-                for logical_id, phase, _order in _metadata_with_phases(execution_package)
-                if logical_id == window_id
-            )
+            or _value(_mapping_value(row, "phase")) != phase
             or _mapping_value(row, "next_window_id") != expected_next
         ):
             return False
@@ -221,7 +204,12 @@ def _metadata_with_phases(
         window_id = _mapping_value(row, "window_id")
         phase = _value(_mapping_value(row, "phase"))
         order = _mapping_value(row, "order")
-        if isinstance(window_id, str) and isinstance(phase, str) and type(order) is int:
+        if (
+            isinstance(window_id, str)
+            and isinstance(phase, str)
+            and phase in {"NIGHT_TEAM_CHAT", "NIGHT_ACTION", "NIGHT_RESOLVE"}
+            and type(order) is int
+        ):
             result.append((window_id, phase, order))
     return tuple(sorted(result, key=lambda item: item[2]))
 
@@ -356,11 +344,11 @@ def _strict_first_night_death_seats(state: Any, execution_package: object) -> tu
     ledgers = _rows(getattr(state, "rule_ledger", ()))
     if not isinstance(players, Mapping):
         return ()
-    metadata = _package_night_window_order(execution_package)
+    metadata = _metadata_with_phases(execution_package)
     if not metadata:
         return ()
-    package_last_order = max(order for _window_id, order in metadata)
     deaths: set[int] = set()
+    verified_boundary_ids: set[str] = set()
 
     def verify_fact_source(
         *, fact_id: str, batch_id: str, expected_group_id: str, depth: int, seen: frozenset[str]
@@ -572,6 +560,9 @@ def _strict_first_night_death_seats(state: Any, execution_package: object) -> tu
             fact_seats.add(seat)
         if valid and fact_seats == set(seats):
             deaths.update(fact_seats)
+            boundary_id = _mapping_value(boundary, "boundary_id")
+            if isinstance(boundary_id, str):
+                verified_boundary_ids.add(boundary_id)
     if not deaths:
         return ()
 
@@ -587,13 +578,27 @@ def _strict_first_night_death_seats(state: Any, execution_package: object) -> tu
         ):
             return ()
     cursor = getattr(state, "rule_workflow_cursor", None)
-    if _mapping_value(cursor, "status") in {
-        "COLLECTING",
-        "DRAINING",
-        "WAITING_CHOICE",
-        "WAITING_BOUNDARY",
-        "ERROR",
-    } or any(_mapping_value(boundary, "is_pending") is True for boundary in boundaries):
+    cursor_status = _mapping_value(cursor, "status")
+    if cursor_status in {"COLLECTING", "WAITING_CHOICE", "ERROR"}:
+        return ()
+    if _mapping_value(cursor, "active_occurrence_id") is not None:
+        return ()
+    pending_boundaries = tuple(
+        boundary
+        for boundary in boundaries
+        if _mapping_value(boundary, "is_pending") is True
+    )
+    pending_boundary_ids = {
+        boundary_id
+        for boundary in pending_boundaries
+        if isinstance(boundary_id := _mapping_value(boundary, "boundary_id"), str)
+    }
+    if pending_boundary_ids and not pending_boundary_ids.issubset(verified_boundary_ids):
+        return ()
+    if cursor_status in {"DRAINING", "WAITING_BOUNDARY"}:
+        if _mapping_value(cursor, "pending_boundary_id") not in pending_boundary_ids:
+            return ()
+    elif pending_boundary_ids:
         return ()
     return tuple(sorted(deaths))
 

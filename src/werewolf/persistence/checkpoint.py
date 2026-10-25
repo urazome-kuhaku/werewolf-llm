@@ -842,9 +842,7 @@ async def load_verified_checkpoint_bundle(
         or snapshot.game_id != identity.game_id
         or snapshot.package_id != identity.package_id
     ):
-        raise PrivateCheckpointIdentityError(
-            "detached checkpoint runtime bundle identity changed"
-        )
+        raise PrivateCheckpointIdentityError("detached checkpoint runtime bundle identity changed")
     return snapshot, bundle
 
 

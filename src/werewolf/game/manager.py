@@ -86,7 +86,11 @@ from .sheriff import (
     SheriffElectionStatus,
     validate_sheriff_start,
 )
-from .sheriff_eligibility import first_day_sheriff_participants, is_first_day_sheriff_boundary
+from .sheriff_eligibility import (
+    first_day_sheriff_participants,
+    first_night_death_seats,
+    is_first_day_sheriff_boundary,
+)
 from .state import (
     AbilityInstanceState,
     GameState,
@@ -6443,15 +6447,9 @@ class GameManager:
             ):
                 return False
 
-        anchor = group_windows_by_id.get(
-            next(
-                (
-                    window.logical_window_id
-                    for window in group_windows
-                    if window.window_id == point.window_id
-                ),
-                "",
-            )
+        anchor = next(
+            (window for window in group_windows if window.window_id == point.window_id),
+            None,
         )
         if anchor is None or (
             point.logical_window_id is not None
@@ -10783,6 +10781,136 @@ class GameManager:
             self._state = committed
             return committed
 
+    def _completed_trigger_marker_matches_badge_boundary(
+        self,
+        state: GameState,
+        boundary: RuleBoundary,
+    ) -> bool:
+        """Prove a held choice marker belongs to this boundary's completed cause."""
+
+        pending = state.pending_resolution
+        cursor = state.rule_workflow_cursor
+        if (
+            not isinstance(pending, Mapping)
+            or pending.get("operation") != "RULE_TRIGGER"
+            or pending.get("status") != "RULE_TRIGGER_ACTION_REQUIRED"
+            or cursor is None
+            or cursor.status != "WAITING_BOUNDARY"
+            or cursor.active_occurrence_id is not None
+            or cursor.pending_boundary_id != boundary.boundary_id
+        ):
+            return False
+        occurrence_id = pending.get("occurrence_id")
+        source_fact_id = pending.get("source_fact_id")
+        window_id = pending.get("window_id")
+        actor_seat = pending.get("actor_seat")
+        base_revision = pending.get("base_revision")
+        if (
+            not isinstance(occurrence_id, str)
+            or not isinstance(source_fact_id, str)
+            or source_fact_id not in boundary.death_fact_ids
+            or not isinstance(window_id, str)
+            or type(actor_seat) is not int
+            or type(base_revision) is not int
+            or base_revision >= state.state_revision
+        ):
+            return False
+        occurrences = tuple(
+            item
+            for item in state.rule_trigger_queue
+            if item.occurrence_id == occurrence_id
+            and item.source_fact_id == source_fact_id
+            and item.actor_seat == actor_seat
+        )
+        if (
+            len(occurrences) != 1
+            or occurrences[0].mode != "PLAYER_CHOICE"
+            or occurrences[0].status != "COMPLETED"
+            or occurrences[0].window_id != window_id
+        ):
+            return False
+        occurrence = occurrences[0]
+        raw_window = state.action_windows.get(window_id)
+        if not isinstance(raw_window, Mapping):
+            return False
+        try:
+            window = _load_action_window(raw_window)
+        except (TypeError, ValueError):
+            return False
+        context = window.visible_context
+        if (
+            window.game_id != state.game_id
+            or window.phase is not GamePhase.TRIGGER_ACTION
+            or window.closed_at is None
+            or window.settlement_group_id != f"trigger-{occurrence_id}"
+            or occurrence.ability_instance_id != context.get("rule_ability_instance_id")
+            or occurrence.skill_id != context.get("rule_skill_id")
+            or context.get("rule_occurrence_id") != occurrence_id
+            or context.get("rule_source_fact_id") != source_fact_id
+            or context.get("rule_actor_seat") != actor_seat
+        ):
+            return False
+        requests = tuple(
+            (request_id, raw_request)
+            for request_id, raw_request in state.action_requests.items()
+            if isinstance(raw_request, Mapping) and raw_request.get("window_id") == window_id
+        )
+        if len(requests) != 1:
+            return False
+        request_id, raw_request = requests[0]
+        if (
+            not isinstance(request_id, str)
+            or request_id not in window.submitted_request_ids
+            or raw_request.get("status") != "CONFIRMED"
+            or raw_request.get("seat") != actor_seat
+            or raw_request.get("session_epoch") != window.session_epoch
+            or raw_request.get("resolution_kind") not in {None, "RULE_TRIGGER"}
+        ):
+            return False
+        receipt_id = raw_request.get("rule_receipt_id")
+        group_id = f"trigger-{occurrence_id}"
+        ledgers = tuple(
+            item
+            for item in state.rule_ledger
+            if item.batch_id == receipt_id
+            and item.group_id == group_id
+            and item.timing == GamePhase.TRIGGER_ACTION.value
+            and item.request_ids == (request_id,)
+        )
+        receipts = tuple(
+            item
+            for item in state.rule_receipts
+            if item.batch_id == receipt_id
+            and item.group_id == group_id
+            and item.timing == GamePhase.TRIGGER_ACTION.value
+            and item.occurrence_ids == (occurrence_id,)
+            and item.request_ids == (request_id,)
+        )
+        if len(ledgers) != 1 or len(receipts) != 1:
+            return False
+        ledger = ledgers[0]
+        receipt = receipts[0]
+        if (
+            ledger.package_id != receipt.package_id
+            or ledger.package_id
+            != (self._execution_package.package_id if self._execution_package is not None else None)
+            or ledger.read_revision != receipt.read_revision
+            or ledger.committed_revision != receipt.committed_revision
+            or ledger.request_ids != receipt.request_ids
+            or ledger.outcome_digest != receipt.outcome_digest
+            or not any(
+                produced.source_batch_id == ledger.batch_id
+                and produced.source_group_id == ledger.group_id
+                and bool(produced.death_fact_ids)
+                and set(produced.death_fact_ids).issubset(
+                    {fact.fact_id for fact in ledger.facts}
+                )
+                for produced in state.rule_boundaries
+            )
+        ):
+            return False
+        return True
+
     async def complete_sheriff_badge(
         self,
         *,
@@ -10838,7 +10966,7 @@ class GameManager:
                         "BADGE_ACTION_INVALID",
                         "trigger badge requires a closed DAY_EXILE source",
                     )
-            if current.serial_turn is not None or current.pending_resolution is not None:
+            if current.serial_turn is not None:
                 raise SheriffElectionError("BADGE_PENDING", "badge action is still active")
             for raw_window in current.action_windows.values():
                 try:
@@ -10952,6 +11080,18 @@ class GameManager:
                         "BADGE_BOUNDARY_INVALID",
                         "completed badge lacks a matching decision request and boundary audit",
                     )
+            completed_trigger_marker = bool(
+                current.pending_resolution is not None
+                and typed_boundary is not None
+                and current.phase is not GamePhase.TRIGGER_ACTION
+                and self._completed_trigger_marker_matches_badge_boundary(
+                    current, typed_boundary
+                )
+            )
+            if current.pending_resolution is not None and not completed_trigger_marker:
+                raise SheriffElectionError(
+                    "BADGE_PENDING", "trigger resolution is still pending"
+                )
             scheduled_dawn_hold = bool(
                 current.phase is GamePhase.DAY_ANNOUNCE
                 and self._execution_package is not None
@@ -10986,6 +11126,8 @@ class GameManager:
                 except (TypeError, ValueError) as exc:
                     raise SheriffElectionError("PHASE_INVALID", str(exc)) from exc
             data = _state_data(transitioned)
+            if completed_trigger_marker:
+                data["pending_resolution"] = None
             if typed_boundary is not None:
                 boundaries = tuple(
                     item.model_copy(
@@ -12203,6 +12345,54 @@ class GameManager:
         async with self._lock:
             return _sheriff_serial_speech_queue(self._state, phase)
 
+    def _scheduled_election_may_precede_pending_dawn_boundary(
+        self,
+        state: GameState,
+    ) -> bool:
+        package = self._execution_package
+        schedule = package.night_boundary_schedule if package is not None else None
+        cursor = state.rule_workflow_cursor
+        election_phases = {
+            GamePhase.SHERIFF_ELECTION_SPEECH,
+            GamePhase.SHERIFF_ELECTION,
+            GamePhase.SHERIFF_ELECTION_PK_SPEECH,
+            GamePhase.SHERIFF_ELECTION_PK,
+            GamePhase.SHERIFF_TRANSFER,
+        }
+        if (
+            schedule is None
+            or "FIRST_DAY_SHERIFF_ELECTION" not in schedule.required_for_round(0)
+            or state.round_no != 0
+            or state.day_no != 1
+            or state.phase not in election_phases
+            or cursor is None
+            or cursor.status not in {"DRAINING", "WAITING_BOUNDARY"}
+            or cursor.active_occurrence_id is not None
+        ):
+            return False
+        pending = tuple(item for item in state.rule_boundaries if item.is_pending)
+        pending_ids = {item.boundary_id for item in pending}
+        if (
+            not pending
+            or cursor.pending_boundary_id not in pending_ids
+            or any(
+                item.status != "COMPLETED"
+                for item in state.rule_trigger_queue
+            )
+        ):
+            return False
+        death_seats = set(first_night_death_seats(state, execution_package=package))
+        return bool(
+            death_seats
+            and all(
+                item.return_point.phase is GamePhase.DAY_ANNOUNCE
+                and item.return_point.day_no == 0
+                and item.source_group_id.startswith("night:0")
+                and set(item.death_seats).issubset(death_seats)
+                for item in pending
+            )
+        )
+
     async def begin_serial_speech_turn(
         self,
         seat: int,
@@ -12265,7 +12455,14 @@ class GameManager:
                         "BOUNDARY_NOT_PENDING: seat is not the pending boundary speech head"
                     )
             else:
-                if any(item.is_pending for item in state.rule_boundaries):
+                if any(item.is_pending for item in state.rule_boundaries) and not (
+                    phase
+                    in {
+                        GamePhase.SHERIFF_ELECTION_SPEECH,
+                        GamePhase.SHERIFF_ELECTION_PK_SPEECH,
+                    }
+                    and self._scheduled_election_may_precede_pending_dawn_boundary(state)
+                ):
                     raise EventCommitError(
                         "BOUNDARY_REQUIRED: pending rule boundary must bind serial speech"
                     )

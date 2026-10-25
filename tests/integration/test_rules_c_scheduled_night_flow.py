@@ -17,11 +17,11 @@ from werewolf.game.events import EventType
 from werewolf.game.manager import EventCommitError, GameManager
 from werewolf.game.sheriff import SheriffElectionStatus
 from werewolf.game.state import GameState
-from werewolf.moderator.sheriff_flow import ModeratorSheriffFlow
 from werewolf.knowledge.compiler import KnowledgePackageCompiler
 from werewolf.knowledge.package_loader import KnowledgePackageLoader
 from werewolf.knowledge.refs import VersionedRef
 from werewolf.moderator.play_runner import ClassicPlayRunner
+from werewolf.moderator.sheriff_flow import ModeratorSheriffFlow
 from werewolf.rules.models import ExecutionPackage
 from werewolf.runtime.player_runtime import (
     Action,
@@ -180,8 +180,13 @@ async def test_first_night_dead_elected_sheriff_completes_announcement_badge_wor
     speech_open_index = next(
         index for index, row in enumerate(history) if row[0] == "day speech open"
     )
-    print("SCHEDULED_HISTORY", list(enumerate(history)))
-    assert announcement_index < badge_open_index < last_words_index < night_check_index < speech_open_index
+    assert (
+        announcement_index
+        < badge_open_index
+        < last_words_index
+        < night_check_index
+        < speech_open_index
+    )
     assert history[badge_open_index][1] is GamePhase.DAY_ANNOUNCE
     assert history[last_words_index][1] is GamePhase.DAY_ANNOUNCE
     assert history[night_check_index][1] is GamePhase.DAY_ANNOUNCE

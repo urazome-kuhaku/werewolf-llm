@@ -7,13 +7,31 @@ import hashlib
 import json
 import os
 import shutil
-from datetime import UTC, datetime
-from pathlib import Path
-from dataclasses import replace
 from collections.abc import Mapping
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
+import aiohttp
 import pytest
+from test_rules_b_white_explosion import (
+    BOARD_REF as WHITE_EXPLOSION_BOARD_REF,
+)
+from test_rules_b_white_explosion import (
+    PUBLISHED_ROOT as WHITE_EXPLOSION_PUBLISHED_ROOT,
+)
+from test_rules_b_white_explosion import (
+    SUNBURST_ACTION,
+    _compiled_classic,
+    _experimental_board,
+)
+from test_rules_b_white_explosion import (
+    _execution as _white_explosion_execution,
+)
+from test_rules_b_white_explosion import (
+    _manager as _white_explosion_manager,
+)
 from test_rules_b_workflow import (
     GAME_ID as WORKFLOW_GAME_ID,
 )
@@ -25,33 +43,36 @@ from test_rules_b_workflow import (
     _manager as _workflow_manager,
 )
 
+from werewolf.cli_support.checkpoint_cli import verify_private_checkpoint
+from werewolf.domain.admission import CatalogAdmission
 from werewolf.domain.enums import GamePhase
 from werewolf.game.actions import load_action_registry
 from werewolf.game.manager import EventCommitError, GameManager
+from werewolf.game.setup import PlayerAssignmentPlan
+from werewolf.game.sheriff import SheriffElectionError
 from werewolf.game.state import (
     GameState,
-    PlayerState,
     RandomStateRef,
     RuleExecutionIdentity,
     RulesetRef,
 )
-from werewolf.game.setup import PlayerAssignmentPlan
-from werewolf.knowledge.compiler import KnowledgePackageCompiler
+from werewolf.knowledge.catalog import CatalogSelection, CatalogStore
 from werewolf.knowledge.compiled_store import CompiledKnowledgeStore
+from werewolf.knowledge.compiler import KnowledgePackageCompiler
 from werewolf.knowledge.package_loader import KnowledgePackageLoader
 from werewolf.knowledge.runtime_loader import load_runtime_knowledge_bundle_from_snapshot
 from werewolf.knowledge.snapshot import KnowledgeSnapshotBuilder
-from werewolf.knowledge.refs import VersionedRef
 from werewolf.moderator import (
     LastWordsFlow,
+    ModeratorShell,
     ModeratorSheriffBadgeFlow,
     ModeratorTriggerFlow,
-    ModeratorShell,
 )
-from werewolf.moderator.shell import ModeratorError
 from werewolf.moderator.config import parse_player_configuration
 from werewolf.moderator.day_flow import DayCoordinator
 from werewolf.moderator.sessions import PlayerSessionService
+from werewolf.moderator.shell import ModeratorError
+from werewolf.persistence.archive import GameArchiveStore
 from werewolf.persistence.checkpoint import (
     CorruptPrivateCheckpointError,
     PrivateCheckpointBoundaryError,
@@ -61,27 +82,12 @@ from werewolf.persistence.checkpoint import (
     _canonical_json_bytes,
     _decode_payload,
 )
-from werewolf.persistence.archive import GameArchiveStore
 from werewolf.persistence.snapshot import GameSnapshotStore
 from werewolf.runtime.demo_runtime import DemoRuntime
 from werewolf.runtime.player_runtime import ActionResponse, ResponseKind, SpeechResponse
 from werewolf.runtime.scripted_runtime import ScriptedRuntime
-from test_rules_b_white_explosion import (
-    BOARD_REF as WHITE_EXPLOSION_BOARD_REF,
-)
-from test_rules_b_white_explosion import (
-    PUBLISHED_ROOT as WHITE_EXPLOSION_PUBLISHED_ROOT,
-)
-from test_rules_b_white_explosion import (
-    SUNBURST_ACTION,
-    _compiled_classic,
-    _execution as _white_explosion_execution,
-    _experimental_board,
-    _manager as _white_explosion_manager,
-)
-from werewolf.cli_support.checkpoint_cli import verify_private_checkpoint
 
-NOW = datetime(2026, 10, 22, 20, 0, tzinfo=UTC)
+NOW = datetime.now(UTC).replace(microsecond=0) + timedelta(days=1)
 GAME_ID = WORKFLOW_GAME_ID
 
 
@@ -91,6 +97,11 @@ class ObservedDemoRuntime(DemoRuntime):
     def __init__(self, knowledge_base_url: str, knowledge_token: str) -> None:
         super().__init__(knowledge_base_url, knowledge_token)
         self.skill_status_reads: list[Mapping[str, Any]] = []
+        self.knowledge_document_reads: list[str] = []
+
+    async def _read_document(self, path: str) -> Mapping[str, Any]:
+        self.knowledge_document_reads.append(path)
+        return await super()._read_document(path)
 
     async def _read_skill_status(self) -> Mapping[str, Any]:
         status = await super()._read_skill_status()
@@ -159,9 +170,7 @@ def _response_for_white_explosion(request: object) -> object:
 async def _compiled_white_explosion_package():
     base = await _compiled_classic()
     board = _experimental_board(base, external_night_attack=False)
-    execution, registry = _white_explosion_execution(
-        base, board, external_night_attack=False
-    )
+    execution, registry = _white_explosion_execution(base, board, external_night_attack=False)
     source = await KnowledgePackageLoader(WHITE_EXPLOSION_PUBLISHED_ROOT).load(
         WHITE_EXPLOSION_BOARD_REF
     )
@@ -402,6 +411,53 @@ async def test_white_wolf_hunter_choice_restores_with_fresh_gateway_and_finishes
     assert compiled.action_registry is not None
     game_id = "checkpoint-white-explosion"
     seed = 20261025
+    catalog_store = CatalogStore(tmp_path / "catalog")
+    catalog_gate = "a" * 64
+    catalog_stage = "b" * 64
+    active_v2_stage = "c" * 64
+    active_v2_gate = "d" * 64
+    active_v2_ref = f"{compiled.board_ref.id}@99.99.99"
+    catalog_selection = CatalogSelection(
+        catalog_root=str(catalog_store.root),
+        catalog_id=catalog_store.catalog_id,
+        board_id=compiled.board_ref.id,
+        board_version=compiled.board_ref.version,
+        package_identity=compiled.package_identity,
+        gate_sha256=catalog_gate,
+        stage_digest=catalog_stage,
+    )
+    catalog_admission = CatalogAdmission.build(
+        catalog_id=catalog_store.catalog_id,
+        game_id=game_id,
+        board_id=compiled.board_ref.id,
+        board_version=compiled.board_ref.version,
+        package_identity=compiled.package_identity,
+        gate_sha256=catalog_gate,
+        lease_generation=1,
+    )
+    catalog_registry = catalog_store._load_registry()
+    catalog_registry["active"] = {compiled.board_ref.id: "99.99.99"}
+    catalog_registry["retired"] = [compiled.board_ref.format()]
+    catalog_registry["entry_digests"] = {active_v2_ref: active_v2_stage}
+    catalog_registry["gate_runs"] = {
+        active_v2_ref: {
+            "status": "PASS",
+            "stage_digest": active_v2_stage,
+            "gate_sha256": active_v2_gate,
+            "report_path": "gates/active-v2.json",
+            "report_sha256": "e" * 64,
+        }
+    }
+    catalog_registry["leases"] = {
+        game_id: {
+            **catalog_admission.model_dump(mode="json"),
+            "board_ref": catalog_selection.board_ref.format(),
+            "status": "ACTIVE",
+        }
+    }
+    catalog_registry["lease_generations"] = {game_id: 1}
+    await catalog_store._write_registry(catalog_registry)
+
     compiled_root = tmp_path / "compiled-live"
     compiled_store = CompiledKnowledgeStore(compiled_root)
     await compiled_store.publish(compiled)
@@ -424,6 +480,7 @@ async def test_white_wolf_hunter_choice_restores_with_fresh_gateway_and_finishes
             "seed": seed,
             "board": {"id": compiled.board_ref.id, "version": compiled.board_ref.version},
         },
+        "catalog_selection": catalog_selection.model_dump(mode="json"),
         "paths": {"compiled_root": str(compiled_root), "games_root": str(games_root)},
         "players": [{"seat": seat, "runtime": "scripted"} for seat in range(1, 13)],
     }
@@ -479,9 +536,8 @@ async def test_white_wolf_hunter_choice_restores_with_fresh_gateway_and_finishes
         state_provider=state_provider,
     )
     initial_records = await initial_service.start(bundle, configuration, assignments)
-    initial_refs = {
-        seat: record.runtime_ref.session_id for seat, record in initial_records.items()
-    }
+    old_hunter_token = initial_records[11].token
+    initial_refs = {seat: record.runtime_ref.session_id for seat, record in initial_records.items()}
     initial_players = {
         seat: assignments.players[seat].model_copy(update={"runtime_ref": initial_refs[seat]})
         for seat in assignment_seats
@@ -497,6 +553,7 @@ async def test_white_wolf_hunter_choice_restores_with_fresh_gateway_and_finishes
             ),
             "rng": RandomStateRef(seed=seed),
             "sheriff_seat": 11,
+            "catalog_admission": catalog_admission,
         }
     )
     manager = GameManager(
@@ -519,6 +576,8 @@ async def test_white_wolf_hunter_choice_restores_with_fresh_gateway_and_finishes
     initial_shell.session_service = initial_service
     initial_shell.snapshot_store = GameSnapshotStore(active_root)
     initial_shell.archive_store = GameArchiveStore(games_root)
+    initial_shell.catalog_selection = catalog_selection
+    initial_shell.catalog_store = catalog_store
     baseline_manager = _white_explosion_manager(
         compiled,
         board,
@@ -533,6 +592,7 @@ async def test_white_wolf_hunter_choice_restores_with_fresh_gateway_and_finishes
         now=NOW,
     )
     assert baseline.phase is GamePhase.NIGHT_TEAM_CHAT
+    baseline = baseline.model_copy(update={"catalog_admission": catalog_admission})
     await initial_shell.snapshot_store.create(baseline, created_at=NOW)
 
     try:
@@ -608,6 +668,42 @@ async def test_white_wolf_hunter_choice_restores_with_fresh_gateway_and_finishes
         )
         assert (await failed_shell.checkpoint_verify(checkpoint_id))["status"] == "verified"
 
+        startup_entered = asyncio.Event()
+        cancel_runtimes: list[ScriptedRuntime] = []
+
+        class BlockedStartupRuntime(ScriptedRuntime):
+            async def start(self, runtime_config, context):
+                result = await super().start(runtime_config, context)
+                if context.seat == 4:
+                    startup_entered.set()
+                    await asyncio.Event().wait()
+                return result
+
+        def blocked_runtime_factory(
+            _player: Any,
+            _gateway_url: str,
+            _token: str,
+        ) -> ScriptedRuntime:
+            runtime = BlockedStartupRuntime([_response_for_white_explosion] * 64)
+            cancel_runtimes.append(runtime)
+            return runtime
+
+        cancelled_shell = ModeratorShell(
+            config_path,
+            runtime_factory=blocked_runtime_factory,
+            clock=lambda: NOW,
+        )
+        restore_task = asyncio.create_task(cancelled_shell.checkpoint_restore(checkpoint_id))
+        await asyncio.wait_for(startup_entered.wait(), timeout=5)
+        restore_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await restore_task
+        assert cancelled_shell.manager is None
+        assert cancelled_shell.session_service is None
+        assert cancelled_shell._checkpoint_bundle_tempdir is None
+        assert cancel_runtimes and all(runtime._closed for runtime in cancel_runtimes)
+        assert (await cancelled_shell.checkpoint_verify(checkpoint_id))["status"] == "verified"
+
         fresh_runtime_map: dict[int, ObservedDemoRuntime] = {}
 
         def fresh_runtime_factory(
@@ -628,7 +724,14 @@ async def test_white_wolf_hunter_choice_restores_with_fresh_gateway_and_finishes
         assert restored["status"] == "restored"
         assert restored_shell.manager is not None
         assert restored_shell.session_service is not None
+        assert restored_shell.catalog_selection == catalog_selection
+        assert restored_shell.catalog_store is not None
+        assert restored_shell.catalog_store.catalog_id == catalog_admission.catalog_id
         restored_manager = restored_shell.manager
+        assert restored_manager.state.catalog_admission == catalog_admission
+        active_lease = catalog_store._load_registry()["leases"][game_id]
+        assert active_lease["status"] == "ACTIVE"
+        assert active_lease["lease_generation"] == catalog_admission.lease_generation
         assert {
             seat: player.session_epoch for seat, player in restored_manager.state.players.items()
         } == {seat: epoch + 1 for seat, epoch in old_epochs.items()}
@@ -662,8 +765,15 @@ async def test_white_wolf_hunter_choice_restores_with_fresh_gateway_and_finishes
         }
         hunter_action = await restored_triggers.next(11)
         assert hunter_action["status"] == "accepted"
+        settlement = await restored_triggers.auto_resolve()
+        assert settlement["status"] == "idle"
         hunter_runtime = fresh_runtime_map[11]
-        assert hunter_runtime.receipts
+        assert len(hunter_runtime.receipts) == 2
+        assert len(set(hunter_runtime.receipts)) == 2
+        assert hunter_runtime.knowledge_document_reads == [
+            "/v1/board/current",
+            f"/v1/role/{restored_manager.state.players[11].role_id}",
+        ]
         assert len(hunter_runtime.skill_status_reads) == 1
         hunter_status = hunter_runtime.skill_status_reads[0]
         assert hunter_status["session_epoch"] == old_epochs[11] + 1
@@ -671,11 +781,16 @@ async def test_white_wolf_hunter_choice_restores_with_fresh_gateway_and_finishes
             item["skill_id"] == "experimental_taken_hunter_shot"
             for item in hunter_status["abilities"]
         )
+        restored_hunter_record = restored_shell.session_service.records[11]
+        async with aiohttp.ClientSession() as client:
+            async with client.get(
+                f"{restored_hunter_record.gateway_url}/v1/game/skills/me",
+                headers={"Authorization": f"Bearer {old_hunter_token}"},
+            ) as old_token_response:
+                assert old_token_response.status == 401
         assert not restored_manager.state.players[3].alive
         hunted_seats = {
-            seat
-            for seat in alive_before_shot
-            if not restored_manager.state.players[seat].alive
+            seat for seat in alive_before_shot if not restored_manager.state.players[seat].alive
         }
         assert len(hunted_seats) == 1
         assert restored_manager.state.players[next(iter(hunted_seats))].faction_id == "good"
@@ -704,8 +819,47 @@ async def test_white_wolf_hunter_choice_restores_with_fresh_gateway_and_finishes
         )
         await badge.next()
         await badge.resolve()
+        badge_state = restored_manager.state
+        bad_window_times = tuple(
+            (window_id, raw.get("opened_at"), raw.get("closed_at"))
+            for window_id, raw in badge_state.action_windows.items()
+            if isinstance(raw, Mapping)
+            and isinstance(raw.get("opened_at"), str)
+            and isinstance(raw.get("closed_at"), str)
+            and raw["closed_at"] < raw["opened_at"]
+        )
+        assert not bad_window_times, repr(bad_window_times)
+        pending = badge_state.pending_resolution
+        assert isinstance(pending, Mapping)
+        queued = tuple(
+            item.model_copy(update={"status": "WAITING_CHOICE"})
+            if item.occurrence_id == pending.get("occurrence_id")
+            else item
+            for item in badge_state.rule_trigger_queue
+        )
+        corrupt_manager = GameManager(
+            badge_state.model_copy(update={"rule_trigger_queue": queued}),
+            registry=restored_manager.registry,
+            execution_package=restored_manager.execution_package,
+            package_identity=restored_manager.package_identity,
+        )
+        with pytest.raises(SheriffElectionError, match="BADGE_PENDING"):
+            await corrupt_manager.complete_sheriff_badge(
+                expected_revision=corrupt_manager.state.state_revision,
+                now=NOW,
+            )
         await badge.finish()
-        assert restored_manager.state.sheriff_seat == 1
+        badge_target = restored_manager.state.sheriff_badge
+        assert isinstance(badge_target, Mapping)
+        transferred_to = badge_target.get("target_seat")
+        assert type(transferred_to) is int
+        assert restored_manager.state.sheriff_seat == transferred_to
+        assert restored_manager.state.players[transferred_to].alive
+
+        while words.status()["pending_seats"]:
+            result = await words.next()
+            assert result.event.payload.content.strip()
+            assert result.event.channel.value == "PUBLIC"
 
         await restored_triggers.finish(now=NOW)
         flow_facts = tuple(
@@ -735,9 +889,22 @@ async def test_white_wolf_hunter_choice_restores_with_fresh_gateway_and_finishes
         archive_path = Path(str(finished["path"]))
         archive_manifest = await GameArchiveStore(games_root).verify(archive_path)
         assert archive_manifest.game_id == game_id
-        final_state = GameState.model_validate_json((archive_path / "state.json").read_bytes())
+        final_snapshot_path = archive_path / archive_manifest.final_snapshot_path
+        final_snapshot = await GameSnapshotStore(archive_path).verify(final_snapshot_path)
+        assert final_snapshot.snapshot_id == archive_manifest.final_snapshot_id
+        final_state = GameState.model_validate_json(
+            (final_snapshot_path / "state.json").read_bytes()
+        )
         assert final_state.phase is GamePhase.FINISHED
         assert final_state.run_status.value == "CLOSED"
+        assert final_state.catalog_admission == catalog_admission
+        closed_registry = catalog_store._load_registry()
+        closed_lease = closed_registry["leases"][game_id]
+        assert closed_lease["status"] == "RELEASED"
+        assert closed_lease["lease_generation"] == catalog_admission.lease_generation
+        assert closed_registry["tombstones"][game_id]["lease_id"] == catalog_admission.lease_id
+        assert closed_registry["active"][compiled.board_ref.id] == "99.99.99"
+        assert compiled.board_ref.format() in closed_registry["retired"]
 
         replay_shell = ModeratorShell(config_path, clock=lambda: NOW)
         with pytest.raises(ModeratorError, match="blocks checkpoint replay"):

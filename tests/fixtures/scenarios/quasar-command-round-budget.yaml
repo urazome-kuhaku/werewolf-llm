@@ -1,0 +1,125 @@
+schema_version: 1
+scenario_id: quasar-command-round-budget
+board_ref: quasar_echo_lab@1.0.0
+mode: COMMAND
+budget:
+  max_commands: 40
+  max_turns: 40
+  max_rounds: 1
+steps:
+  - kind: HOST_COMMAND
+    step_id: create
+    command: NEW
+  - kind: HOST_COMMAND
+    step_id: assign-1
+    command: NEXT
+  - kind: HOST_COMMAND
+    step_id: assign-2
+    command: NEXT
+  - kind: HOST_COMMAND
+    step_id: start
+    command: START
+  - kind: HOST_COMMAND
+    step_id: prepare-1
+    command: PREPARE_NEXT
+  - kind: HOST_COMMAND
+    step_id: prepare-2
+    command: PREPARE_NEXT
+  - kind: HOST_COMMAND
+    step_id: prepare-3
+    command: PREPARE_NEXT
+  - kind: HOST_COMMAND
+    step_id: begin-night-0
+    command: NEXT
+  - kind: HOST_COMMAND
+    step_id: night-0-open-team
+    command: NIGHT_OPEN
+  - kind: HOST_COMMAND
+    step_id: night-0-team-next
+    command: NIGHT_TEAM_NEXT
+  - kind: HOST_COMMAND
+    step_id: night-0-plan-status
+    command: NIGHT_PLAN_STATUS
+  - kind: HOST_COMMAND
+    step_id: night-0-team-advance
+    command: NIGHT_ADVANCE
+  - kind: HOST_COMMAND
+    step_id: night-0-open-actions
+    command: NIGHT_OPEN
+  - kind: PLAYER_TURN
+    step_id: quasar-oracle-pass
+    match:
+      seat: 1
+      role_id: quasar_oracle
+      phase: NIGHT_ACTION
+      round_no: 0
+    expected_kind: action
+    actions:
+      - action_code: 299
+  - kind: HOST_COMMAND
+    step_id: night-0-action-next
+    command: NIGHT_ACTION_NEXT
+  - kind: HOST_COMMAND
+    step_id: night-0-action-advance
+    command: NIGHT_ADVANCE
+  - kind: HOST_COMMAND
+    step_id: night-0-open-resolve
+    command: NIGHT_OPEN
+  - kind: HOST_COMMAND
+    step_id: night-0-auto-resolve
+    command: NIGHT_AUTO_RESOLVE
+  - kind: HOST_COMMAND
+    step_id: night-0-victory-check
+    command: VICTORY_NIGHT_CHECK
+    required: false
+  - kind: HOST_COMMAND
+    step_id: day-1-announce
+    command: DAY_ANNOUNCE
+    content: Night passes quietly.
+  - kind: HOST_COMMAND
+    step_id: day-1-speech-open
+    command: DAY_SPEECH_OPEN
+    seats: [1, 2, 3]
+  - kind: HOST_COMMAND
+    step_id: day-1-speech-next-1
+    command: DAY_SPEECH_NEXT
+  - kind: HOST_COMMAND
+    step_id: day-1-speech-next-2
+    command: DAY_SPEECH_NEXT
+  - kind: HOST_COMMAND
+    step_id: day-1-speech-next-3
+    command: DAY_SPEECH_NEXT
+  - kind: HOST_COMMAND
+    step_id: day-1-speech-close
+    command: DAY_SPEECH_CLOSE
+  - kind: HOST_COMMAND
+    step_id: day-1-vote-open
+    command: DAY_VOTE_OPEN
+  - kind: HOST_COMMAND
+    step_id: day-1-vote-collect
+    command: DAY_VOTE_COLLECT
+    force: true
+  - kind: HOST_COMMAND
+    step_id: day-1-vote-confirm
+    command: DAY_VOTE_CONFIRM
+  - kind: HOST_COMMAND
+    step_id: day-1-confirm-no-exile
+    command: DAY_CONFIRM_EXILE
+    target: NONE
+  - kind: HOST_COMMAND
+    step_id: day-1-finish
+    command: DAY_FINISH
+  - kind: ASSERT
+    step_id: round-1-victory-boundary
+    field: round_no
+    operator: EQ
+    expected: 1
+  - kind: ASSERT
+    step_id: round-1-phase
+    field: phase
+    operator: EQ
+    expected: VICTORY_CHECK
+  - kind: HOST_COMMAND
+    step_id: next-night-blocked
+    command: VICTORY_CHECK
+    required: false

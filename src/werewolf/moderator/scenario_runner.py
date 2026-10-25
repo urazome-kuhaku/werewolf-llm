@@ -20,7 +20,7 @@ from werewolf.domain.scenario import (
     load_scenario,
     scenario_sha256,
 )
-from werewolf.game.state import GameState
+from werewolf.game.state import GamePhase, GameState
 from werewolf.knowledge.preview import experimental_preview
 from werewolf.moderator.config import PlayerSessionConfig
 from werewolf.moderator.play_runner import (
@@ -64,6 +64,20 @@ class _ScenarioPlayRunner(ClassicPlayRunner):
         self._scenario_evidence = evidence
 
     async def command(self, line: str) -> Mapping[str, object]:
+        if self.shell.manager is not None:
+            state = self.shell.state
+            command_parts = line.strip().lower().split()
+            if (
+                state.phase is GamePhase.VICTORY_CHECK
+                and state.round_no >= self._scenario_evidence.scenario.budget.max_rounds
+                and command_parts[:2] == ["victory", "check"]
+                and self.shell._evaluate_victory().get("status") == "ONGOING"
+            ):
+                raise PlayRunnerError(
+                    "round budget exhausted before starting another night: "
+                    f"round {state.round_no} reached max_rounds "
+                    f"{self._scenario_evidence.scenario.budget.max_rounds}"
+                )
         pre_state = _state_summary(self.shell.state) if self.shell.manager is not None else None
         result = await super().command(line)
         post_state = _state_summary(self.shell.state) if self.shell.manager is not None else None
@@ -111,6 +125,7 @@ async def run_scenario(
         raise ScenarioRunError("play setup report must contain a compiled package identity")
 
     evidence = ScenarioRunEvidence(scenario=scenario, turn_budget=scenario.budget.max_turns)
+
     def make_runtime(
         _player: PlayerSessionConfig, gateway_url: str, token: str
     ) -> DeclarativeRuntime:
@@ -158,9 +173,7 @@ async def run_scenario(
                             _evaluate_assertion_step(
                                 step,
                                 state=(
-                                    runner.shell.state
-                                    if runner.shell.manager is not None
-                                    else None
+                                    runner.shell.state if runner.shell.manager is not None else None
                                 ),
                                 archive_verified=False,
                                 snapshot_verified=False,
@@ -214,9 +227,7 @@ async def run_scenario(
             failures.append("FULL_GAME did not reach FINISHED and CLOSED")
         if scenario.mode is ScenarioMode.FULL_GAME and archived_state is not None:
             archived_digest = (
-                archive_evidence.get("final_state_sha256")
-                if archive_evidence is not None
-                else None
+                archive_evidence.get("final_state_sha256") if archive_evidence is not None else None
             )
             live_snapshot_ref = (
                 live_final_state.last_snapshot if live_final_state is not None else None
@@ -555,9 +566,7 @@ def _skill_use_evidence(
             if skill_modes.get(skill_id) == "PLAYER"
             and getattr(skills_by_id.get(skill_id), "action_code", None) != 299
         }
-        required_player.update(
-            initial_player_grants | potential_dynamic_player_grants
-        )
+        required_player.update(initial_player_grants | potential_dynamic_player_grants)
         required_automatic.update(
             skill_id for skill_id, mode in skill_modes.items() if mode == "AUTOMATIC"
         )
@@ -661,11 +670,11 @@ def _evaluate_assertion_step(
     evidence: ScenarioRunEvidence,
 ) -> dict[str, object]:
     actual = _assertion_value(
-            step,
-            state=state,
-            archive_verified=archive_verified,
-            snapshot_verified=snapshot_verified,
-        )
+        step,
+        state=state,
+        archive_verified=archive_verified,
+        snapshot_verified=snapshot_verified,
+    )
     passed = _compare(step, actual)
     if passed:
         evidence.used_step_ids.add(step.step_id)
@@ -687,11 +696,7 @@ def _evaluate_assertion_step(
         "expected": step.expected,
         "actual": actual,
         "passed": passed,
-        **(
-            {}
-            if passed or not step.required
-            else {"failure": f"assertion failed: {step.step_id}"}
-        )
+        **({} if passed or not step.required else {"failure": f"assertion failed: {step.step_id}"}),
     }
 
 
@@ -738,9 +743,7 @@ def _assertion_value(
         )
     if field is AssertionField.GAME_STATE_VALUE:
         matching = [
-            item
-            for item in state.rule_state
-            if item.scope == "GAME" and item.key == step.state_key
+            item for item in state.rule_state if item.scope == "GAME" and item.key == step.state_key
         ]
         if matching and type(matching[-1].value) is bool:
             return matching[-1].value

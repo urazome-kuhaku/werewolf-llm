@@ -96,6 +96,7 @@ def test_command_scenario_rejects_failed_assertions_unused_steps_and_budget_exha
         ("quasar-command-assertion-fail", "assertion failed"),
         ("quasar-command-unused", "unused-player-action"),
         ("quasar-command-budget", "budget exhausted"),
+        ("quasar-command-round-budget", "round budget exhausted"),
     )
     for index, (scenario_name, expected_failure) in enumerate(cases):
         config = _setup(tmp_path, label=f"negative-{index}")
@@ -104,3 +105,14 @@ def test_command_scenario_rejects_failed_assertions_unused_steps_and_budget_exha
         assert result.exit_code == 1, result.stdout
         assert report["status"] == "FAIL"
         assert any(expected_failure in failure for failure in report["failures"])
+        if scenario_name == "quasar-command-round-budget":
+            assert len(report["failures"]) == 1
+            assert [item["actual"] for item in report["assertions"]] == [
+                1,
+                "VICTORY_CHECK",
+            ]
+            assert all(item["consumed"] for item in report["steps"] if item["required"])
+            assert report["host_commands"][-1]["command"] == "day finish"
+            assert report["host_commands"][-1]["post_state_proof"]["phase_after"] == (
+                "VICTORY_CHECK"
+            )

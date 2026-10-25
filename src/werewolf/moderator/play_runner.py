@@ -362,7 +362,7 @@ class ClassicPlayRunner:
     async def _night_resolve(self) -> None:
         await self.command("night open")
         await self.command("night auto-resolve")
-        await self._drain_pending_rule_work()
+        await self._drain_pending_rule_work(defer_scheduled_dawn_boundary=True)
 
     def _has_pending_rule_work(self) -> bool:
         """Return whether the persisted workflow has work for TriggerFlow."""
@@ -469,7 +469,11 @@ class ClassicPlayRunner:
         if current.is_pending:
             raise PlayRunnerError(f"rule boundary remains pending: {boundary_id}")
 
-    async def _drain_rule_workflow(self) -> None:
+    async def _drain_rule_workflow(
+        self,
+        *,
+        defer_scheduled_dawn_boundary: bool = False,
+    ) -> None:
         """Drain generic occurrences and their audited death boundaries."""
 
         step_limit = 512
@@ -498,6 +502,17 @@ class ClassicPlayRunner:
 
             boundary = self._pending_rule_boundary()
             if boundary is not None:
+                if defer_scheduled_dawn_boundary and self._is_scheduled_dawn_boundary(boundary):
+                    cursor = self.shell.state.rule_workflow_cursor
+                    queued_occurrences = any(
+                        item.status in {"QUEUED", "READY", "WAITING_CHOICE"}
+                        for item in self.shell.state.rule_trigger_queue
+                    ) or (cursor is not None and cursor.active_occurrence_id is not None)
+                    if not queued_occurrences:
+                        return
+                    if self.shell.state.state_revision == before_revision:
+                        raise PlayRunnerError("rule workflow made no durable progress")
+                    continue
                 await self._complete_rule_boundary(boundary)
                 continue
             if not self._has_pending_rule_work():
@@ -507,29 +522,48 @@ class ClassicPlayRunner:
 
         raise PlayRunnerError("rule workflow exceeded the runner progress budget")
 
-    async def _drain_pending_rule_work(self) -> None:
+    async def _drain_pending_rule_work(
+        self,
+        *,
+        defer_scheduled_dawn_boundary: bool = False,
+    ) -> None:
         """Drain only work pinned in the manager-owned workflow state."""
 
         if self.shell.state.phase is not GamePhase.TRIGGER_ACTION and self._has_pending_rule_work():
-            await self._drain_rule_workflow()
+            await self._drain_rule_workflow(
+                defer_scheduled_dawn_boundary=defer_scheduled_dawn_boundary
+            )
+
+    def _is_scheduled_dawn_boundary(self, boundary: object) -> bool:
+        manager = self.shell.manager
+        package = manager.execution_package if manager is not None else None
+        schedule = package.night_boundary_schedule if package is not None else None
+        point = getattr(boundary, "return_point", None)
+        group_id = getattr(boundary, "source_group_id", None)
+        round_no = self.shell.state.round_no
+        return bool(
+            schedule is not None
+            and self.shell.state.phase is GamePhase.DAY_ANNOUNCE
+            and self.shell.state.day_no == round_no + 1
+            and getattr(point, "phase", None) is GamePhase.DAY_ANNOUNCE
+            and getattr(point, "day_no", None) == round_no
+            and isinstance(group_id, str)
+            and (group_id == f"night:{round_no}" or group_id.startswith(f"night:{round_no}:"))
+        )
 
     async def _day_announce(self) -> None:
+        manager = self.shell.manager
+        execution_package = manager.execution_package if manager is not None else None
         schedule = (
-            self.shell.manager.execution_package.night_boundary_schedule
-            if self.shell.manager is not None
-            and self.shell.manager.execution_package is not None
-            else None
+            execution_package.night_boundary_schedule if execution_package is not None else None
         )
         if schedule is not None:
+            assert manager is not None and execution_package is not None
             state = self.shell.state
             required = schedule.required_for_round(state.round_no)
-            prerequisites = (
-                self.shell.manager.night_boundary_prerequisites(
-                    state,
-                    round_no=state.round_no,
-                )
-                if self.shell.manager is not None
-                else ()
+            prerequisites = manager.night_boundary_prerequisites(
+                state,
+                round_no=state.round_no,
             )
             results = {item.prerequisite: item.satisfied for item in prerequisites}
             if (
@@ -544,7 +578,7 @@ class ClassicPlayRunner:
                 if candidates is None:
                     candidates = first_day_sheriff_participants(
                         state,
-                        execution_package=self.shell.manager.execution_package,
+                        execution_package=execution_package,
                     )[:2]
                 if len(candidates) < 1:
                     raise PlayRunnerError("no eligible sheriff candidate is available")
@@ -561,6 +595,8 @@ class ClassicPlayRunner:
                 await self.command("sheriff badge resolve")
                 await self.command("sheriff badge finish")
             await self._last_words()
+            if self._has_pending_rule_work():
+                await self._drain_rule_workflow()
             await self.command("victory night-check")
             if self.shell.state.phase is GamePhase.FINISHED:
                 return
@@ -640,7 +676,7 @@ class ClassicPlayRunner:
             return
         if phase is GamePhase.SHERIFF_TRANSFER:
             await self.command("sheriff transfer")
-            manager = self.shell.manager
+            manager = getattr(self.shell, "manager", None)
             schedule = (
                 manager.execution_package.night_boundary_schedule
                 if manager is not None and manager.execution_package is not None
