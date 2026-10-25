@@ -6370,11 +6370,21 @@ class GameManager:
         self,
         state: GameState,
         boundary: RuleBoundary,
+        *,
+        depth: int = 0,
+        seen: frozenset[str] = frozenset(),
     ) -> bool:
-        """Prove that a DAY_ANNOUNCE boundary follows a closed final night group."""
+        """Prove that a dawn boundary descends from this round's final night group."""
 
         point = boundary.return_point
         package = self._execution_package
+        ancestry_keys = {
+            f"boundary:{boundary.boundary_id}",
+            f"group:{boundary.source_group_id}",
+            *(f"fact:{fact_id}" for fact_id in boundary.death_fact_ids),
+        }
+        if depth > 64 or ancestry_keys & seen:
+            return False
         night_phases = {
             GamePhase.NIGHT_TEAM_CHAT,
             GamePhase.NIGHT_ACTION,
@@ -6387,11 +6397,18 @@ class GameManager:
             and state.phase is GamePhase.DAY_ANNOUNCE
             and cursor is not None
             and cursor.status == "WAITING_BOUNDARY"
-            and cursor.pending_boundary_id == boundary.boundary_id
+            and cursor.return_point == point
+            and any(
+                item.boundary_id == cursor.pending_boundary_id
+                and item.is_pending
+                and item.return_point == point
+                for item in state.rule_boundaries
+            )
         )
         if (
             package is None
             or not package.window_metadata
+            or getattr(state.execution_identity, "package_id", None) != package.package_id
             or point.phase is not GamePhase.DAY_ANNOUNCE
             or point.window_id is None
             or point.day_no is None
@@ -6411,7 +6428,13 @@ class GameManager:
             row for row in rows if group_id_for(row.window_id) == boundary.source_group_id
         )
         if not expected_rows or group_id_for(rows[-1].window_id) != boundary.source_group_id:
-            return False
+            return self._has_trigger_night_boundary_ancestry(
+                state,
+                boundary,
+                point=point,
+                depth=depth,
+                seen=seen | ancestry_keys,
+            )
 
         group_windows: list[ActionWindow] = []
         group_windows_by_id: dict[str, ActionWindow] = {}
@@ -6452,8 +6475,7 @@ class GameManager:
             None,
         )
         if anchor is None or (
-            point.logical_window_id is not None
-            and point.logical_window_id != anchor.next_window_id
+            point.logical_window_id is not None and point.logical_window_id != anchor.next_window_id
         ):
             return False
 
@@ -6462,6 +6484,7 @@ class GameManager:
             for ledger in state.rule_ledger
             if ledger.batch_id == boundary.source_batch_id
             and ledger.group_id == boundary.source_group_id
+            and ledger.package_id == package.package_id
             and ledger.timing in {phase.value for phase in night_phases}
             and ledger.round_no == state.round_no
             and set(boundary.death_fact_ids).issubset(
@@ -6475,15 +6498,152 @@ class GameManager:
         if len(matching_ledgers) != 1:
             return False
         ledger = matching_ledgers[0]
-        return any(
-            receipt.batch_id == ledger.batch_id
-            and receipt.package_id == ledger.package_id
+        if (
+            ledger.committed_revision != ledger.read_revision + 1
+            or ledger.committed_revision > state.state_revision
+        ):
+            return False
+        receipts = tuple(
+            receipt for receipt in state.rule_receipts if receipt.batch_id == ledger.batch_id
+        )
+        if len(receipts) != 1:
+            return False
+        receipt = receipts[0]
+        return (
+            receipt.package_id == ledger.package_id
             and receipt.group_id == ledger.group_id
             and receipt.timing == ledger.timing
+            and receipt.read_revision == ledger.read_revision
             and receipt.committed_revision == ledger.committed_revision
             and receipt.request_ids == ledger.request_ids
+            and not receipt.occurrence_ids
             and receipt.outcome_digest == ledger.outcome_digest
-            for receipt in state.rule_receipts
+        )
+
+    def _has_trigger_night_boundary_ancestry(
+        self,
+        state: GameState,
+        boundary: RuleBoundary,
+        *,
+        point: RuleReturnPoint,
+        depth: int,
+        seen: frozenset[str],
+    ) -> bool:
+        """Bind a derived dawn boundary back to a closed physical night group."""
+
+        package = self._execution_package
+        group_id = boundary.source_group_id
+        if package is None or package.package_id != getattr(
+            state.execution_identity, "package_id", None
+        ):
+            return False
+        if group_id.startswith("automatic-"):
+            expected_mode = "AUTOMATIC"
+            occurrence_id = group_id.removeprefix("automatic-")
+        elif group_id.startswith("trigger-"):
+            expected_mode = "PLAYER_CHOICE"
+            occurrence_id = group_id.removeprefix("trigger-")
+        else:
+            return False
+        if not occurrence_id:
+            return False
+
+        ledgers = tuple(
+            item
+            for item in state.rule_ledger
+            if item.batch_id == boundary.source_batch_id
+            and item.group_id == group_id
+            and item.package_id == package.package_id
+            and item.round_no == state.round_no
+            and item.timing == GamePhase.TRIGGER_ACTION.value
+        )
+        if len(ledgers) != 1:
+            return False
+        ledger = ledgers[0]
+        death_facts = tuple(
+            fact for fact in ledger.facts if fact.fact_type.upper() == "DEATH_CONFIRMED"
+        )
+        death_fact_ids = {fact.fact_id for fact in death_facts}
+        death_seats = {fact.target_seat for fact in death_facts if fact.target_seat is not None}
+        if (
+            not boundary.death_fact_ids
+            or not set(boundary.death_fact_ids).issubset(death_fact_ids)
+            or death_seats != set(boundary.death_seats)
+            or ledger.committed_revision != ledger.read_revision + 1
+            or ledger.committed_revision > state.state_revision
+        ):
+            return False
+        receipts = tuple(item for item in state.rule_receipts if item.batch_id == ledger.batch_id)
+        if len(receipts) != 1:
+            return False
+        receipt = receipts[0]
+        if (
+            receipt.package_id != ledger.package_id
+            or receipt.group_id != ledger.group_id
+            or receipt.timing != ledger.timing
+            or receipt.read_revision != ledger.read_revision
+            or receipt.committed_revision != ledger.committed_revision
+            or receipt.request_ids != ledger.request_ids
+            or receipt.occurrence_ids != (occurrence_id,)
+            or receipt.outcome_digest != ledger.outcome_digest
+        ):
+            return False
+        occurrences = tuple(
+            item
+            for item in state.rule_trigger_queue
+            if item.occurrence_id == occurrence_id
+            and item.status == "COMPLETED"
+            and item.mode == expected_mode
+        )
+        if len(occurrences) != 1:
+            return False
+        occurrence = occurrences[0]
+        if expected_mode == "AUTOMATIC" and ledger.request_ids:
+            return False
+        if expected_mode == "PLAYER_CHOICE" and len(ledger.request_ids) != 1:
+            return False
+
+        source_ledgers = tuple(
+            item
+            for item in state.rule_ledger
+            if item.batch_id == occurrence.source_batch_id
+            and any(fact.fact_id == occurrence.source_fact_id for fact in item.facts)
+        )
+        if len(source_ledgers) != 1:
+            return False
+        source_ledger = source_ledgers[0]
+        source_boundaries = tuple(
+            item
+            for item in state.rule_boundaries
+            if item.source_batch_id == source_ledger.batch_id
+            and item.source_group_id == source_ledger.group_id
+            and occurrence.source_fact_id in item.death_fact_ids
+            and item.return_point == point
+        )
+        if len(source_boundaries) != 1:
+            return False
+
+        try:
+            self._assert_private_checkpoint_trigger_source(state, occurrence)
+            for fact_id in boundary.death_fact_ids:
+                self._assert_private_checkpoint_source_fact(
+                    state,
+                    source_fact_id=fact_id,
+                    source_batch_id=ledger.batch_id,
+                )
+        except (EventCommitError, TypeError, ValueError):
+            return False
+
+        return self._has_terminal_night_boundary_source(
+            state,
+            source_boundaries[0],
+            depth=depth + 1,
+            seen=seen
+            | {
+                f"boundary:{boundary.boundary_id}",
+                f"group:{boundary.source_group_id}",
+                *(f"fact:{fact_id}" for fact_id in boundary.death_fact_ids),
+            },
         )
 
     def night_boundary_prerequisites(
@@ -10791,10 +10951,10 @@ class GameManager:
         """Prove a held choice marker belongs to one completed trigger batch.
 
         When ``boundary`` is supplied, the manager must currently be waiting on
-        that exact output boundary.  A scheduled first-dawn election can hold a
-        different, already-proven night boundary at the cursor, so its badge
-        path uses the same receipt and output proof without binding that cursor
-        to the choice occurrence's output boundary.
+        the occurrence's source boundary. A scheduled first-dawn election can
+        hold a different, already-proven night boundary at the cursor, so its
+        badge path uses the same receipt and output proof while separately
+        proving the occurrence's first-night ancestry.
         """
 
         pending = state.pending_resolution
@@ -10833,6 +10993,7 @@ class GameManager:
             or type(base_revision) is not int
             or base_revision >= state.state_revision
             or cursor.settlement_group_id != f"trigger-{occurrence_id}"
+            or (boundary is not None and source_fact_id not in boundary.death_fact_ids)
         ):
             return False
         occurrences = tuple(
@@ -10914,6 +11075,8 @@ class GameManager:
             ledger.package_id != receipt.package_id
             or ledger.package_id
             != (self._execution_package.package_id if self._execution_package is not None else None)
+            or ledger.committed_revision != ledger.read_revision + 1
+            or ledger.committed_revision > state.state_revision
             or ledger.read_revision != receipt.read_revision
             or ledger.committed_revision != receipt.committed_revision
             or ledger.request_ids != receipt.request_ids
@@ -10929,19 +11092,22 @@ class GameManager:
             if item.is_pending
             and item.source_batch_id == ledger.batch_id
             and item.source_group_id == ledger.group_id
-            and item.return_point.phase is GamePhase.DAY_ANNOUNCE
-            and item.return_point.day_no == 0
+            and (
+                boundary is not None
+                or (
+                    item.return_point.phase is GamePhase.DAY_ANNOUNCE
+                    and item.return_point.day_no == 0
+                )
+            )
             and bool(item.death_fact_ids)
             and set(item.death_fact_ids).issubset(death_fact_ids)
         )
         if len(output_boundaries) != 1:
             return False
         output_boundary = output_boundaries[0]
-        if boundary is not None and output_boundary.boundary_id != boundary.boundary_id:
-            return False
-        if proven_output_seats is not None and not set(
-            output_boundary.death_seats
-        ).issubset(proven_output_seats):
+        if proven_output_seats is not None and not set(output_boundary.death_seats).issubset(
+            proven_output_seats
+        ):
             return False
         try:
             self._assert_private_checkpoint_trigger_source(state, occurrence)
